@@ -1,11 +1,14 @@
 import {
+  DocumentData,
   addDoc,
   collection,
-  DocumentData,
+  deleteDoc,
+  doc,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
+  updateDoc,
 } from "firebase/firestore";
 import React, { useEffect, useMemo, useState } from "react";
 import { FlatList, StyleSheet, View } from "react-native";
@@ -14,6 +17,8 @@ import {
   Card,
   Chip,
   Dialog,
+  IconButton,
+  Menu,
   Portal,
   ProgressBar,
   Text,
@@ -45,16 +50,22 @@ const COLORS = [
 export default function BucketsScreen() {
   const { user } = useAuth();
   const [buckets, setBuckets] = useState<Bucket[]>([]);
-  const [visible, setVisible] = useState(false);
 
-  // form state
+  // Create dialog state
+  const [createVisible, setCreateVisible] = useState(false);
   const [name, setName] = useState("");
   const [target, setTarget] = useState("");
   const [balance, setBalance] = useState("");
   const [color, setColor] = useState<string | null>(COLORS[0]);
   const [submitting, setSubmitting] = useState(false);
 
-  const canSubmit = useMemo(
+  // Edit/Delete state
+  const [menuAnchor, setMenuAnchor] = useState<string | null>(null); // bucketId whose menu is open
+  const [editVisible, setEditVisible] = useState(false);
+  const [deleteVisible, setDeleteVisible] = useState(false);
+  const [editing, setEditing] = useState<Bucket | null>(null);
+
+  const canCreate = useMemo(
     () => name.trim().length > 0 && Number(target) > 0 && !submitting,
     [name, target, submitting]
   );
@@ -65,10 +76,10 @@ export default function BucketsScreen() {
     const q = query(col, orderBy("createdAt", "desc"));
     const unsub = onSnapshot(q, (snap) => {
       const next: Bucket[] = [];
-      snap.forEach((doc) => {
-        const d = doc.data() as DocumentData;
+      snap.forEach((docSnap) => {
+        const d = docSnap.data() as DocumentData;
         next.push({
-          id: doc.id,
+          id: docSnap.id,
           name: d.name,
           target: Number(d.target) || 0,
           balance: Number(d.balance) || 0,
@@ -81,9 +92,10 @@ export default function BucketsScreen() {
     return () => unsub();
   }, [user]);
 
-  const openDialog = () => setVisible(true);
-  const closeDialog = () => {
-    setVisible(false);
+  // Create
+  const openCreate = () => setCreateVisible(true);
+  const closeCreate = () => {
+    setCreateVisible(false);
     setName("");
     setTarget("");
     setBalance("");
@@ -102,7 +114,7 @@ export default function BucketsScreen() {
         color: color ?? null,
         createdAt: serverTimestamp(),
       });
-      closeDialog();
+      closeCreate();
     } catch (e) {
       console.error("Failed to add bucket:", e);
     } finally {
@@ -110,14 +122,95 @@ export default function BucketsScreen() {
     }
   };
 
+  // Edit
+  const openMenu = (bucketId: string) => setMenuAnchor(bucketId);
+  const closeMenu = () => setMenuAnchor(null);
+
+  const startEdit = (b: Bucket) => {
+    setEditing(b);
+    closeMenu();
+    setEditVisible(true);
+  };
+
+  const closeEdit = () => {
+    setEditVisible(false);
+    setEditing(null);
+  };
+
+  const onSaveEdit = async () => {
+    if (!user || !editing) return;
+    setSubmitting(true);
+    try {
+      const ref = doc(db, "users", user.uid, "buckets", editing.id);
+      await updateDoc(ref, {
+        name: editing.name.trim(),
+        target: Number(editing.target) || 0,
+        balance: Number(editing.balance) || 0,
+        color: editing.color ?? null,
+      });
+      closeEdit();
+    } catch (e) {
+      console.error("Failed to update bucket:", e);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Delete
+  const startDelete = (b: Bucket) => {
+    setEditing(b);
+    closeMenu();
+    setDeleteVisible(true);
+  };
+
+  const closeDelete = () => {
+    setDeleteVisible(false);
+    setEditing(null);
+  };
+
+  const onConfirmDelete = async () => {
+    if (!user || !editing) return;
+    setSubmitting(true);
+    try {
+      const ref = doc(db, "users", user.uid, "buckets", editing.id);
+      await deleteDoc(ref);
+      closeDelete();
+    } catch (e) {
+      console.error("Failed to delete bucket:", e);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   const renderItem = ({ item }: { item: Bucket }) => {
     const pct = item.target > 0 ? Math.min(item.balance / item.target, 1) : 0;
+    const isMenuOpen = menuAnchor === item.id;
+
     return (
       <Card style={[styles.card, { backgroundColor: item.color ?? "#1F2937" }]} elevation={3}>
         <Card.Content>
-          <Text variant="titleMedium" style={styles.cardTitle}>
-            {item.name}
-          </Text>
+          <View style={styles.cardHeader}>
+            <Text variant="titleMedium" style={styles.cardTitle}>
+              {item.name}
+            </Text>
+
+            <Menu
+              visible={isMenuOpen}
+              onDismiss={closeMenu}
+              anchor={
+                <IconButton
+                  icon="dots-vertical"
+                  iconColor="white"
+                  size={20}
+                  onPress={() => openMenu(item.id)}
+                />
+              }
+            >
+              <Menu.Item title="Edit" onPress={() => startEdit(item)} />
+              <Menu.Item title="Delete" onPress={() => startDelete(item)} />
+            </Menu>
+          </View>
+
           <Text style={styles.sub}>
             ${item.balance.toFixed(2)} / ${item.target.toFixed(2)}
           </Text>
@@ -132,7 +225,7 @@ export default function BucketsScreen() {
     <View style={styles.container}>
       <View style={styles.headerRow}>
         <Text variant="titleLarge">Buckets</Text>
-        <Button mode="contained" onPress={openDialog}>
+        <Button mode="contained" onPress={openCreate}>
           New
         </Button>
       </View>
@@ -154,8 +247,9 @@ export default function BucketsScreen() {
         }
       />
 
+      {/* Create Dialog */}
       <Portal>
-        <Dialog visible={visible} onDismiss={closeDialog}>
+        <Dialog visible={createVisible} onDismiss={closeCreate}>
           <Dialog.Title>New Bucket</Dialog.Title>
           <Dialog.Content>
             <TextInput
@@ -195,9 +289,84 @@ export default function BucketsScreen() {
             </View>
           </Dialog.Content>
           <Dialog.Actions>
-            <Button onPress={closeDialog}>Cancel</Button>
-            <Button mode="contained" onPress={onAddBucket} disabled={!canSubmit} loading={submitting}>
+            <Button onPress={closeCreate}>Cancel</Button>
+            <Button mode="contained" onPress={onAddBucket} disabled={!canCreate} loading={submitting}>
               Save
+            </Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
+
+      {/* Edit Dialog */}
+      <Portal>
+        <Dialog visible={editVisible} onDismiss={closeEdit}>
+          <Dialog.Title>Edit Bucket</Dialog.Title>
+          <Dialog.Content>
+            <TextInput
+              label="Name"
+              value={editing?.name ?? ""}
+              onChangeText={(v) => setEditing((prev) => (prev ? { ...prev, name: v } : prev))}
+              style={{ marginBottom: 12 }}
+            />
+            <TextInput
+              label="Target Amount"
+              value={editing?.target?.toString() ?? ""}
+              onChangeText={(v) =>
+                setEditing((prev) => (prev ? { ...prev, target: Number(v) || 0 } : prev))
+              }
+              keyboardType="numeric"
+              style={{ marginBottom: 12 }}
+            />
+            <TextInput
+              label="Balance"
+              value={editing?.balance?.toString() ?? ""}
+              onChangeText={(v) =>
+                setEditing((prev) => (prev ? { ...prev, balance: Number(v) || 0 } : prev))
+              }
+              keyboardType="numeric"
+              style={{ marginBottom: 16 }}
+            />
+
+            <Text style={{ marginBottom: 8 }}>Color</Text>
+            <View style={styles.colorRow}>
+              {COLORS.map((c) => (
+                <Chip
+                  key={c}
+                  selected={editing?.color === c}
+                  onPress={() =>
+                    setEditing((prev) => (prev ? { ...prev, color: c } : prev))
+                  }
+                  style={[styles.colorChip, { backgroundColor: c }]}
+                  textStyle={{ color: "white", fontWeight: "600" }}
+                >
+                  {editing?.color === c ? "Selected" : " "}
+                </Chip>
+              ))}
+            </View>
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={closeEdit}>Cancel</Button>
+            <Button mode="contained" onPress={onSaveEdit} loading={submitting}>
+              Save
+            </Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
+
+      {/* Delete Confirm */}
+      <Portal>
+        <Dialog visible={deleteVisible} onDismiss={closeDelete}>
+          <Dialog.Title>Delete Bucket</Dialog.Title>
+          <Dialog.Content>
+            <Text>
+              Are you sure you want to delete{" "}
+              <Text style={{ fontWeight: "700" }}>{editing?.name}</Text>?
+            </Text>
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={closeDelete}>Cancel</Button>
+            <Button mode="contained" onPress={onConfirmDelete} loading={submitting}>
+              Delete
             </Button>
           </Dialog.Actions>
         </Dialog>
@@ -225,9 +394,14 @@ const styles = StyleSheet.create({
     marginRight: GAP / 2,
     marginLeft: GAP / 2,
     borderRadius: 16,
-    minHeight: 140,
+    minHeight: 160,
   },
-  cardTitle: { color: "white", fontWeight: "700", marginBottom: 4 },
+  cardHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+  },
+  cardTitle: { color: "white", fontWeight: "700", marginBottom: 4, flex: 1, paddingRight: 6 },
   sub: { color: "white", opacity: 0.9, marginBottom: 8 },
   progress: { height: 10, borderRadius: 6, backgroundColor: "rgba(255,255,255,0.3)" },
   percent: { color: "white", textAlign: "right", marginTop: 6, opacity: 0.95 },
