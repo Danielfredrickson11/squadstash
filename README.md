@@ -1,70 +1,119 @@
 # SquadStash
 
-SquadStash is a personal + group savings and expense tracking app that solves two common trip problems:
+**SquadStash is a financial system for managing shared savings goals, group expenses, and personal budgeting through structured data models and clear financial logic.**
 
-1) **Saving consistently for a trip goal** (e.g., $5,000 for 5 people)  
-2) **Fairly settling shared expenses during/after the trip** (hotel, gas, restaurants, activities)
+It is designed to solve two common financial problems:
 
-It also doubles as a personal “buckets” budgeting tool for everyday life.
+1. **Coordinating savings toward a shared goal** (e.g., funding a group trip)  
+2. **Accurately tracking and settling shared expenses** during and after that goal is achieved  
 
----
-
-## Why SquadStash
-
-Group trips often fall apart financially because:
-- People struggle to save consistently toward a shared goal
-- Expenses are uneven (different meals, different spending)
-- Settling up afterward becomes confusing (“Who owes who?”)
-
-SquadStash makes it easier to plan, save, spend, and settle—clearly and fairly.
+The system also supports **personal bucket-based budgeting** for everyday financial tracking.
 
 ---
 
-## Core Features
+## System Design Focus
 
-### Group Trip Savings (Goal-Based)
-- Create a trip with a total goal amount
-- Add members and track contributions over time
-- View progress toward the shared goal and individual contributions
+SquadStash is built as a **data-driven financial application**, not just a UI-based expense tracker.
 
-### Trip Expense Tracking + Settlement
-- Log shared expenses (hotel, gas, activities)
-- Log individual purchases (e.g., restaurant meals with different prices)
-- Generate a clear breakdown to help settle balances fairly
+The core emphasis is on:
+- Structured financial data models  
+- Clear ownership of contributions and expenses  
+- Deterministic settlement logic  
+- Separation between personal and group financial flows  
 
-### Personal Buckets (Everyday Budgeting)
-- Create personal buckets (Rent, Food, Activities, etc.)
-- Track deposits, spending, and progress by category
-- View recent transactions in one place
+This project demonstrates how real-world financial problems can be translated into **reliable, scalable software systems**.
 
 ---
 
-## App Sections
+## Financial Problems Addressed
 
-- **Home / Dashboard** — overview, progress, recent activity  
-- **Buckets** — personal budgeting categories  
-- **Trips** — group goals, contributions, expenses, settlement  
-- **Transactions** — unified view of deposits/expenses  
-- **Profile** — account settings and preferences  
+Group finances often break down due to:
+- Inconsistent contribution tracking  
+- Uneven spending across participants  
+- Lack of transparency around balances and settlements  
+- Manual, error-prone reconciliation after the fact  
+
+SquadStash replaces ad-hoc spreadsheets and messaging with a **single source of truth** for shared financial activity.
+
+---
+
+## Core Financial Components
+
+### 1. Group Savings System (Goal-Based)
+- Define a total goal amount for a group (e.g., $5,000 trip fund)
+- Assign members and track individual contributions
+- Monitor progress at both the group and individual level
+- Maintain contribution history for auditability
+
+### 2. Expense Tracking & Settlement Logic
+- Record shared expenses (hotel, gas, activities)
+- Record individual expenses with uneven amounts (e.g., meals)
+- Associate expenses with specific participants
+- Generate a clear breakdown of who owes or is owed based on actual spending
+
+### 3. Personal Budget Buckets
+- Create categorized buckets (Rent, Food, Activities, etc.)
+- Track deposits, spending, and balances per category
+- Keep personal financial activity isolated from group funds
+
+---
+
+## Application Structure
+
+- **Dashboard** — high-level financial overview and recent activity  
+- **Buckets** — personal budgeting categories and balances  
+- **Trips** — group goals, contributions, expenses, and settlements  
+- **Transactions** — unified ledger of deposits and expenses  
+- **Profile** — user settings and account management  
+
+Each section maps directly to an underlying financial data model.
 
 ---
 
 ## Tech Stack
 
-- **React Native (Expo)**
-- **TypeScript**
-- **Expo Router**
+- **React Native (Expo)** — cross-platform application layer  
+- **TypeScript** — type safety and predictable data structures  
+- **Expo Router** — structured navigation  
 - **Firebase**
-  - Authentication
-  - Firestore (data storage)
+  - **Authentication** — user identity and access control  
+  - **Firestore** — persistent storage for financial records  
 
 ---
 
-## Getting Started (Local Dev)
+## Local Development
 
-1) Clone the repo  
-2) Install dependencies:
 ```bash
+# Install dependencies
 npm install
-3) npx expo start
-4) Open in Expo Go (iOS/Android) or run on web
+
+# Start development server
+npx expo start
+```
+### Run on
+- iOS / Android via **Expo Go**
+- Web via local browser
+
+---
+
+## Current Status
+
+SquadStash is fully functional end-to-end and actively evolving.
+
+Current focus areas include:
+- UI refinement and validation
+- Expanded settlement summaries
+- Analytics-style views (category spend, contribution pacing, budget burn rates)
+- Improved onboarding and edge-case handling
+
+---
+
+## Why This Project
+
+This project was inspired by real-world friction experienced during group trips—specifically the difficulty of saving together and settling expenses fairly.
+
+SquadStash exists to demonstrate:
+- Financial system thinking
+- Data modeling for money movement
+- Translating financial rules into software logic
+- Building maintainable, real-world financial applications
