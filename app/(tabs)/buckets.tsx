@@ -25,8 +25,8 @@ import {
   TextInput,
 } from "react-native-paper";
 import { db } from "../../firebase";
+import { useAuth } from "../../src/contexts/AuthContext";
 import { formatCurrency } from "../../utils/format";
-import { useAuth } from "../contexts/AuthContext";
 
 type Bucket = {
   id: string;

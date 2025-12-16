@@ -3,8 +3,8 @@ import React, { useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { Button, Card, ProgressBar, Text } from "react-native-paper";
 import { db } from "../../firebase";
+import { useAuth } from "../../src/contexts/AuthContext";
 import { formatCurrency } from "../../utils/format";
-import { useAuth } from "../contexts/AuthContext";
 
 type MiniBucket = { name: string; balance: number; target: number };
 

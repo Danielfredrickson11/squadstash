@@ -9,7 +9,7 @@ import { Provider as PaperProvider } from 'react-native-paper';
 import 'react-native-reanimated';
 
 // ✅ Auth Provider (corrected import path)
-import { AuthProvider } from './contexts/AuthContext';
+import { AuthProvider } from '../src/contexts/AuthContext';
 
 export { ErrorBoundary } from 'expo-router';
 

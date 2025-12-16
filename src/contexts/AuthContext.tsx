@@ -1,7 +1,7 @@
 // app/contexts/AuthContext.tsx
 import { onAuthStateChanged, signOut, User } from "firebase/auth";
-import React, { createContext, ReactNode, useContext, useEffect, useState } from "react";
-import { auth } from "../../firebase"; // root-level firebase.ts
+import React, { createContext, ReactNode, useContext, useEffect, useMemo, useState } from "react";
+import { auth } from "../../firebase";
 
 type AuthContextType = {
   user: User | null;
@@ -9,14 +9,14 @@ type AuthContextType = {
   logout: () => Promise<void>;
 };
 
-const AuthContext = createContext<AuthContextType>({
-  user: null,
-  loading: true,
-  logout: async () => {},
-});
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function useAuth() {
-  return useContext(AuthContext);
+  const ctx = useContext(AuthContext);
+  if (!ctx) {
+    throw new Error("useAuth must be used inside <AuthProvider />");
+  }
+  return ctx;
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -28,16 +28,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(u);
       setLoading(false);
     });
-    return () => unsub();
+    return unsub;
   }, []);
 
   const logout = async () => {
+    // This triggers onAuthStateChanged -> user becomes null
     await signOut(auth);
   };
 
-  return (
-    <AuthContext.Provider value={{ user, loading, logout }}>
-      {children}
-    </AuthContext.Provider>
-  );
+  const value = useMemo(() => ({ user, loading, logout }), [user, loading]);
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
