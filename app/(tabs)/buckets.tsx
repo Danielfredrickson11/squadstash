@@ -25,6 +25,7 @@ import {
   TextInput,
 } from "react-native-paper";
 import { db } from "../../firebase";
+import { formatCurrency } from "../../utils/format";
 import { useAuth } from "../contexts/AuthContext";
 
 type Bucket = {
@@ -104,13 +105,19 @@ export default function BucketsScreen() {
 
   const onAddBucket = async () => {
     if (!user) return;
+    // ✅ validate numbers
+    const t = Number(target);
+    const b = balance ? Number(balance) : 0;
+    if (!Number.isFinite(t) || t <= 0) return;
+    if (!Number.isFinite(b) || b < 0) return;
+
     setSubmitting(true);
     try {
       const col = collection(db, "users", user.uid, "buckets");
       await addDoc(col, {
         name: name.trim(),
-        target: Number(target),
-        balance: balance ? Number(balance) : 0,
+        target: t,
+        balance: b,
         color: color ?? null,
         createdAt: serverTimestamp(),
       });
@@ -139,13 +146,20 @@ export default function BucketsScreen() {
 
   const onSaveEdit = async () => {
     if (!user || !editing) return;
+
+    // ✅ validate numbers
+    const t = Number(editing.target);
+    const b = Number(editing.balance);
+    if (!Number.isFinite(t) || t <= 0) return;
+    if (!Number.isFinite(b) || b < 0) return;
+
     setSubmitting(true);
     try {
       const ref = doc(db, "users", user.uid, "buckets", editing.id);
       await updateDoc(ref, {
         name: editing.name.trim(),
-        target: Number(editing.target) || 0,
-        balance: Number(editing.balance) || 0,
+        target: t,
+        balance: b,
         color: editing.color ?? null,
       });
       closeEdit();
@@ -212,7 +226,7 @@ export default function BucketsScreen() {
           </View>
 
           <Text style={styles.sub}>
-            ${item.balance.toFixed(2)} / ${item.target.toFixed(2)}
+            {formatCurrency(item.balance)} / {formatCurrency(item.target)}
           </Text>
           <ProgressBar progress={pct} style={styles.progress} />
           <Text style={styles.percent}>{Math.round(pct * 100)}%</Text>
@@ -355,22 +369,22 @@ export default function BucketsScreen() {
 
       {/* Delete Confirm */}
       <Portal>
-        <Dialog visible={deleteVisible} onDismiss={closeDelete}>
-          <Dialog.Title>Delete Bucket</Dialog.Title>
-          <Dialog.Content>
-            <Text>
-              Are you sure you want to delete{" "}
-              <Text style={{ fontWeight: "700" }}>{editing?.name}</Text>?
-            </Text>
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button onPress={closeDelete}>Cancel</Button>
-            <Button mode="contained" onPress={onConfirmDelete} loading={submitting}>
-              Delete
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-      </Portal>
+  <Dialog visible={deleteVisible} onDismiss={closeDelete}>
+    <Dialog.Title>Delete Bucket</Dialog.Title>
+    <Dialog.Content>
+      <Text>
+        Are you sure you want to delete{" "}
+        <Text style={{ fontWeight: "700" }}>{editing?.name}</Text>?
+      </Text>
+    </Dialog.Content>
+    <Dialog.Actions>
+      <Button onPress={closeDelete}>Cancel</Button>
+      <Button mode="contained" onPress={onConfirmDelete} loading={submitting}>
+        Delete
+      </Button>
+    </Dialog.Actions>
+  </Dialog>
+</Portal>
     </View>
   );
 }
