@@ -1,3 +1,18 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { FlatList, StyleSheet, View, useWindowDimensions } from "react-native";
+import {
+  Button,
+  Card,
+  Dialog,
+  IconButton,
+  Menu,
+  Portal,
+  ProgressBar,
+  Text,
+  TextInput,
+  Chip,
+} from "react-native-paper";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import {
   DocumentData,
   addDoc,
@@ -10,20 +25,6 @@ import {
   serverTimestamp,
   updateDoc,
 } from "firebase/firestore";
-import React, { useEffect, useMemo, useState } from "react";
-import { FlatList, StyleSheet, View } from "react-native";
-import {
-  Button,
-  Card,
-  Chip,
-  Dialog,
-  IconButton,
-  Menu,
-  Portal,
-  ProgressBar,
-  Text,
-  TextInput,
-} from "react-native-paper";
 import { db } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
 import { formatCurrency } from "../../utils/format";
@@ -31,25 +32,38 @@ import { formatCurrency } from "../../utils/format";
 type Bucket = {
   id: string;
   name: string;
-  target: number;   // goal amount
-  balance: number;  // current saved
-  color?: string | null;
+  target: number; // goal amount
+  balance: number; // current saved
+  color?: string | null; // accent color
   createdAt?: any;
 };
 
 const COLORS = [
-  "#4F46E5", // indigo
-  "#06B6D4", // cyan
+  "#2563EB", // blue
   "#10B981", // emerald
+  "#8B5CF6", // violet
   "#F59E0B", // amber
   "#EF4444", // red
-  "#8B5CF6", // violet
+  "#06B6D4", // cyan
   "#EC4899", // pink
   "#0EA5E9", // sky
 ];
 
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(n, max));
+}
+
 export default function BucketsScreen() {
   const { user } = useAuth();
+  const { width } = useWindowDimensions();
+
+  // Responsive columns (web can show 3 like your screenshot)
+  const numColumns = useMemo(() => {
+    if (width >= 1100) return 3;
+    if (width >= 700) return 2;
+    return 1;
+  }, [width]);
+
   const [buckets, setBuckets] = useState<Bucket[]>([]);
 
   // Create dialog state
@@ -61,7 +75,7 @@ export default function BucketsScreen() {
   const [submitting, setSubmitting] = useState(false);
 
   // Edit/Delete state
-  const [menuAnchor, setMenuAnchor] = useState<string | null>(null); // bucketId whose menu is open
+  const [menuAnchor, setMenuAnchor] = useState<string | null>(null); // bucketId
   const [editVisible, setEditVisible] = useState(false);
   const [deleteVisible, setDeleteVisible] = useState(false);
   const [editing, setEditing] = useState<Bucket | null>(null);
@@ -73,15 +87,17 @@ export default function BucketsScreen() {
 
   useEffect(() => {
     if (!user) return;
-    const col = collection(db, "users", user.uid, "buckets");
-    const q = query(col, orderBy("createdAt", "desc"));
-    const unsub = onSnapshot(q, (snap) => {
+
+    const colRef = collection(db, "users", user.uid, "buckets");
+    const qRef = query(colRef, orderBy("createdAt", "desc"));
+
+    const unsub = onSnapshot(qRef, (snap) => {
       const next: Bucket[] = [];
       snap.forEach((docSnap) => {
         const d = docSnap.data() as DocumentData;
         next.push({
           id: docSnap.id,
-          name: d.name,
+          name: String(d.name ?? "Untitled"),
           target: Number(d.target) || 0,
           balance: Number(d.balance) || 0,
           color: d.color ?? null,
@@ -90,6 +106,7 @@ export default function BucketsScreen() {
       });
       setBuckets(next);
     });
+
     return () => unsub();
   }, [user]);
 
@@ -105,16 +122,17 @@ export default function BucketsScreen() {
 
   const onAddBucket = async () => {
     if (!user) return;
-    // ✅ validate numbers
+
     const t = Number(target);
     const b = balance ? Number(balance) : 0;
+
     if (!Number.isFinite(t) || t <= 0) return;
     if (!Number.isFinite(b) || b < 0) return;
 
     setSubmitting(true);
     try {
-      const col = collection(db, "users", user.uid, "buckets");
-      await addDoc(col, {
+      const colRef = collection(db, "users", user.uid, "buckets");
+      await addDoc(colRef, {
         name: name.trim(),
         target: t,
         balance: b,
@@ -129,7 +147,7 @@ export default function BucketsScreen() {
     }
   };
 
-  // Edit
+  // Edit/Delete menu
   const openMenu = (bucketId: string) => setMenuAnchor(bucketId);
   const closeMenu = () => setMenuAnchor(null);
 
@@ -147,9 +165,9 @@ export default function BucketsScreen() {
   const onSaveEdit = async () => {
     if (!user || !editing) return;
 
-    // ✅ validate numbers
     const t = Number(editing.target);
     const b = Number(editing.balance);
+
     if (!Number.isFinite(t) || t <= 0) return;
     if (!Number.isFinite(b) || b < 0) return;
 
@@ -170,7 +188,6 @@ export default function BucketsScreen() {
     }
   };
 
-  // Delete
   const startDelete = (b: Bucket) => {
     setEditing(b);
     closeMenu();
@@ -184,6 +201,7 @@ export default function BucketsScreen() {
 
   const onConfirmDelete = async () => {
     if (!user || !editing) return;
+
     setSubmitting(true);
     try {
       const ref = doc(db, "users", user.uid, "buckets", editing.id);
@@ -196,25 +214,40 @@ export default function BucketsScreen() {
     }
   };
 
+  // Quick add (+$50 / +$100)
+  const quickAdd = async (bucket: Bucket, amount: number) => {
+    if (!user) return;
+    const nextBalance = (Number(bucket.balance) || 0) + amount;
+
+    try {
+      const ref = doc(db, "users", user.uid, "buckets", bucket.id);
+      await updateDoc(ref, { balance: nextBalance });
+    } catch (e) {
+      console.error("Failed to quick add:", e);
+    }
+  };
+
   const renderItem = ({ item }: { item: Bucket }) => {
-    const pct = item.target > 0 ? Math.min(item.balance / item.target, 1) : 0;
+    const accent = item.color ?? COLORS[0];
+    const pct = item.target > 0 ? clamp(item.balance / item.target, 0, 1) : 0;
+
     const isMenuOpen = menuAnchor === item.id;
 
     return (
-      <Card style={[styles.card, { backgroundColor: item.color ?? "#1F2937" }]} elevation={3}>
+      <Card style={styles.card} mode="elevated">
         <Card.Content>
-          <View style={styles.cardHeader}>
-            <Text variant="titleMedium" style={styles.cardTitle}>
-              {item.name}
-            </Text>
+          {/* Top row: icon bubble + menu */}
+          <View style={styles.cardTopRow}>
+            <View style={[styles.iconBubble, { backgroundColor: `${accent}22` }]}>
+              <MaterialCommunityIcons name="bullseye-arrow" size={20} color={accent} />
+            </View>
 
             <Menu
               visible={isMenuOpen}
               onDismiss={closeMenu}
               anchor={
                 <IconButton
-                  icon="dots-vertical"
-                  iconColor="white"
+                  icon="dots-horizontal"
                   size={20}
                   onPress={() => openMenu(item.id)}
                 />
@@ -225,11 +258,43 @@ export default function BucketsScreen() {
             </Menu>
           </View>
 
-          <Text style={styles.sub}>
-            {formatCurrency(item.balance)} / {formatCurrency(item.target)}
+          {/* Name */}
+          <Text style={styles.bucketName} numberOfLines={1}>
+            {item.name}
           </Text>
-          <ProgressBar progress={pct} style={styles.progress} />
-          <Text style={styles.percent}>{Math.round(pct * 100)}%</Text>
+
+          {/* Big amount */}
+          <View style={styles.amountRow}>
+            <Text style={styles.bigAmount}>{formatCurrency(item.balance)}</Text>
+            <Text style={styles.ofAmount}> / {formatCurrency(item.target)}</Text>
+          </View>
+
+          {/* Progress */}
+          <ProgressBar progress={pct} style={styles.progress} color={accent} />
+
+          <View style={styles.completedRow}>
+            <Text style={styles.muted}>{Math.round(pct * 100)}% Completed</Text>
+          </View>
+
+          {/* Quick add buttons */}
+          <View style={styles.quickRow}>
+            <Button
+              mode="outlined"
+              onPress={() => quickAdd(item, 50)}
+              style={styles.quickBtn}
+              compact
+            >
+              + {formatCurrency(50)}
+            </Button>
+            <Button
+              mode="outlined"
+              onPress={() => quickAdd(item, 100)}
+              style={styles.quickBtn}
+              compact
+            >
+              + {formatCurrency(100)}
+            </Button>
+          </View>
         </Card.Content>
       </Card>
     );
@@ -237,10 +302,17 @@ export default function BucketsScreen() {
 
   return (
     <View style={styles.container}>
+      {/* Header like your screenshot */}
       <View style={styles.headerRow}>
-        <Text variant="titleLarge">Buckets</Text>
-        <Button mode="contained" onPress={openCreate}>
-          New
+        <View style={{ flex: 1 }}>
+          <Text variant="headlineSmall" style={styles.title}>
+            Personal Buckets
+          </Text>
+          <Text style={styles.subtitle}>Track and manage your savings goals.</Text>
+        </View>
+
+        <Button mode="contained" icon="plus" onPress={openCreate}>
+          New Goal
         </Button>
       </View>
 
@@ -248,14 +320,23 @@ export default function BucketsScreen() {
         data={buckets}
         keyExtractor={(b) => b.id}
         renderItem={renderItem}
-        numColumns={2}
-        columnWrapperStyle={styles.row}
+        numColumns={numColumns}
+        key={numColumns} // forces layout recalculation when columns change
+        columnWrapperStyle={numColumns > 1 ? styles.row : undefined}
         contentContainerStyle={buckets.length === 0 ? styles.emptyContainer : undefined}
         ListEmptyComponent={
           <Card style={{ borderRadius: 12 }}>
             <Card.Content>
-              <Text>You don’t have any buckets yet.</Text>
-              <Text>Create your first one to start tracking savings goals.</Text>
+              <Text style={{ fontWeight: "700", marginBottom: 6 }}>
+                You don’t have any buckets yet.
+              </Text>
+              <Text style={styles.muted}>
+                Create your first goal to start tracking savings.
+              </Text>
+              <View style={{ height: 12 }} />
+              <Button mode="contained" icon="plus" onPress={openCreate}>
+                New Goal
+              </Button>
             </Card.Content>
           </Card>
         }
@@ -287,15 +368,19 @@ export default function BucketsScreen() {
               style={{ marginBottom: 16 }}
             />
 
-            <Text style={{ marginBottom: 8 }}>Color</Text>
+            <Text style={{ marginBottom: 8 }}>Accent Color</Text>
             <View style={styles.colorRow}>
               {COLORS.map((c) => (
                 <Chip
                   key={c}
                   selected={color === c}
                   onPress={() => setColor(c)}
-                  style={[styles.colorChip, { backgroundColor: c }]}
-                  textStyle={{ color: "white", fontWeight: "600" }}
+                  style={[
+                    styles.colorChip,
+                    { backgroundColor: c },
+                    color === c ? styles.colorChipSelected : null,
+                  ]}
+                  textStyle={{ color: "white", fontWeight: "700" }}
                 >
                   {color === c ? "Selected" : " "}
                 </Chip>
@@ -304,7 +389,12 @@ export default function BucketsScreen() {
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={closeCreate}>Cancel</Button>
-            <Button mode="contained" onPress={onAddBucket} disabled={!canCreate} loading={submitting}>
+            <Button
+              mode="contained"
+              onPress={onAddBucket}
+              disabled={!canCreate}
+              loading={submitting}
+            >
               Save
             </Button>
           </Dialog.Actions>
@@ -319,14 +409,18 @@ export default function BucketsScreen() {
             <TextInput
               label="Name"
               value={editing?.name ?? ""}
-              onChangeText={(v) => setEditing((prev) => (prev ? { ...prev, name: v } : prev))}
+              onChangeText={(v) =>
+                setEditing((prev) => (prev ? { ...prev, name: v } : prev))
+              }
               style={{ marginBottom: 12 }}
             />
             <TextInput
               label="Target Amount"
               value={editing?.target?.toString() ?? ""}
               onChangeText={(v) =>
-                setEditing((prev) => (prev ? { ...prev, target: Number(v) || 0 } : prev))
+                setEditing((prev) =>
+                  prev ? { ...prev, target: Number(v) || 0 } : prev
+                )
               }
               keyboardType="numeric"
               style={{ marginBottom: 12 }}
@@ -335,13 +429,15 @@ export default function BucketsScreen() {
               label="Balance"
               value={editing?.balance?.toString() ?? ""}
               onChangeText={(v) =>
-                setEditing((prev) => (prev ? { ...prev, balance: Number(v) || 0 } : prev))
+                setEditing((prev) =>
+                  prev ? { ...prev, balance: Number(v) || 0 } : prev
+                )
               }
               keyboardType="numeric"
               style={{ marginBottom: 16 }}
             />
 
-            <Text style={{ marginBottom: 8 }}>Color</Text>
+            <Text style={{ marginBottom: 8 }}>Accent Color</Text>
             <View style={styles.colorRow}>
               {COLORS.map((c) => (
                 <Chip
@@ -350,8 +446,12 @@ export default function BucketsScreen() {
                   onPress={() =>
                     setEditing((prev) => (prev ? { ...prev, color: c } : prev))
                   }
-                  style={[styles.colorChip, { backgroundColor: c }]}
-                  textStyle={{ color: "white", fontWeight: "600" }}
+                  style={[
+                    styles.colorChip,
+                    { backgroundColor: c },
+                    editing?.color === c ? styles.colorChipSelected : null,
+                  ]}
+                  textStyle={{ color: "white", fontWeight: "700" }}
                 >
                   {editing?.color === c ? "Selected" : " "}
                 </Chip>
@@ -369,22 +469,22 @@ export default function BucketsScreen() {
 
       {/* Delete Confirm */}
       <Portal>
-  <Dialog visible={deleteVisible} onDismiss={closeDelete}>
-    <Dialog.Title>Delete Bucket</Dialog.Title>
-    <Dialog.Content>
-      <Text>
-        Are you sure you want to delete{" "}
-        <Text style={{ fontWeight: "700" }}>{editing?.name}</Text>?
-      </Text>
-    </Dialog.Content>
-    <Dialog.Actions>
-      <Button onPress={closeDelete}>Cancel</Button>
-      <Button mode="contained" onPress={onConfirmDelete} loading={submitting}>
-        Delete
-      </Button>
-    </Dialog.Actions>
-  </Dialog>
-</Portal>
+        <Dialog visible={deleteVisible} onDismiss={closeDelete}>
+          <Dialog.Title>Delete Bucket</Dialog.Title>
+          <Dialog.Content>
+            <Text>
+              Are you sure you want to delete{" "}
+              <Text style={{ fontWeight: "800" }}>{editing?.name}</Text>?
+            </Text>
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={closeDelete}>Cancel</Button>
+            <Button mode="contained" onPress={onConfirmDelete} loading={submitting}>
+              Delete
+            </Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
     </View>
   );
 }
@@ -392,34 +492,78 @@ export default function BucketsScreen() {
 const GAP = 12;
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 16 },
+  container: { flex: 1, padding: 16, backgroundColor: "#F6F7FB" },
+
   headerRow: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    marginBottom: GAP,
+    gap: 12,
+    marginBottom: 14,
   },
+  title: { fontWeight: "900" },
+  subtitle: { opacity: 0.7, marginTop: 2 },
+
   row: {
-    justifyContent: "space-between",
+    gap: GAP,
     marginBottom: GAP,
   },
+
   card: {
     flex: 1,
-    marginRight: GAP / 2,
-    marginLeft: GAP / 2,
     borderRadius: 16,
-    minHeight: 160,
+    marginBottom: GAP,
+    backgroundColor: "white",
   },
-  cardHeader: {
+
+  cardTopRow: {
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "flex-start",
+    alignItems: "center",
+    marginBottom: 10,
   },
-  cardTitle: { color: "white", fontWeight: "700", marginBottom: 4, flex: 1, paddingRight: 6 },
-  sub: { color: "white", opacity: 0.9, marginBottom: 8 },
-  progress: { height: 10, borderRadius: 6, backgroundColor: "rgba(255,255,255,0.3)" },
-  percent: { color: "white", textAlign: "right", marginTop: 6, opacity: 0.95 },
-  emptyContainer: { flex: 1, justifyContent: "center" },
+  iconBubble: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  bucketName: {
+    fontWeight: "900",
+    fontSize: 18,
+    marginBottom: 8,
+  },
+
+  amountRow: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: 6,
+    marginBottom: 10,
+  },
+  bigAmount: { fontWeight: "900", fontSize: 22 },
+  ofAmount: { opacity: 0.6 },
+
+  progress: { height: 10, borderRadius: 10, backgroundColor: "rgba(0,0,0,0.06)" },
+
+  completedRow: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    marginTop: 10,
+    marginBottom: 12,
+  },
+  muted: { opacity: 0.7 },
+
+  quickRow: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  quickBtn: { flex: 1, borderRadius: 12 },
+
+  emptyContainer: { flexGrow: 1, justifyContent: "center" },
+
   colorRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  colorChip: { marginRight: 8, marginBottom: 8, borderRadius: 999 },
+  colorChip: { borderRadius: 999, marginBottom: 8 },
+  colorChipSelected: { borderWidth: 2, borderColor: "rgba(0,0,0,0.15)" },
 });
