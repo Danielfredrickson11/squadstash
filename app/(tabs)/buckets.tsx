@@ -2,6 +2,8 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 import {
   DocumentData,
   addDoc,
+  arrayRemove,
+  arrayUnion,
   collection,
   deleteDoc,
   doc,
@@ -92,6 +94,12 @@ export default function BucketsScreen() {
   const [deleteVisible, setDeleteVisible] = useState(false);
   const [editing, setEditing] = useState<Bucket | null>(null);
 
+  // ✅ Members dialog state
+  const [membersVisible, setMembersVisible] = useState(false);
+  const [membersBucket, setMembersBucket] = useState<Bucket | null>(null);
+  const [inviteUid, setInviteUid] = useState("");
+  const [membersSubmitting, setMembersSubmitting] = useState(false);
+
   const canCreate = useMemo(
     () => name.trim().length > 0 && Number(target) > 0 && !submitting,
     [name, target, submitting]
@@ -127,7 +135,6 @@ export default function BucketsScreen() {
         });
         setBuckets(next);
 
-        // quick sanity log (safe to keep for now)
         console.log(
           "BUCKETS SNAPSHOT:",
           next.map((b) => ({ id: b.id.slice(0, 6), name: b.name }))
@@ -261,6 +268,71 @@ export default function BucketsScreen() {
     }
   };
 
+  // ✅ Members dialog
+  const openMembers = (b: Bucket) => {
+    setMembersBucket(b);
+    setInviteUid("");
+    setMembersVisible(true);
+    closeMenu();
+  };
+
+  const closeMembers = () => {
+    setMembersVisible(false);
+    setMembersBucket(null);
+    setInviteUid("");
+  };
+
+  const inviteMemberByUid = async () => {
+    if (!user || !membersBucket) return;
+
+    const uid = inviteUid.trim();
+    if (!uid) return;
+
+    if (membersBucket.ownerId !== user.uid) {
+      console.warn("Only the owner can add members.");
+      return;
+    }
+
+    setMembersSubmitting(true);
+    try {
+      const ref = doc(db, "buckets", membersBucket.id);
+      await updateDoc(ref, {
+        memberIds: arrayUnion(uid),
+      });
+      setInviteUid("");
+    } catch (e) {
+      console.error("Failed to invite member:", e);
+    } finally {
+      setMembersSubmitting(false);
+    }
+  };
+
+  const removeMember = async (uidToRemove: string) => {
+    if (!user || !membersBucket) return;
+
+    if (membersBucket.ownerId !== user.uid) {
+      console.warn("Only the owner can remove members.");
+      return;
+    }
+
+    if (uidToRemove === membersBucket.ownerId) {
+      console.warn("Owner cannot be removed.");
+      return;
+    }
+
+    setMembersSubmitting(true);
+    try {
+      const ref = doc(db, "buckets", membersBucket.id);
+      await updateDoc(ref, {
+        memberIds: arrayRemove(uidToRemove),
+      });
+    } catch (e) {
+      console.error("Failed to remove member:", e);
+    } finally {
+      setMembersSubmitting(false);
+    }
+  };
+
   const renderItem = ({ item }: { item: Bucket }) => {
     const accent = item.color ?? COLORS[0];
     const pct = item.target > 0 ? clamp(item.balance / item.target, 0, 1) : 0;
@@ -275,34 +347,38 @@ export default function BucketsScreen() {
         <Card.Content>
           <View style={styles.cardTopRow}>
             <View style={[styles.iconBubble, { backgroundColor: `${accent}22` }]}>
-              <MaterialCommunityIcons
-                name="bullseye-arrow"
-                size={20}
-                color={accent}
-              />
+              <MaterialCommunityIcons name="bullseye-arrow" size={20} color={accent} />
             </View>
 
-            <Menu
-              visible={isMenuOpen}
-              onDismiss={closeMenu}
-              anchor={
-                <IconButton
-                  icon="dots-horizontal"
-                  size={20}
-                  onPress={() => openMenu(item.id)}
-                />
-              }
-            >
-              <Menu.Item title="Edit" onPress={() => startEdit(item)} />
-              <Menu.Item
-                title="Delete"
-                onPress={() => startDelete(item)}
-                disabled={!isOwner}
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 2 }}>
+              <IconButton
+                icon="account-multiple"
+                size={20}
+                onPress={() => openMembers(item)}
               />
-            </Menu>
+
+              <Menu
+                visible={isMenuOpen}
+                onDismiss={closeMenu}
+                anchor={
+                  <IconButton
+                    icon="dots-horizontal"
+                    size={20}
+                    onPress={() => openMenu(item.id)}
+                  />
+                }
+              >
+                <Menu.Item title="Members" onPress={() => openMembers(item)} />
+                <Menu.Item title="Edit" onPress={() => startEdit(item)} />
+                <Menu.Item
+                  title="Delete"
+                  onPress={() => startDelete(item)}
+                  disabled={!isOwner}
+                />
+              </Menu>
+            </View>
           </View>
 
-          {/* ✅ Web-proof name rendering */}
           <View style={[styles.nameWrap, DEBUG_NAME_BOX ? styles.debugBox : null]}>
             <RNText style={styles.bucketNameText}>{displayName}</RNText>
           </View>
@@ -318,21 +394,18 @@ export default function BucketsScreen() {
             <Text style={styles.muted}>{Math.round(pct * 100)}% Completed</Text>
           </View>
 
+          <View style={styles.memberMetaRow}>
+            <Text style={styles.muted}>
+              Members: {item.memberIds?.length ?? 0}
+              {isOwner ? " • You’re owner" : ""}
+            </Text>
+          </View>
+
           <View style={styles.quickRow}>
-            <Button
-              mode="outlined"
-              onPress={() => quickAdd(item, 50)}
-              style={styles.quickBtn}
-              compact
-            >
+            <Button mode="outlined" onPress={() => quickAdd(item, 50)} style={styles.quickBtn} compact>
               + {formatCurrency(50)}
             </Button>
-            <Button
-              mode="outlined"
-              onPress={() => quickAdd(item, 100)}
-              style={styles.quickBtn}
-              compact
-            >
+            <Button mode="outlined" onPress={() => quickAdd(item, 100)} style={styles.quickBtn} compact>
               + {formatCurrency(100)}
             </Button>
           </View>
@@ -340,6 +413,9 @@ export default function BucketsScreen() {
       </Card>
     );
   };
+
+  const currentMembers = membersBucket?.memberIds ?? [];
+  const currentIsOwner = !!(user?.uid && membersBucket?.ownerId === user.uid);
 
   return (
     <View style={styles.container}>
@@ -363,18 +439,14 @@ export default function BucketsScreen() {
         numColumns={numColumns}
         key={numColumns}
         columnWrapperStyle={numColumns > 1 ? styles.row : undefined}
-        contentContainerStyle={
-          buckets.length === 0 ? styles.emptyContainer : undefined
-        }
+        contentContainerStyle={buckets.length === 0 ? styles.emptyContainer : undefined}
         ListEmptyComponent={
           <Card style={{ borderRadius: 12 }}>
             <Card.Content>
               <Text style={{ fontWeight: "700", marginBottom: 6 }}>
                 You don’t have any buckets yet.
               </Text>
-              <Text style={styles.muted}>
-                Create your first goal to start tracking savings.
-              </Text>
+              <Text style={styles.muted}>Create your first goal to start tracking savings.</Text>
               <View style={{ height: 12 }} />
               <Button mode="contained" icon="plus" onPress={openCreate}>
                 New Goal
@@ -383,6 +455,74 @@ export default function BucketsScreen() {
           </Card>
         }
       />
+
+      {/* ✅ Members Dialog */}
+      <Portal>
+        <Dialog visible={membersVisible} onDismiss={closeMembers}>
+          <Dialog.Title>Bucket Members</Dialog.Title>
+          <Dialog.Content>
+            <Text style={{ marginBottom: 8, opacity: 0.7 }}>
+              Bucket: <Text style={{ fontWeight: "800" }}>{membersBucket?.name || "Untitled"}</Text>
+            </Text>
+
+            {!currentIsOwner ? (
+              <Text style={{ marginBottom: 12, opacity: 0.7 }}>
+                Only the bucket owner can add/remove members (for now).
+              </Text>
+            ) : (
+              <>
+                <TextInput
+                  label="Invite by UID (for now)"
+                  value={inviteUid}
+                  onChangeText={setInviteUid}
+                  autoCapitalize="none"
+                  style={{ marginBottom: 10 }}
+                />
+                <Button
+                  mode="contained"
+                  onPress={inviteMemberByUid}
+                  loading={membersSubmitting}
+                  disabled={!inviteUid.trim()}
+                >
+                  Add Member
+                </Button>
+                <View style={{ height: 14 }} />
+              </>
+            )}
+
+            <Text style={{ fontWeight: "800", marginBottom: 8 }}>Current members</Text>
+            {currentMembers.length === 0 ? (
+              <Text style={{ opacity: 0.7 }}>No members.</Text>
+            ) : (
+              currentMembers.map((m) => {
+                const short = `${m.slice(0, 6)}…${m.slice(-4)}`;
+                const isOwnerMember = membersBucket?.ownerId === m;
+
+                return (
+                  <View key={m} style={styles.memberRow}>
+                    <Text style={{ flex: 1 }}>
+                      {short} {isOwnerMember ? "(owner)" : ""}
+                    </Text>
+
+                    {currentIsOwner && !isOwnerMember ? (
+                      <Button
+                        mode="text"
+                        onPress={() => removeMember(m)}
+                        loading={membersSubmitting}
+                      >
+                        Remove
+                      </Button>
+                    ) : null}
+                  </View>
+                );
+              })
+            )}
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={closeMembers}>Done</Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
 
       {/* Create Dialog */}
       <Portal>
@@ -431,12 +571,7 @@ export default function BucketsScreen() {
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={closeCreate}>Cancel</Button>
-            <Button
-              mode="contained"
-              onPress={onAddBucket}
-              disabled={!canCreate}
-              loading={submitting}
-            >
+            <Button mode="contained" onPress={onAddBucket} disabled={!canCreate} loading={submitting}>
               Save
             </Button>
           </Dialog.Actions>
@@ -451,18 +586,14 @@ export default function BucketsScreen() {
             <TextInput
               label="Name"
               value={editing?.name ?? ""}
-              onChangeText={(v) =>
-                setEditing((p) => (p ? { ...p, name: v } : p))
-              }
+              onChangeText={(v) => setEditing((p) => (p ? { ...p, name: v } : p))}
               style={{ marginBottom: 12 }}
             />
             <TextInput
               label="Target Amount"
               value={editing?.target?.toString() ?? ""}
               onChangeText={(v) =>
-                setEditing((p) =>
-                  p ? { ...p, target: Number(v) || 0 } : p
-                )
+                setEditing((p) => (p ? { ...p, target: Number(v) || 0 } : p))
               }
               keyboardType="numeric"
               style={{ marginBottom: 12 }}
@@ -471,9 +602,7 @@ export default function BucketsScreen() {
               label="Balance"
               value={editing?.balance?.toString() ?? ""}
               onChangeText={(v) =>
-                setEditing((p) =>
-                  p ? { ...p, balance: Number(v) || 0 } : p
-                )
+                setEditing((p) => (p ? { ...p, balance: Number(v) || 0 } : p))
               }
               keyboardType="numeric"
               style={{ marginBottom: 16 }}
@@ -485,9 +614,7 @@ export default function BucketsScreen() {
                 <Chip
                   key={c}
                   selected={editing?.color === c}
-                  onPress={() =>
-                    setEditing((p) => (p ? { ...p, color: c } : p))
-                  }
+                  onPress={() => setEditing((p) => (p ? { ...p, color: c } : p))}
                   style={[
                     styles.colorChip,
                     { backgroundColor: c },
@@ -524,11 +651,7 @@ export default function BucketsScreen() {
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={closeDelete}>Cancel</Button>
-            <Button
-              mode="contained"
-              onPress={onConfirmDelete}
-              loading={submitting}
-            >
+            <Button mode="contained" onPress={onConfirmDelete} loading={submitting}>
               Delete
             </Button>
           </Dialog.Actions>
@@ -576,7 +699,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 
-  // ✅ This wrapper prevents weird web layout collapse
   nameWrap: {
     minHeight: 26,
     justifyContent: "center",
@@ -587,7 +709,6 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     lineHeight: 22,
     color: "#111827",
-    // helps on web when cards get tight
     flexShrink: 1,
   },
 
@@ -617,6 +738,8 @@ const styles = StyleSheet.create({
   },
   muted: { opacity: 0.7 },
 
+  memberMetaRow: { marginBottom: 10 },
+
   quickRow: { flexDirection: "row", gap: 10 },
   quickBtn: { flex: 1, borderRadius: 12 },
 
@@ -625,4 +748,13 @@ const styles = StyleSheet.create({
   colorRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   colorChip: { borderRadius: 999, marginBottom: 8 },
   colorChipSelected: { borderWidth: 2, borderColor: "rgba(0,0,0,0.15)" },
+
+  memberRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 6,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "rgba(0,0,0,0.08)",
+  },
 });

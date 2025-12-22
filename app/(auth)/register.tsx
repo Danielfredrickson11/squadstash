@@ -1,9 +1,10 @@
 import { router } from "expo-router";
 import { createUserWithEmailAndPassword, updateProfile } from "firebase/auth";
+import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import React, { useState } from "react";
 import { View } from "react-native";
 import { Button, Card, Text, TextInput } from "react-native-paper";
-import { auth } from "../../firebase";
+import { auth, db } from "../../firebase";
 
 export default function Register() {
   const [name, setName] = useState("");
@@ -16,11 +17,24 @@ export default function Register() {
     setError(null);
     setSubmitting(true);
     try {
-      const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
-      if (name.trim()) {
-        await updateProfile(cred.user, { displayName: name.trim() });
+      const cleanEmail = email.trim().toLowerCase();
+      const cred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+
+      const displayName = name.trim() || "";
+
+      if (displayName) {
+        await updateProfile(cred.user, { displayName });
       }
-      router.replace("/(tabs)/home"); // <-- navigate immediately
+
+      // ✅ Create user profile doc (foundation for future invites)
+      await setDoc(doc(db, "users", cred.user.uid), {
+        uid: cred.user.uid,
+        email: cleanEmail,
+        displayName,
+        createdAt: serverTimestamp(),
+      });
+
+      router.replace("/(tabs)/home");
     } catch (e: any) {
       setError(e.message ?? "Registration failed");
     } finally {
@@ -54,7 +68,9 @@ export default function Register() {
             onChangeText={setPassword}
             style={{ marginBottom: 12 }}
           />
-          {error ? <Text style={{ color: "red", marginBottom: 8 }}>{error}</Text> : null}
+          {error ? (
+            <Text style={{ color: "red", marginBottom: 8 }}>{error}</Text>
+          ) : null}
           <Button mode="contained" onPress={onRegister} loading={submitting}>
             Sign Up
           </Button>
