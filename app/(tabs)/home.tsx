@@ -6,16 +6,11 @@ import {
   onSnapshot,
   orderBy,
   query,
+  where,
 } from "firebase/firestore";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ScrollView, StyleSheet, View } from "react-native";
-import {
-  Button,
-  Card,
-  Divider,
-  ProgressBar,
-  Text,
-} from "react-native-paper";
+import { Button, Card, Divider, ProgressBar, Text } from "react-native-paper";
 import { db } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
 import { formatCurrency } from "../../utils/format";
@@ -63,13 +58,16 @@ export default function HomeScreen() {
   useEffect(() => {
     if (!user) return;
 
-    const q = query(
-      collection(db, "users", user.uid, "buckets"),
+    // ✅ NEW: shared buckets query (memberIds contains my uid)
+    const qRef = query(
+      collection(db, "buckets"),
+      where("memberIds", "array-contains", user.uid),
       orderBy("createdAt", "desc")
     );
 
-    const unsub = onSnapshot(q, (snap) => {
+    const unsub = onSnapshot(qRef, (snap) => {
       const list: MiniBucket[] = [];
+
       snap.forEach((d) => {
         const data = d.data() as DocumentData;
         list.push({
@@ -81,7 +79,7 @@ export default function HomeScreen() {
 
       setBuckets(list);
 
-      // "Last updated" (skip the very first render to avoid looking weird)
+      // "Last updated" (skip first render)
       if (!firstLoad.current) setLastUpdated(new Date());
       firstLoad.current = false;
     });
@@ -144,7 +142,7 @@ export default function HomeScreen() {
         <Text style={styles.lastUpdated}>{lastUpdatedLabel}</Text>
       </View>
 
-      {/* Stat cards (2x2) */}
+      {/* Stat cards */}
       <View style={styles.statsGrid}>
         <StatCard
           label="Personal Savings"
@@ -206,9 +204,7 @@ export default function HomeScreen() {
         <Card.Content>
           <View style={styles.sectionHeaderRow}>
             <Text style={styles.sectionTitle}>Overall Progress</Text>
-            <Text style={styles.muted}>
-              {Math.round(totals.progress * 100)}%
-            </Text>
+            <Text style={styles.muted}>{Math.round(totals.progress * 100)}%</Text>
           </View>
           <Text style={styles.muted}>
             {formatCurrency(totals.totalSaved)} / {formatCurrency(totals.totalGoals)}
@@ -343,9 +339,7 @@ const styles = StyleSheet.create({
     gap: 10,
     marginTop: 10,
   },
-  actionBtn: {
-    flexGrow: 1,
-  },
+  actionBtn: { flexGrow: 1 },
 
   progressBar: { height: 10, borderRadius: 8 },
 

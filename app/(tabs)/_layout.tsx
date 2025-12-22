@@ -20,6 +20,9 @@ export default function TabLayout() {
   const colorScheme = useColorScheme();
   const { user, loading } = useAuth();
 
+  // ✅ IMPORTANT: call hooks at the top level (not inside screenOptions)
+  const headerShown = useClientOnlyValue(false, true);
+
   // 1) Wait for Firebase to tell us if someone is logged in
   if (loading) {
     return (
@@ -39,7 +42,7 @@ export default function TabLayout() {
     <Tabs
       screenOptions={{
         tabBarActiveTintColor: Colors[colorScheme ?? "light"].tint,
-        headerShown: useClientOnlyValue(false, true),
+        headerShown,
         tabBarStyle: { paddingBottom: 4, height: 60 },
         tabBarLabelStyle: { fontSize: 12 },
       }}

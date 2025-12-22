@@ -1,17 +1,3 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { FlatList, StyleSheet, View, useWindowDimensions } from "react-native";
-import {
-  Button,
-  Card,
-  Dialog,
-  IconButton,
-  Menu,
-  Portal,
-  ProgressBar,
-  Text,
-  TextInput,
-  Chip,
-} from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import {
   DocumentData,
@@ -24,7 +10,28 @@ import {
   query,
   serverTimestamp,
   updateDoc,
+  where,
 } from "firebase/firestore";
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  FlatList,
+  Text as RNText,
+  StyleSheet,
+  View,
+  useWindowDimensions,
+} from "react-native";
+import {
+  Button,
+  Card,
+  Chip,
+  Dialog,
+  IconButton,
+  Menu,
+  Portal,
+  ProgressBar,
+  Text,
+  TextInput,
+} from "react-native-paper";
 import { db } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
 import { formatCurrency } from "../../utils/format";
@@ -32,32 +39,37 @@ import { formatCurrency } from "../../utils/format";
 type Bucket = {
   id: string;
   name: string;
-  target: number; // goal amount
-  balance: number; // current saved
-  color?: string | null; // accent color
+  target: number;
+  balance: number;
+  color?: string | null;
   createdAt?: any;
+
+  ownerId: string;
+  memberIds: string[];
 };
 
 const COLORS = [
-  "#2563EB", // blue
-  "#10B981", // emerald
-  "#8B5CF6", // violet
-  "#F59E0B", // amber
-  "#EF4444", // red
-  "#06B6D4", // cyan
-  "#EC4899", // pink
-  "#0EA5E9", // sky
+  "#2563EB",
+  "#10B981",
+  "#8B5CF6",
+  "#F59E0B",
+  "#EF4444",
+  "#06B6D4",
+  "#EC4899",
+  "#0EA5E9",
 ];
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(n, max));
 }
 
+// ✅ Toggle this ON until names show, then set false
+const DEBUG_NAME_BOX = false;
+
 export default function BucketsScreen() {
   const { user } = useAuth();
   const { width } = useWindowDimensions();
 
-  // Responsive columns (web can show 3 like your screenshot)
   const numColumns = useMemo(() => {
     if (width >= 1100) return 3;
     if (width >= 700) return 2;
@@ -66,7 +78,7 @@ export default function BucketsScreen() {
 
   const [buckets, setBuckets] = useState<Bucket[]>([]);
 
-  // Create dialog state
+  // Create dialog
   const [createVisible, setCreateVisible] = useState(false);
   const [name, setName] = useState("");
   const [target, setTarget] = useState("");
@@ -75,7 +87,7 @@ export default function BucketsScreen() {
   const [submitting, setSubmitting] = useState(false);
 
   // Edit/Delete state
-  const [menuAnchor, setMenuAnchor] = useState<string | null>(null); // bucketId
+  const [menuAnchor, setMenuAnchor] = useState<string | null>(null);
   const [editVisible, setEditVisible] = useState(false);
   const [deleteVisible, setDeleteVisible] = useState(false);
   const [editing, setEditing] = useState<Bucket | null>(null);
@@ -85,27 +97,44 @@ export default function BucketsScreen() {
     [name, target, submitting]
   );
 
+  // Read buckets where user is a member
   useEffect(() => {
     if (!user) return;
 
-    const colRef = collection(db, "users", user.uid, "buckets");
-    const qRef = query(colRef, orderBy("createdAt", "desc"));
+    const colRef = collection(db, "buckets");
+    const qRef = query(
+      colRef,
+      where("memberIds", "array-contains", user.uid),
+      orderBy("createdAt", "desc")
+    );
 
-    const unsub = onSnapshot(qRef, (snap) => {
-      const next: Bucket[] = [];
-      snap.forEach((docSnap) => {
-        const d = docSnap.data() as DocumentData;
-        next.push({
-          id: docSnap.id,
-          name: String(d.name ?? "Untitled"),
-          target: Number(d.target) || 0,
-          balance: Number(d.balance) || 0,
-          color: d.color ?? null,
-          createdAt: d.createdAt,
+    const unsub = onSnapshot(
+      qRef,
+      (snap) => {
+        const next: Bucket[] = [];
+        snap.forEach((docSnap) => {
+          const d = docSnap.data() as DocumentData;
+          next.push({
+            id: docSnap.id,
+            name: String(d.name ?? ""),
+            target: Number(d.target) || 0,
+            balance: Number(d.balance) || 0,
+            color: d.color ?? null,
+            createdAt: d.createdAt,
+            ownerId: String(d.ownerId ?? ""),
+            memberIds: Array.isArray(d.memberIds) ? d.memberIds : [],
+          });
         });
-      });
-      setBuckets(next);
-    });
+        setBuckets(next);
+
+        // quick sanity log (safe to keep for now)
+        console.log(
+          "BUCKETS SNAPSHOT:",
+          next.map((b) => ({ id: b.id.slice(0, 6), name: b.name }))
+        );
+      },
+      (err) => console.error("Buckets snapshot error:", err)
+    );
 
     return () => unsub();
   }, [user]);
@@ -125,19 +154,20 @@ export default function BucketsScreen() {
 
     const t = Number(target);
     const b = balance ? Number(balance) : 0;
-
     if (!Number.isFinite(t) || t <= 0) return;
     if (!Number.isFinite(b) || b < 0) return;
 
     setSubmitting(true);
     try {
-      const colRef = collection(db, "users", user.uid, "buckets");
+      const colRef = collection(db, "buckets");
       await addDoc(colRef, {
         name: name.trim(),
         target: t,
         balance: b,
         color: color ?? null,
         createdAt: serverTimestamp(),
+        ownerId: user.uid,
+        memberIds: [user.uid],
       });
       closeCreate();
     } catch (e) {
@@ -147,10 +177,11 @@ export default function BucketsScreen() {
     }
   };
 
-  // Edit/Delete menu
+  // Menu helpers
   const openMenu = (bucketId: string) => setMenuAnchor(bucketId);
   const closeMenu = () => setMenuAnchor(null);
 
+  // Edit
   const startEdit = (b: Bucket) => {
     setEditing(b);
     closeMenu();
@@ -167,15 +198,14 @@ export default function BucketsScreen() {
 
     const t = Number(editing.target);
     const b = Number(editing.balance);
-
     if (!Number.isFinite(t) || t <= 0) return;
     if (!Number.isFinite(b) || b < 0) return;
 
     setSubmitting(true);
     try {
-      const ref = doc(db, "users", user.uid, "buckets", editing.id);
+      const ref = doc(db, "buckets", editing.id);
       await updateDoc(ref, {
-        name: editing.name.trim(),
+        name: String(editing.name ?? "").trim(),
         target: t,
         balance: b,
         color: editing.color ?? null,
@@ -188,6 +218,7 @@ export default function BucketsScreen() {
     }
   };
 
+  // Delete
   const startDelete = (b: Bucket) => {
     setEditing(b);
     closeMenu();
@@ -204,7 +235,11 @@ export default function BucketsScreen() {
 
     setSubmitting(true);
     try {
-      const ref = doc(db, "users", user.uid, "buckets", editing.id);
+      if (editing.ownerId !== user.uid) {
+        console.warn("Only the owner can delete this bucket.");
+        return;
+      }
+      const ref = doc(db, "buckets", editing.id);
       await deleteDoc(ref);
       closeDelete();
     } catch (e) {
@@ -214,13 +249,12 @@ export default function BucketsScreen() {
     }
   };
 
-  // Quick add (+$50 / +$100)
+  // Quick add
   const quickAdd = async (bucket: Bucket, amount: number) => {
     if (!user) return;
     const nextBalance = (Number(bucket.balance) || 0) + amount;
-
     try {
-      const ref = doc(db, "users", user.uid, "buckets", bucket.id);
+      const ref = doc(db, "buckets", bucket.id);
       await updateDoc(ref, { balance: nextBalance });
     } catch (e) {
       console.error("Failed to quick add:", e);
@@ -232,14 +266,20 @@ export default function BucketsScreen() {
     const pct = item.target > 0 ? clamp(item.balance / item.target, 0, 1) : 0;
 
     const isMenuOpen = menuAnchor === item.id;
+    const isOwner = !!(user?.uid && item.ownerId === user.uid);
+
+    const displayName = item.name?.trim() ? item.name.trim() : "Untitled";
 
     return (
       <Card style={styles.card} mode="elevated">
         <Card.Content>
-          {/* Top row: icon bubble + menu */}
           <View style={styles.cardTopRow}>
             <View style={[styles.iconBubble, { backgroundColor: `${accent}22` }]}>
-              <MaterialCommunityIcons name="bullseye-arrow" size={20} color={accent} />
+              <MaterialCommunityIcons
+                name="bullseye-arrow"
+                size={20}
+                color={accent}
+              />
             </View>
 
             <Menu
@@ -254,29 +294,30 @@ export default function BucketsScreen() {
               }
             >
               <Menu.Item title="Edit" onPress={() => startEdit(item)} />
-              <Menu.Item title="Delete" onPress={() => startDelete(item)} />
+              <Menu.Item
+                title="Delete"
+                onPress={() => startDelete(item)}
+                disabled={!isOwner}
+              />
             </Menu>
           </View>
 
-          {/* Name */}
-          <Text style={styles.bucketName} numberOfLines={1}>
-            {item.name}
-          </Text>
+          {/* ✅ Web-proof name rendering */}
+          <View style={[styles.nameWrap, DEBUG_NAME_BOX ? styles.debugBox : null]}>
+            <RNText style={styles.bucketNameText}>{displayName}</RNText>
+          </View>
 
-          {/* Big amount */}
           <View style={styles.amountRow}>
             <Text style={styles.bigAmount}>{formatCurrency(item.balance)}</Text>
             <Text style={styles.ofAmount}> / {formatCurrency(item.target)}</Text>
           </View>
 
-          {/* Progress */}
           <ProgressBar progress={pct} style={styles.progress} color={accent} />
 
           <View style={styles.completedRow}>
             <Text style={styles.muted}>{Math.round(pct * 100)}% Completed</Text>
           </View>
 
-          {/* Quick add buttons */}
           <View style={styles.quickRow}>
             <Button
               mode="outlined"
@@ -302,7 +343,6 @@ export default function BucketsScreen() {
 
   return (
     <View style={styles.container}>
-      {/* Header like your screenshot */}
       <View style={styles.headerRow}>
         <View style={{ flex: 1 }}>
           <Text variant="headlineSmall" style={styles.title}>
@@ -321,9 +361,11 @@ export default function BucketsScreen() {
         keyExtractor={(b) => b.id}
         renderItem={renderItem}
         numColumns={numColumns}
-        key={numColumns} // forces layout recalculation when columns change
+        key={numColumns}
         columnWrapperStyle={numColumns > 1 ? styles.row : undefined}
-        contentContainerStyle={buckets.length === 0 ? styles.emptyContainer : undefined}
+        contentContainerStyle={
+          buckets.length === 0 ? styles.emptyContainer : undefined
+        }
         ListEmptyComponent={
           <Card style={{ borderRadius: 12 }}>
             <Card.Content>
@@ -410,7 +452,7 @@ export default function BucketsScreen() {
               label="Name"
               value={editing?.name ?? ""}
               onChangeText={(v) =>
-                setEditing((prev) => (prev ? { ...prev, name: v } : prev))
+                setEditing((p) => (p ? { ...p, name: v } : p))
               }
               style={{ marginBottom: 12 }}
             />
@@ -418,8 +460,8 @@ export default function BucketsScreen() {
               label="Target Amount"
               value={editing?.target?.toString() ?? ""}
               onChangeText={(v) =>
-                setEditing((prev) =>
-                  prev ? { ...prev, target: Number(v) || 0 } : prev
+                setEditing((p) =>
+                  p ? { ...p, target: Number(v) || 0 } : p
                 )
               }
               keyboardType="numeric"
@@ -429,8 +471,8 @@ export default function BucketsScreen() {
               label="Balance"
               value={editing?.balance?.toString() ?? ""}
               onChangeText={(v) =>
-                setEditing((prev) =>
-                  prev ? { ...prev, balance: Number(v) || 0 } : prev
+                setEditing((p) =>
+                  p ? { ...p, balance: Number(v) || 0 } : p
                 )
               }
               keyboardType="numeric"
@@ -444,7 +486,7 @@ export default function BucketsScreen() {
                   key={c}
                   selected={editing?.color === c}
                   onPress={() =>
-                    setEditing((prev) => (prev ? { ...prev, color: c } : prev))
+                    setEditing((p) => (p ? { ...p, color: c } : p))
                   }
                   style={[
                     styles.colorChip,
@@ -476,10 +518,17 @@ export default function BucketsScreen() {
               Are you sure you want to delete{" "}
               <Text style={{ fontWeight: "800" }}>{editing?.name}</Text>?
             </Text>
+            <Text style={{ marginTop: 8, opacity: 0.7 }}>
+              Only the bucket owner can delete.
+            </Text>
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={closeDelete}>Cancel</Button>
-            <Button mode="contained" onPress={onConfirmDelete} loading={submitting}>
+            <Button
+              mode="contained"
+              onPress={onConfirmDelete}
+              loading={submitting}
+            >
               Delete
             </Button>
           </Dialog.Actions>
@@ -504,10 +553,7 @@ const styles = StyleSheet.create({
   title: { fontWeight: "900" },
   subtitle: { opacity: 0.7, marginTop: 2 },
 
-  row: {
-    gap: GAP,
-    marginBottom: GAP,
-  },
+  row: { gap: GAP, marginBottom: GAP },
 
   card: {
     flex: 1,
@@ -530,10 +576,26 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 
-  bucketName: {
-    fontWeight: "900",
-    fontSize: 18,
+  // ✅ This wrapper prevents weird web layout collapse
+  nameWrap: {
+    minHeight: 26,
+    justifyContent: "center",
     marginBottom: 8,
+  },
+  bucketNameText: {
+    fontSize: 18,
+    fontWeight: "800",
+    lineHeight: 22,
+    color: "#111827",
+    // helps on web when cards get tight
+    flexShrink: 1,
+  },
+
+  debugBox: {
+    backgroundColor: "yellow",
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    borderRadius: 8,
   },
 
   amountRow: {
@@ -555,10 +617,7 @@ const styles = StyleSheet.create({
   },
   muted: { opacity: 0.7 },
 
-  quickRow: {
-    flexDirection: "row",
-    gap: 10,
-  },
+  quickRow: { flexDirection: "row", gap: 10 },
   quickBtn: { flex: 1, borderRadius: 12 },
 
   emptyContainer: { flexGrow: 1, justifyContent: "center" },
