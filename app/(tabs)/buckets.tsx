@@ -18,6 +18,7 @@ import { httpsCallable } from "firebase/functions";
 import React, { useEffect, useMemo, useState } from "react";
 import {
   FlatList,
+  Image,
   Text as RNText,
   StyleSheet,
   View,
@@ -35,10 +36,10 @@ import {
   Text,
   TextInput,
 } from "react-native-paper";
-import { db } from "../../firebase";
+
+import { db, functions } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
 import { formatCurrency } from "../../utils/format";
-import { functions } from "../../firebase"; // ✅ make sure you export `functions` from firebase.ts (see note below)
 
 type Bucket = {
   id: string;
@@ -56,6 +57,7 @@ type PublicUser = {
   uid: string;
   displayName?: string;
   photoURL?: string;
+  emailLower?: string;
 };
 
 const COLORS = [
@@ -73,9 +75,6 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(n, max));
 }
 
-// ✅ Toggle this ON for layout debugging, then set false
-const DEBUG_NAME_BOX = false;
-
 function initialsFromName(name?: string) {
   const s = (name ?? "").trim();
   if (!s) return "?";
@@ -87,14 +86,39 @@ function shortUid(uid: string) {
   return `${uid.slice(0, 6)}…${uid.slice(-4)}`;
 }
 
-/**
- * Small avatar circle with initials (photoURL can be added later)
- */
-function AvatarChip(props: { label: string; index: number }) {
-  const { label, index } = props;
+function isValidInviteEmail(email: string) {
+  const e = email.trim().toLowerCase();
+  return e.includes("@") && e.includes(".") && e.length >= 6;
+}
+
+function AvatarCircle(props: {
+  index: number;
+  label: string;
+  photoURL?: string;
+  size?: number;
+}) {
+  const { index, label, photoURL, size = 26 } = props;
+
   return (
-    <View style={[styles.avatar, { marginLeft: index === 0 ? 0 : -10 }]}>
-      <RNText style={styles.avatarText}>{label}</RNText>
+    <View
+      style={[
+        styles.avatar,
+        {
+          width: size,
+          height: size,
+          borderRadius: 999,
+          marginLeft: index === 0 ? 0 : -10,
+        },
+      ]}
+    >
+      {photoURL ? (
+        <Image
+          source={{ uri: photoURL }}
+          style={{ width: size - 2, height: size - 2, borderRadius: 999 }}
+        />
+      ) : (
+        <RNText style={styles.avatarText}>{label}</RNText>
+      )}
     </View>
   );
 }
@@ -130,11 +154,11 @@ export default function BucketsScreen() {
   const [deleteVisible, setDeleteVisible] = useState(false);
   const [editing, setEditing] = useState<Bucket | null>(null);
 
-  // ✅ Members dialog state
+  // Members dialog state
   const [membersVisible, setMembersVisible] = useState(false);
   const [membersBucket, setMembersBucket] = useState<Bucket | null>(null);
 
-  // Invite by email (real UX)
+  // Invite by email
   const [inviteEmail, setInviteEmail] = useState("");
   const [membersSubmitting, setMembersSubmitting] = useState(false);
   const [membersError, setMembersError] = useState<string | null>(null);
@@ -180,20 +204,18 @@ export default function BucketsScreen() {
     return () => unsub();
   }, [user]);
 
-  // ✅ Subscribe to publicUsers docs for all member UIDs we see
+  // Subscribe to publicUsers docs for all member UIDs we see
   useEffect(() => {
     if (!user) return;
 
     const allUids = new Set<string>();
     buckets.forEach((b) => (b.memberIds ?? []).forEach((uid) => allUids.add(uid)));
-
-    // include current user just in case
     allUids.add(user.uid);
 
     const uids = Array.from(allUids);
     if (uids.length === 0) return;
 
-    // Firestore "in" query max 30 values — chunk it safely
+    // Firestore "in" query max 30 values
     const chunks: string[][] = [];
     for (let i = 0; i < uids.length; i += 30) chunks.push(uids.slice(i, i + 30));
 
@@ -216,6 +238,7 @@ export default function BucketsScreen() {
                 uid: docSnap.id,
                 displayName: String(d.displayName ?? ""),
                 photoURL: String(d.photoURL ?? ""),
+                emailLower: String(d.emailLower ?? ""),
               };
             });
             return next;
@@ -259,6 +282,8 @@ export default function BucketsScreen() {
         createdAt: serverTimestamp(),
         ownerId: user.uid,
         memberIds: [user.uid],
+        lastUpdatedAt: serverTimestamp(),
+        lastUpdatedBy: user.uid,
       });
       closeCreate();
     } catch (e) {
@@ -300,6 +325,8 @@ export default function BucketsScreen() {
         target: t,
         balance: b,
         color: editing.color ?? null,
+        lastUpdatedAt: serverTimestamp(),
+        lastUpdatedBy: user.uid,
       });
       closeEdit();
     } catch (e) {
@@ -346,13 +373,17 @@ export default function BucketsScreen() {
     const nextBalance = (Number(bucket.balance) || 0) + amount;
     try {
       const ref = doc(db, "buckets", bucket.id);
-      await updateDoc(ref, { balance: nextBalance });
+      await updateDoc(ref, {
+        balance: nextBalance,
+        lastUpdatedAt: serverTimestamp(),
+        lastUpdatedBy: user.uid,
+      });
     } catch (e) {
       console.error("Failed to quick add:", e);
     }
   };
 
-  // ✅ Members dialog
+  // Members dialog
   const openMembers = (b: Bucket) => {
     setMembersBucket(b);
     setInviteEmail("");
@@ -368,12 +399,39 @@ export default function BucketsScreen() {
     setMembersError(null);
   };
 
-  // ✅ Invite by email via Cloud Function
+  const currentMembers = membersBucket?.memberIds ?? [];
+  const currentIsOwner = !!(user?.uid && membersBucket?.ownerId === user.uid);
+
+  const nameForUid = (uid: string) => {
+    const pu = publicUsers[uid];
+    const dn = pu?.displayName?.trim();
+    return dn || shortUid(uid);
+  };
+
+  const avatarForUid = (uid: string) => {
+    const pu = publicUsers[uid];
+    const dn = pu?.displayName?.trim();
+    return {
+      label: dn ? initialsFromName(dn) : uid.slice(0, 2).toUpperCase(),
+      photoURL: pu?.photoURL?.trim() || "",
+    };
+  };
+
+  // Invite by email via Cloud Function
   const inviteMemberByEmail = async () => {
     if (!user || !membersBucket) return;
 
     const email = inviteEmail.trim().toLowerCase();
-    if (!email) return;
+    if (!isValidInviteEmail(email)) {
+      setMembersError("Enter a valid email.");
+      return;
+    }
+
+    // ✅ prevent inviting yourself
+    if ((user.email ?? "").toLowerCase() === email) {
+      setMembersError("You can’t invite yourself.");
+      return;
+    }
 
     if (membersBucket.ownerId !== user.uid) {
       setMembersError("Only the bucket owner can add members.");
@@ -395,7 +453,6 @@ export default function BucketsScreen() {
         return;
       }
 
-      // Prevent duplicates + let owner invite themselves without breaking
       if ((membersBucket.memberIds ?? []).includes(uid)) {
         setMembersError("That user is already a member of this bucket.");
         return;
@@ -411,11 +468,7 @@ export default function BucketsScreen() {
       setInviteEmail("");
     } catch (e: any) {
       console.warn("inviteMemberByEmail failed:", e);
-      setMembersError(
-        e?.message?.includes("not-found")
-          ? "No user found with that email."
-          : "Invite failed. Double-check the email and try again."
-      );
+      setMembersError("Invite failed. Double-check the email and try again.");
     } finally {
       setMembersSubmitting(false);
     }
@@ -428,7 +481,6 @@ export default function BucketsScreen() {
       setMembersError("Only the bucket owner can remove members.");
       return;
     }
-
     if (uidToRemove === membersBucket.ownerId) {
       setMembersError("Owner cannot be removed.");
       return;
@@ -452,18 +504,32 @@ export default function BucketsScreen() {
     }
   };
 
-  const nameForUid = (uid: string) => {
-    const pu = publicUsers[uid];
-    const dn = pu?.displayName?.trim();
-    return dn || shortUid(uid);
-  };
+  // ✅ Leave bucket (non-owner)
+  const leaveBucket = async () => {
+    if (!user || !membersBucket) return;
 
-  const initialsForUid = (uid: string) => {
-    const pu = publicUsers[uid];
-    const dn = pu?.displayName?.trim();
-    if (dn) return initialsFromName(dn);
-    // fallback: first 2 of uid
-    return uid.slice(0, 2).toUpperCase();
+    if (membersBucket.ownerId === user.uid) {
+      setMembersError("Owners can’t leave. Transfer ownership later (we’ll add this).");
+      return;
+    }
+
+    setMembersSubmitting(true);
+    setMembersError(null);
+
+    try {
+      const ref = doc(db, "buckets", membersBucket.id);
+      await updateDoc(ref, {
+        memberIds: arrayRemove(user.uid),
+        lastUpdatedAt: serverTimestamp(),
+        lastUpdatedBy: user.uid,
+      });
+      closeMembers();
+    } catch (e) {
+      console.error("Failed to leave bucket:", e);
+      setMembersError("Failed to leave bucket.");
+    } finally {
+      setMembersSubmitting(false);
+    }
   };
 
   const renderItem = ({ item }: { item: Bucket }) => {
@@ -475,7 +541,6 @@ export default function BucketsScreen() {
 
     const displayName = item.name?.trim() ? item.name.trim() : "Untitled";
 
-    // show up to 3 portraits, then +N
     const memberIds = item.memberIds ?? [];
     const topMembers = memberIds.slice(0, 3);
     const extraCount = Math.max(0, memberIds.length - topMembers.length);
@@ -485,15 +550,10 @@ export default function BucketsScreen() {
         <Card.Content>
           <View style={styles.cardTopRow}>
             <View style={[styles.iconBubble, { backgroundColor: `${accent}22` }]}>
-              <MaterialCommunityIcons
-                name="bullseye-arrow"
-                size={20}
-                color={accent}
-              />
+              <MaterialCommunityIcons name="bullseye-arrow" size={20} color={accent} />
             </View>
 
             <View style={styles.memberCluster}>
-              {/* Portrait stack – click to open Members */}
               <Button
                 compact
                 mode="text"
@@ -503,8 +563,15 @@ export default function BucketsScreen() {
               >
                 <View style={styles.avatarStack}>
                   {topMembers.map((uid, idx) => {
-                    const label = initialsForUid(uid);
-                    return <AvatarChip key={uid} label={label} index={idx} />;
+                    const a = avatarForUid(uid);
+                    return (
+                      <AvatarCircle
+                        key={uid}
+                        index={idx}
+                        label={a.label}
+                        photoURL={a.photoURL}
+                      />
+                    );
                   })}
 
                   {extraCount > 0 ? (
@@ -515,32 +582,21 @@ export default function BucketsScreen() {
                 </View>
               </Button>
 
-              {/* Menu */}
               <Menu
                 visible={isMenuOpen}
                 onDismiss={closeMenu}
                 anchor={
-                  <IconButton
-                    icon="dots-horizontal"
-                    size={20}
-                    onPress={() => openMenu(item.id)}
-                  />
+                  <IconButton icon="dots-horizontal" size={20} onPress={() => openMenu(item.id)} />
                 }
               >
                 <Menu.Item title="Members" onPress={() => openMembers(item)} />
                 <Menu.Item title="Edit" onPress={() => startEdit(item)} />
-                <Menu.Item
-                  title="Delete"
-                  onPress={() => startDelete(item)}
-                  disabled={!isOwner}
-                />
+                <Menu.Item title="Delete" onPress={() => startDelete(item)} disabled={!isOwner} />
               </Menu>
             </View>
           </View>
 
-          <View
-            style={[styles.nameWrap, DEBUG_NAME_BOX ? styles.debugBox : null]}
-          >
+          <View style={styles.nameWrap}>
             <RNText style={styles.bucketNameText} numberOfLines={1}>
               {displayName}
             </RNText>
@@ -565,20 +621,10 @@ export default function BucketsScreen() {
           </View>
 
           <View style={styles.quickRow}>
-            <Button
-              mode="outlined"
-              onPress={() => quickAdd(item, 50)}
-              style={styles.quickBtn}
-              compact
-            >
+            <Button mode="outlined" onPress={() => quickAdd(item, 50)} style={styles.quickBtn} compact>
               + {formatCurrency(50)}
             </Button>
-            <Button
-              mode="outlined"
-              onPress={() => quickAdd(item, 100)}
-              style={styles.quickBtn}
-              compact
-            >
+            <Button mode="outlined" onPress={() => quickAdd(item, 100)} style={styles.quickBtn} compact>
               + {formatCurrency(100)}
             </Button>
           </View>
@@ -587,8 +633,13 @@ export default function BucketsScreen() {
     );
   };
 
-  const currentMembers = membersBucket?.memberIds ?? [];
-  const currentIsOwner = !!(user?.uid && membersBucket?.ownerId === user.uid);
+  const inviteDisabled = useMemo(() => {
+    const email = inviteEmail.trim().toLowerCase();
+    if (!currentIsOwner) return true;
+    if (!isValidInviteEmail(email)) return true;
+    if ((user?.email ?? "").toLowerCase() === email) return true;
+    return membersSubmitting;
+  }, [inviteEmail, currentIsOwner, user?.email, membersSubmitting]);
 
   return (
     <View style={styles.container}>
@@ -612,18 +663,14 @@ export default function BucketsScreen() {
         numColumns={numColumns}
         key={numColumns}
         columnWrapperStyle={numColumns > 1 ? styles.row : undefined}
-        contentContainerStyle={
-          buckets.length === 0 ? styles.emptyContainer : undefined
-        }
+        contentContainerStyle={buckets.length === 0 ? styles.emptyContainer : undefined}
         ListEmptyComponent={
           <Card style={{ borderRadius: 12 }}>
             <Card.Content>
               <Text style={{ fontWeight: "700", marginBottom: 6 }}>
                 You don’t have any buckets yet.
               </Text>
-              <Text style={styles.muted}>
-                Create your first goal to start tracking savings.
-              </Text>
+              <Text style={styles.muted}>Create your first goal to start tracking savings.</Text>
               <View style={{ height: 12 }} />
               <Button mode="contained" icon="plus" onPress={openCreate}>
                 New Goal
@@ -633,7 +680,7 @@ export default function BucketsScreen() {
         }
       />
 
-      {/* ✅ Members Dialog */}
+      {/* Members Dialog */}
       <Portal>
         <Dialog visible={membersVisible} onDismiss={closeMembers}>
           <Dialog.Title>Bucket Members</Dialog.Title>
@@ -646,9 +693,22 @@ export default function BucketsScreen() {
             </Text>
 
             {!currentIsOwner ? (
-              <Text style={{ marginBottom: 12, opacity: 0.7 }}>
-                Only the bucket owner can add/remove members (for now).
-              </Text>
+              <>
+                <Text style={{ marginBottom: 12, opacity: 0.7 }}>
+                  Only the bucket owner can add/remove members.
+                </Text>
+
+                <Button
+                  mode="outlined"
+                  onPress={leaveBucket}
+                  loading={membersSubmitting}
+                  disabled={membersSubmitting}
+                >
+                  Leave Bucket
+                </Button>
+
+                <View style={{ height: 12 }} />
+              </>
             ) : (
               <>
                 <TextInput
@@ -659,41 +719,40 @@ export default function BucketsScreen() {
                   keyboardType="email-address"
                   style={{ marginBottom: 10 }}
                 />
+
                 {membersError ? (
                   <Text style={{ color: "#B91C1C", marginBottom: 8 }}>
                     {membersError}
                   </Text>
                 ) : null}
+
                 <Button
                   mode="contained"
                   onPress={inviteMemberByEmail}
                   loading={membersSubmitting}
-                  disabled={!inviteEmail.trim()}
+                  disabled={inviteDisabled}
                 >
-                  Send Invite
+                  Invite
                 </Button>
+
                 <View style={{ height: 14 }} />
               </>
             )}
 
-            <Text style={{ fontWeight: "800", marginBottom: 8 }}>
-              Current members
-            </Text>
+            <Text style={{ fontWeight: "800", marginBottom: 8 }}>Current members</Text>
 
             {currentMembers.length === 0 ? (
               <Text style={{ opacity: 0.7 }}>No members.</Text>
             ) : (
               currentMembers.map((uid) => {
                 const isOwnerMember = membersBucket?.ownerId === uid;
-                const label = initialsForUid(uid);
+                const a = avatarForUid(uid);
                 const display = nameForUid(uid);
 
                 return (
                   <View key={uid} style={styles.memberRow}>
                     <View style={{ flexDirection: "row", alignItems: "center", gap: 10, flex: 1 }}>
-                      <View style={[styles.avatar, { marginLeft: 0 }]}>
-                        <RNText style={styles.avatarText}>{label}</RNText>
-                      </View>
+                      <AvatarCircle index={0} label={a.label} photoURL={a.photoURL} size={30} />
 
                       <View style={{ flex: 1 }}>
                         <Text style={{ fontWeight: "700" }}>
@@ -710,6 +769,7 @@ export default function BucketsScreen() {
                         mode="text"
                         onPress={() => removeMember(uid)}
                         loading={membersSubmitting}
+                        disabled={membersSubmitting}
                       >
                         Remove
                       </Button>
@@ -772,12 +832,7 @@ export default function BucketsScreen() {
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={closeCreate}>Cancel</Button>
-            <Button
-              mode="contained"
-              onPress={onAddBucket}
-              disabled={!canCreate}
-              loading={submitting}
-            >
+            <Button mode="contained" onPress={onAddBucket} disabled={!canCreate} loading={submitting}>
               Save
             </Button>
           </Dialog.Actions>
@@ -798,18 +853,14 @@ export default function BucketsScreen() {
             <TextInput
               label="Target Amount"
               value={editing?.target?.toString() ?? ""}
-              onChangeText={(v) =>
-                setEditing((p) => (p ? { ...p, target: Number(v) || 0 } : p))
-              }
+              onChangeText={(v) => setEditing((p) => (p ? { ...p, target: Number(v) || 0 } : p))}
               keyboardType="numeric"
               style={{ marginBottom: 12 }}
             />
             <TextInput
               label="Balance"
               value={editing?.balance?.toString() ?? ""}
-              onChangeText={(v) =>
-                setEditing((p) => (p ? { ...p, balance: Number(v) || 0 } : p))
-              }
+              onChangeText={(v) => setEditing((p) => (p ? { ...p, balance: Number(v) || 0 } : p))}
               keyboardType="numeric"
               style={{ marginBottom: 16 }}
             />
@@ -857,11 +908,7 @@ export default function BucketsScreen() {
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={closeDelete}>Cancel</Button>
-            <Button
-              mode="contained"
-              onPress={onConfirmDelete}
-              loading={submitting}
-            >
+            <Button mode="contained" onPress={onConfirmDelete} loading={submitting}>
               Delete
             </Button>
           </Dialog.Actions>
@@ -909,7 +956,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 
-  // ✅ name wrapper prevents weird web collapse
   nameWrap: {
     minHeight: 26,
     justifyContent: "center",
@@ -921,13 +967,6 @@ const styles = StyleSheet.create({
     lineHeight: 22,
     color: "#111827",
     flexShrink: 1,
-  },
-
-  debugBox: {
-    backgroundColor: "yellow",
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    borderRadius: 8,
   },
 
   amountRow: {
@@ -955,18 +994,15 @@ const styles = StyleSheet.create({
 
   memberMetaRow: { marginBottom: 10 },
 
-  // ✅ avatar cluster styles
   memberCluster: { flexDirection: "row", alignItems: "center", gap: 6 },
   avatarStack: { flexDirection: "row", alignItems: "center" },
   avatar: {
-    width: 26,
-    height: 26,
-    borderRadius: 999,
     borderWidth: 2,
     borderColor: "white",
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: "#E5E7EB",
+    overflow: "hidden",
   },
   avatarText: { fontSize: 11, fontWeight: "800", color: "#111827" },
   morePill: {
