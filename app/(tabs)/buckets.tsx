@@ -14,6 +14,7 @@ import {
   updateDoc,
   where,
 } from "firebase/firestore";
+import { httpsCallable } from "firebase/functions";
 import React, { useEffect, useMemo, useState } from "react";
 import {
   FlatList,
@@ -37,6 +38,7 @@ import {
 import { db } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
 import { formatCurrency } from "../../utils/format";
+import { functions } from "../../firebase"; // ✅ make sure you export `functions` from firebase.ts (see note below)
 
 type Bucket = {
   id: string;
@@ -48,6 +50,12 @@ type Bucket = {
 
   ownerId: string;
   memberIds: string[];
+};
+
+type PublicUser = {
+  uid: string;
+  displayName?: string;
+  photoURL?: string;
 };
 
 const COLORS = [
@@ -65,8 +73,31 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(n, max));
 }
 
-// ✅ Toggle this ON until names show, then set false
+// ✅ Toggle this ON for layout debugging, then set false
 const DEBUG_NAME_BOX = false;
+
+function initialsFromName(name?: string) {
+  const s = (name ?? "").trim();
+  if (!s) return "?";
+  const parts = s.split(/\s+/).slice(0, 2);
+  return parts.map((p) => (p?.[0] ?? "").toUpperCase()).join("");
+}
+
+function shortUid(uid: string) {
+  return `${uid.slice(0, 6)}…${uid.slice(-4)}`;
+}
+
+/**
+ * Small avatar circle with initials (photoURL can be added later)
+ */
+function AvatarChip(props: { label: string; index: number }) {
+  const { label, index } = props;
+  return (
+    <View style={[styles.avatar, { marginLeft: index === 0 ? 0 : -10 }]}>
+      <RNText style={styles.avatarText}>{label}</RNText>
+    </View>
+  );
+}
 
 export default function BucketsScreen() {
   const { user } = useAuth();
@@ -79,6 +110,11 @@ export default function BucketsScreen() {
   }, [width]);
 
   const [buckets, setBuckets] = useState<Bucket[]>([]);
+
+  // Public users cache: uid -> public user doc
+  const [publicUsers, setPublicUsers] = useState<Record<string, PublicUser>>(
+    {}
+  );
 
   // Create dialog
   const [createVisible, setCreateVisible] = useState(false);
@@ -97,8 +133,11 @@ export default function BucketsScreen() {
   // ✅ Members dialog state
   const [membersVisible, setMembersVisible] = useState(false);
   const [membersBucket, setMembersBucket] = useState<Bucket | null>(null);
-  const [inviteUid, setInviteUid] = useState("");
+
+  // Invite by email (real UX)
+  const [inviteEmail, setInviteEmail] = useState("");
   const [membersSubmitting, setMembersSubmitting] = useState(false);
+  const [membersError, setMembersError] = useState<string | null>(null);
 
   const canCreate = useMemo(
     () => name.trim().length > 0 && Number(target) > 0 && !submitting,
@@ -134,17 +173,62 @@ export default function BucketsScreen() {
           });
         });
         setBuckets(next);
-
-        console.log(
-          "BUCKETS SNAPSHOT:",
-          next.map((b) => ({ id: b.id.slice(0, 6), name: b.name }))
-        );
       },
       (err) => console.error("Buckets snapshot error:", err)
     );
 
     return () => unsub();
   }, [user]);
+
+  // ✅ Subscribe to publicUsers docs for all member UIDs we see
+  useEffect(() => {
+    if (!user) return;
+
+    const allUids = new Set<string>();
+    buckets.forEach((b) => (b.memberIds ?? []).forEach((uid) => allUids.add(uid)));
+
+    // include current user just in case
+    allUids.add(user.uid);
+
+    const uids = Array.from(allUids);
+    if (uids.length === 0) return;
+
+    // Firestore "in" query max 30 values — chunk it safely
+    const chunks: string[][] = [];
+    for (let i = 0; i < uids.length; i += 30) chunks.push(uids.slice(i, i + 30));
+
+    const unsubs: Array<() => void> = [];
+
+    chunks.forEach((chunk) => {
+      const qRef = query(
+        collection(db, "publicUsers"),
+        where("__name__", "in", chunk)
+      );
+
+      const unsub = onSnapshot(
+        qRef,
+        (snap) => {
+          setPublicUsers((prev) => {
+            const next = { ...prev };
+            snap.forEach((docSnap) => {
+              const d = docSnap.data() as any;
+              next[docSnap.id] = {
+                uid: docSnap.id,
+                displayName: String(d.displayName ?? ""),
+                photoURL: String(d.photoURL ?? ""),
+              };
+            });
+            return next;
+          });
+        },
+        (err) => console.warn("publicUsers snapshot error:", err)
+      );
+
+      unsubs.push(unsub);
+    });
+
+    return () => unsubs.forEach((fn) => fn());
+  }, [buckets, user]);
 
   // Create
   const openCreate = () => setCreateVisible(true);
@@ -271,7 +355,8 @@ export default function BucketsScreen() {
   // ✅ Members dialog
   const openMembers = (b: Bucket) => {
     setMembersBucket(b);
-    setInviteUid("");
+    setInviteEmail("");
+    setMembersError(null);
     setMembersVisible(true);
     closeMenu();
   };
@@ -279,29 +364,58 @@ export default function BucketsScreen() {
   const closeMembers = () => {
     setMembersVisible(false);
     setMembersBucket(null);
-    setInviteUid("");
+    setInviteEmail("");
+    setMembersError(null);
   };
 
-  const inviteMemberByUid = async () => {
+  // ✅ Invite by email via Cloud Function
+  const inviteMemberByEmail = async () => {
     if (!user || !membersBucket) return;
 
-    const uid = inviteUid.trim();
-    if (!uid) return;
+    const email = inviteEmail.trim().toLowerCase();
+    if (!email) return;
 
     if (membersBucket.ownerId !== user.uid) {
-      console.warn("Only the owner can add members.");
+      setMembersError("Only the bucket owner can add members.");
       return;
     }
 
     setMembersSubmitting(true);
+    setMembersError(null);
+
     try {
+      const lookup = httpsCallable(functions, "lookupUserByEmail");
+      const res = await lookup({ email });
+
+      const data = res.data as any;
+      const uid = String(data?.uid ?? "").trim();
+
+      if (!uid) {
+        setMembersError("Could not find a user for that email.");
+        return;
+      }
+
+      // Prevent duplicates + let owner invite themselves without breaking
+      if ((membersBucket.memberIds ?? []).includes(uid)) {
+        setMembersError("That user is already a member of this bucket.");
+        return;
+      }
+
       const ref = doc(db, "buckets", membersBucket.id);
       await updateDoc(ref, {
         memberIds: arrayUnion(uid),
+        lastUpdatedAt: serverTimestamp(),
+        lastUpdatedBy: user.uid,
       });
-      setInviteUid("");
-    } catch (e) {
-      console.error("Failed to invite member:", e);
+
+      setInviteEmail("");
+    } catch (e: any) {
+      console.warn("inviteMemberByEmail failed:", e);
+      setMembersError(
+        e?.message?.includes("not-found")
+          ? "No user found with that email."
+          : "Invite failed. Double-check the email and try again."
+      );
     } finally {
       setMembersSubmitting(false);
     }
@@ -311,26 +425,45 @@ export default function BucketsScreen() {
     if (!user || !membersBucket) return;
 
     if (membersBucket.ownerId !== user.uid) {
-      console.warn("Only the owner can remove members.");
+      setMembersError("Only the bucket owner can remove members.");
       return;
     }
 
     if (uidToRemove === membersBucket.ownerId) {
-      console.warn("Owner cannot be removed.");
+      setMembersError("Owner cannot be removed.");
       return;
     }
 
     setMembersSubmitting(true);
+    setMembersError(null);
+
     try {
       const ref = doc(db, "buckets", membersBucket.id);
       await updateDoc(ref, {
         memberIds: arrayRemove(uidToRemove),
+        lastUpdatedAt: serverTimestamp(),
+        lastUpdatedBy: user.uid,
       });
     } catch (e) {
       console.error("Failed to remove member:", e);
+      setMembersError("Failed to remove member.");
     } finally {
       setMembersSubmitting(false);
     }
+  };
+
+  const nameForUid = (uid: string) => {
+    const pu = publicUsers[uid];
+    const dn = pu?.displayName?.trim();
+    return dn || shortUid(uid);
+  };
+
+  const initialsForUid = (uid: string) => {
+    const pu = publicUsers[uid];
+    const dn = pu?.displayName?.trim();
+    if (dn) return initialsFromName(dn);
+    // fallback: first 2 of uid
+    return uid.slice(0, 2).toUpperCase();
   };
 
   const renderItem = ({ item }: { item: Bucket }) => {
@@ -342,21 +475,47 @@ export default function BucketsScreen() {
 
     const displayName = item.name?.trim() ? item.name.trim() : "Untitled";
 
+    // show up to 3 portraits, then +N
+    const memberIds = item.memberIds ?? [];
+    const topMembers = memberIds.slice(0, 3);
+    const extraCount = Math.max(0, memberIds.length - topMembers.length);
+
     return (
       <Card style={styles.card} mode="elevated">
         <Card.Content>
           <View style={styles.cardTopRow}>
             <View style={[styles.iconBubble, { backgroundColor: `${accent}22` }]}>
-              <MaterialCommunityIcons name="bullseye-arrow" size={20} color={accent} />
+              <MaterialCommunityIcons
+                name="bullseye-arrow"
+                size={20}
+                color={accent}
+              />
             </View>
 
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 2 }}>
-              <IconButton
-                icon="account-multiple"
-                size={20}
+            <View style={styles.memberCluster}>
+              {/* Portrait stack – click to open Members */}
+              <Button
+                compact
+                mode="text"
                 onPress={() => openMembers(item)}
-              />
+                style={{ paddingHorizontal: 0 }}
+                contentStyle={{ flexDirection: "row" }}
+              >
+                <View style={styles.avatarStack}>
+                  {topMembers.map((uid, idx) => {
+                    const label = initialsForUid(uid);
+                    return <AvatarChip key={uid} label={label} index={idx} />;
+                  })}
 
+                  {extraCount > 0 ? (
+                    <View style={[styles.morePill, { marginLeft: -10 }]}>
+                      <RNText style={styles.morePillText}>+{extraCount}</RNText>
+                    </View>
+                  ) : null}
+                </View>
+              </Button>
+
+              {/* Menu */}
               <Menu
                 visible={isMenuOpen}
                 onDismiss={closeMenu}
@@ -379,8 +538,12 @@ export default function BucketsScreen() {
             </View>
           </View>
 
-          <View style={[styles.nameWrap, DEBUG_NAME_BOX ? styles.debugBox : null]}>
-            <RNText style={styles.bucketNameText}>{displayName}</RNText>
+          <View
+            style={[styles.nameWrap, DEBUG_NAME_BOX ? styles.debugBox : null]}
+          >
+            <RNText style={styles.bucketNameText} numberOfLines={1}>
+              {displayName}
+            </RNText>
           </View>
 
           <View style={styles.amountRow}>
@@ -402,10 +565,20 @@ export default function BucketsScreen() {
           </View>
 
           <View style={styles.quickRow}>
-            <Button mode="outlined" onPress={() => quickAdd(item, 50)} style={styles.quickBtn} compact>
+            <Button
+              mode="outlined"
+              onPress={() => quickAdd(item, 50)}
+              style={styles.quickBtn}
+              compact
+            >
               + {formatCurrency(50)}
             </Button>
-            <Button mode="outlined" onPress={() => quickAdd(item, 100)} style={styles.quickBtn} compact>
+            <Button
+              mode="outlined"
+              onPress={() => quickAdd(item, 100)}
+              style={styles.quickBtn}
+              compact
+            >
               + {formatCurrency(100)}
             </Button>
           </View>
@@ -439,14 +612,18 @@ export default function BucketsScreen() {
         numColumns={numColumns}
         key={numColumns}
         columnWrapperStyle={numColumns > 1 ? styles.row : undefined}
-        contentContainerStyle={buckets.length === 0 ? styles.emptyContainer : undefined}
+        contentContainerStyle={
+          buckets.length === 0 ? styles.emptyContainer : undefined
+        }
         ListEmptyComponent={
           <Card style={{ borderRadius: 12 }}>
             <Card.Content>
               <Text style={{ fontWeight: "700", marginBottom: 6 }}>
                 You don’t have any buckets yet.
               </Text>
-              <Text style={styles.muted}>Create your first goal to start tracking savings.</Text>
+              <Text style={styles.muted}>
+                Create your first goal to start tracking savings.
+              </Text>
               <View style={{ height: 12 }} />
               <Button mode="contained" icon="plus" onPress={openCreate}>
                 New Goal
@@ -462,7 +639,10 @@ export default function BucketsScreen() {
           <Dialog.Title>Bucket Members</Dialog.Title>
           <Dialog.Content>
             <Text style={{ marginBottom: 8, opacity: 0.7 }}>
-              Bucket: <Text style={{ fontWeight: "800" }}>{membersBucket?.name || "Untitled"}</Text>
+              Bucket:{" "}
+              <Text style={{ fontWeight: "800" }}>
+                {membersBucket?.name || "Untitled"}
+              </Text>
             </Text>
 
             {!currentIsOwner ? (
@@ -472,42 +652,63 @@ export default function BucketsScreen() {
             ) : (
               <>
                 <TextInput
-                  label="Invite by UID (for now)"
-                  value={inviteUid}
-                  onChangeText={setInviteUid}
+                  label="Invite by email"
+                  value={inviteEmail}
+                  onChangeText={setInviteEmail}
                   autoCapitalize="none"
+                  keyboardType="email-address"
                   style={{ marginBottom: 10 }}
                 />
+                {membersError ? (
+                  <Text style={{ color: "#B91C1C", marginBottom: 8 }}>
+                    {membersError}
+                  </Text>
+                ) : null}
                 <Button
                   mode="contained"
-                  onPress={inviteMemberByUid}
+                  onPress={inviteMemberByEmail}
                   loading={membersSubmitting}
-                  disabled={!inviteUid.trim()}
+                  disabled={!inviteEmail.trim()}
                 >
-                  Add Member
+                  Send Invite
                 </Button>
                 <View style={{ height: 14 }} />
               </>
             )}
 
-            <Text style={{ fontWeight: "800", marginBottom: 8 }}>Current members</Text>
+            <Text style={{ fontWeight: "800", marginBottom: 8 }}>
+              Current members
+            </Text>
+
             {currentMembers.length === 0 ? (
               <Text style={{ opacity: 0.7 }}>No members.</Text>
             ) : (
-              currentMembers.map((m) => {
-                const short = `${m.slice(0, 6)}…${m.slice(-4)}`;
-                const isOwnerMember = membersBucket?.ownerId === m;
+              currentMembers.map((uid) => {
+                const isOwnerMember = membersBucket?.ownerId === uid;
+                const label = initialsForUid(uid);
+                const display = nameForUid(uid);
 
                 return (
-                  <View key={m} style={styles.memberRow}>
-                    <Text style={{ flex: 1 }}>
-                      {short} {isOwnerMember ? "(owner)" : ""}
-                    </Text>
+                  <View key={uid} style={styles.memberRow}>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 10, flex: 1 }}>
+                      <View style={[styles.avatar, { marginLeft: 0 }]}>
+                        <RNText style={styles.avatarText}>{label}</RNText>
+                      </View>
+
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ fontWeight: "700" }}>
+                          {display} {isOwnerMember ? "(owner)" : ""}
+                        </Text>
+                        <Text style={{ opacity: 0.6, fontSize: 12 }}>
+                          {shortUid(uid)}
+                        </Text>
+                      </View>
+                    </View>
 
                     {currentIsOwner && !isOwnerMember ? (
                       <Button
                         mode="text"
-                        onPress={() => removeMember(m)}
+                        onPress={() => removeMember(uid)}
                         loading={membersSubmitting}
                       >
                         Remove
@@ -571,7 +772,12 @@ export default function BucketsScreen() {
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={closeCreate}>Cancel</Button>
-            <Button mode="contained" onPress={onAddBucket} disabled={!canCreate} loading={submitting}>
+            <Button
+              mode="contained"
+              onPress={onAddBucket}
+              disabled={!canCreate}
+              loading={submitting}
+            >
               Save
             </Button>
           </Dialog.Actions>
@@ -651,7 +857,11 @@ export default function BucketsScreen() {
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={closeDelete}>Cancel</Button>
-            <Button mode="contained" onPress={onConfirmDelete} loading={submitting}>
+            <Button
+              mode="contained"
+              onPress={onConfirmDelete}
+              loading={submitting}
+            >
               Delete
             </Button>
           </Dialog.Actions>
@@ -699,6 +909,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 
+  // ✅ name wrapper prevents weird web collapse
   nameWrap: {
     minHeight: 26,
     justifyContent: "center",
@@ -728,7 +939,11 @@ const styles = StyleSheet.create({
   bigAmount: { fontWeight: "900", fontSize: 22 },
   ofAmount: { opacity: 0.6 },
 
-  progress: { height: 10, borderRadius: 10, backgroundColor: "rgba(0,0,0,0.06)" },
+  progress: {
+    height: 10,
+    borderRadius: 10,
+    backgroundColor: "rgba(0,0,0,0.06)",
+  },
 
   completedRow: {
     flexDirection: "row",
@@ -739,6 +954,30 @@ const styles = StyleSheet.create({
   muted: { opacity: 0.7 },
 
   memberMetaRow: { marginBottom: 10 },
+
+  // ✅ avatar cluster styles
+  memberCluster: { flexDirection: "row", alignItems: "center", gap: 6 },
+  avatarStack: { flexDirection: "row", alignItems: "center" },
+  avatar: {
+    width: 26,
+    height: 26,
+    borderRadius: 999,
+    borderWidth: 2,
+    borderColor: "white",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#E5E7EB",
+  },
+  avatarText: { fontSize: 11, fontWeight: "800", color: "#111827" },
+  morePill: {
+    height: 26,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    backgroundColor: "#EEF2FF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  morePillText: { fontSize: 11, fontWeight: "800", color: "#3730A3" },
 
   quickRow: { flexDirection: "row", gap: 10 },
   quickBtn: { flex: 1, borderRadius: 12 },
@@ -753,8 +992,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingVertical: 6,
+    paddingVertical: 10,
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: "rgba(0,0,0,0.08)",
+    gap: 10,
   },
 });

@@ -1,6 +1,6 @@
-import {initializeApp} from "firebase-admin/app";
-import {getAuth} from "firebase-admin/auth";
-import {HttpsError, onCall} from "firebase-functions/v2/https";
+import { initializeApp } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
+import { HttpsError, onCall } from "firebase-functions/v2/https";
 
 initializeApp();
 
@@ -17,7 +17,7 @@ export const lookupUserByEmail = onCall(async (request) => {
     throw new HttpsError("unauthenticated", "You must be signed in.");
   }
 
-  const emailRaw = (request.data?.email ?? "") as string;
+  const emailRaw = String(request.data?.email ?? "");
   const email = emailRaw.trim().toLowerCase();
 
   if (!email) {
@@ -26,8 +26,9 @@ export const lookupUserByEmail = onCall(async (request) => {
 
   try {
     const userRecord = await getAuth().getUserByEmail(email);
-    return {uid: userRecord.uid, email: userRecord.email ?? email};
+    return { uid: userRecord.uid, email: userRecord.email ?? email };
   } catch (err: unknown) {
+    // If you want, you can detect auth/user-not-found specifically
     throw new HttpsError("not-found", "No user found with that email.");
   }
 });

@@ -1,6 +1,8 @@
+// firebase.ts
 import { initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
+import { getFunctions } from "firebase/functions";
 
 // 🔥 Replace with your actual config from Firebase Console
 const firebaseConfig = {
@@ -9,7 +11,7 @@ const firebaseConfig = {
   projectId: "squadstash-6d0f1",
   storageBucket: "squadstash-6d0f1.firebasestorage.app",
   messagingSenderId: "1048007868667",
-  appId: "1:1048007868667:web:a63772f6322465302c305e"
+  appId: "1:1048007868667:web:a63772f6322465302c305e",
 };
 
 // Initialize Firebase
@@ -18,3 +20,6 @@ const app = initializeApp(firebaseConfig);
 // Export commonly used services
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+
+// ✅ Cloud Functions (for invite-by-email, etc.)
+export const functions = getFunctions(app);
