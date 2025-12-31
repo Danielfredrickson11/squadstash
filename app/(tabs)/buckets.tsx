@@ -15,7 +15,7 @@ import {
   where,
 } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   FlatList,
   Image,
@@ -48,7 +48,6 @@ type Bucket = {
   balance: number;
   color?: string | null;
   createdAt?: any;
-
   ownerId: string;
   memberIds: string[];
 };
@@ -124,7 +123,7 @@ function AvatarCircle(props: {
 }
 
 export default function BucketsScreen() {
-  const { user } = useAuth();
+  const { user, loading } = useAuth();
   const { width } = useWindowDimensions();
 
   const numColumns = useMemo(() => {
@@ -134,11 +133,10 @@ export default function BucketsScreen() {
   }, [width]);
 
   const [buckets, setBuckets] = useState<Bucket[]>([]);
+  const [publicUsers, setPublicUsers] = useState<Record<string, PublicUser>>({});
 
-  // Public users cache: uid -> public user doc
-  const [publicUsers, setPublicUsers] = useState<Record<string, PublicUser>>(
-    {}
-  );
+  // Optional: show a friendly message if permissions fail
+  const [readError, setReadError] = useState<string | null>(null);
 
   // Create dialog
   const [createVisible, setCreateVisible] = useState(false);
@@ -168,9 +166,18 @@ export default function BucketsScreen() {
     [name, target, submitting]
   );
 
-  // Read buckets where user is a member
+  // ✅ Buckets listener (ONE listener only, no fallback)
+  const didLogRef = useRef(false);
   useEffect(() => {
+    if (loading) return;
     if (!user) return;
+
+    if (!didLogRef.current) {
+      didLogRef.current = true;
+      console.log("Buckets listener starting for uid:", user.uid, user.email);
+    }
+
+    setReadError(null);
 
     const colRef = collection(db, "buckets");
     const qRef = query(
@@ -198,24 +205,32 @@ export default function BucketsScreen() {
         });
         setBuckets(next);
       },
-      (err) => console.error("Buckets snapshot error:", err)
+      (err) => {
+        console.error("Buckets snapshot error:", err);
+        setReadError(
+          "Can’t load buckets (permissions). Double-check Firestore rules."
+        );
+        // IMPORTANT: do NOT wipe buckets here, so UI doesn’t flicker empty.
+      }
     );
 
     return () => unsub();
-  }, [user]);
+  }, [loading, user?.uid]);
 
-  // Subscribe to publicUsers docs for all member UIDs we see
+  // ✅ publicUsers listener (only for member UIDs we actually have)
   useEffect(() => {
+    if (loading) return;
     if (!user) return;
 
     const allUids = new Set<string>();
-    buckets.forEach((b) => (b.memberIds ?? []).forEach((uid) => allUids.add(uid)));
+    buckets.forEach((b) =>
+      (b.memberIds ?? []).forEach((uid) => allUids.add(uid))
+    );
     allUids.add(user.uid);
 
     const uids = Array.from(allUids);
     if (uids.length === 0) return;
 
-    // Firestore "in" query max 30 values
     const chunks: string[][] = [];
     for (let i = 0; i < uids.length; i += 30) chunks.push(uids.slice(i, i + 30));
 
@@ -251,9 +266,9 @@ export default function BucketsScreen() {
     });
 
     return () => unsubs.forEach((fn) => fn());
-  }, [buckets, user]);
+  }, [loading, buckets, user?.uid]);
 
-  // Create
+  // Create dialog helpers
   const openCreate = () => setCreateVisible(true);
   const closeCreate = () => {
     setCreateVisible(false);
@@ -367,7 +382,6 @@ export default function BucketsScreen() {
     }
   };
 
-  // Quick add
   const quickAdd = async (bucket: Bucket, amount: number) => {
     if (!user) return;
     const nextBalance = (Number(bucket.balance) || 0) + amount;
@@ -383,7 +397,6 @@ export default function BucketsScreen() {
     }
   };
 
-  // Members dialog
   const openMembers = (b: Bucket) => {
     setMembersBucket(b);
     setInviteEmail("");
@@ -417,7 +430,6 @@ export default function BucketsScreen() {
     };
   };
 
-  // Invite by email via Cloud Function
   const inviteMemberByEmail = async () => {
     if (!user || !membersBucket) return;
 
@@ -426,13 +438,10 @@ export default function BucketsScreen() {
       setMembersError("Enter a valid email.");
       return;
     }
-
-    // ✅ prevent inviting yourself
     if ((user.email ?? "").toLowerCase() === email) {
       setMembersError("You can’t invite yourself.");
       return;
     }
-
     if (membersBucket.ownerId !== user.uid) {
       setMembersError("Only the bucket owner can add members.");
       return;
@@ -452,7 +461,6 @@ export default function BucketsScreen() {
         setMembersError("Could not find a user for that email.");
         return;
       }
-
       if ((membersBucket.memberIds ?? []).includes(uid)) {
         setMembersError("That user is already a member of this bucket.");
         return;
@@ -504,12 +512,11 @@ export default function BucketsScreen() {
     }
   };
 
-  // ✅ Leave bucket (non-owner)
   const leaveBucket = async () => {
     if (!user || !membersBucket) return;
 
     if (membersBucket.ownerId === user.uid) {
-      setMembersError("Owners can’t leave. Transfer ownership later (we’ll add this).");
+      setMembersError("Owners can’t leave. Transfer ownership later.");
       return;
     }
 
@@ -532,13 +539,20 @@ export default function BucketsScreen() {
     }
   };
 
+  const inviteDisabled = useMemo(() => {
+    const email = inviteEmail.trim().toLowerCase();
+    if (!currentIsOwner) return true;
+    if (!isValidInviteEmail(email)) return true;
+    if ((user?.email ?? "").toLowerCase() === email) return true;
+    return membersSubmitting;
+  }, [inviteEmail, currentIsOwner, user?.email, membersSubmitting]);
+
   const renderItem = ({ item }: { item: Bucket }) => {
     const accent = item.color ?? COLORS[0];
     const pct = item.target > 0 ? clamp(item.balance / item.target, 0, 1) : 0;
 
     const isMenuOpen = menuAnchor === item.id;
     const isOwner = !!(user?.uid && item.ownerId === user.uid);
-
     const displayName = item.name?.trim() ? item.name.trim() : "Untitled";
 
     const memberIds = item.memberIds ?? [];
@@ -633,14 +647,6 @@ export default function BucketsScreen() {
     );
   };
 
-  const inviteDisabled = useMemo(() => {
-    const email = inviteEmail.trim().toLowerCase();
-    if (!currentIsOwner) return true;
-    if (!isValidInviteEmail(email)) return true;
-    if ((user?.email ?? "").toLowerCase() === email) return true;
-    return membersSubmitting;
-  }, [inviteEmail, currentIsOwner, user?.email, membersSubmitting]);
-
   return (
     <View style={styles.container}>
       <View style={styles.headerRow}>
@@ -649,6 +655,10 @@ export default function BucketsScreen() {
             Personal Buckets
           </Text>
           <Text style={styles.subtitle}>Track and manage your savings goals.</Text>
+
+          {readError ? (
+            <Text style={{ marginTop: 6, color: "#B91C1C" }}>{readError}</Text>
+          ) : null}
         </View>
 
         <Button mode="contained" icon="plus" onPress={openCreate}>
@@ -687,9 +697,7 @@ export default function BucketsScreen() {
           <Dialog.Content>
             <Text style={{ marginBottom: 8, opacity: 0.7 }}>
               Bucket:{" "}
-              <Text style={{ fontWeight: "800" }}>
-                {membersBucket?.name || "Untitled"}
-              </Text>
+              <Text style={{ fontWeight: "800" }}>{membersBucket?.name || "Untitled"}</Text>
             </Text>
 
             {!currentIsOwner ? (
@@ -714,16 +722,17 @@ export default function BucketsScreen() {
                 <TextInput
                   label="Invite by email"
                   value={inviteEmail}
-                  onChangeText={setInviteEmail}
+                  onChangeText={(v) => {
+                    setInviteEmail(v);
+                    if (membersError) setMembersError(null);
+                  }}
                   autoCapitalize="none"
                   keyboardType="email-address"
                   style={{ marginBottom: 10 }}
                 />
 
                 {membersError ? (
-                  <Text style={{ color: "#B91C1C", marginBottom: 8 }}>
-                    {membersError}
-                  </Text>
+                  <Text style={{ color: "#B91C1C", marginBottom: 8 }}>{membersError}</Text>
                 ) : null}
 
                 <Button
@@ -758,9 +767,7 @@ export default function BucketsScreen() {
                         <Text style={{ fontWeight: "700" }}>
                           {display} {isOwnerMember ? "(owner)" : ""}
                         </Text>
-                        <Text style={{ opacity: 0.6, fontSize: 12 }}>
-                          {shortUid(uid)}
-                        </Text>
+                        <Text style={{ opacity: 0.6, fontSize: 12 }}>{shortUid(uid)}</Text>
                       </View>
                     </View>
 
@@ -902,9 +909,7 @@ export default function BucketsScreen() {
               Are you sure you want to delete{" "}
               <Text style={{ fontWeight: "800" }}>{editing?.name}</Text>?
             </Text>
-            <Text style={{ marginTop: 8, opacity: 0.7 }}>
-              Only the bucket owner can delete.
-            </Text>
+            <Text style={{ marginTop: 8, opacity: 0.7 }}>Only the bucket owner can delete.</Text>
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={closeDelete}>Cancel</Button>

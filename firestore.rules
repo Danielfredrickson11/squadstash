@@ -7,74 +7,58 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function hasMemberList() {
-      return resource.data.memberIds is list;
+    // --- Buckets helpers (QUERY FRIENDLY) ---
+    // IMPORTANT: no type checks here, so Firestore can prove query safety.
+    function isBucketMember() {
+      return signedIn() && (request.auth.uid in resource.data.memberIds);
     }
 
-    function isMember() {
-      return signedIn()
-        && hasMemberList()
-        && (request.auth.uid in resource.data.memberIds);
+    function isBucketOwner() {
+      return signedIn() && (resource.data.ownerId == request.auth.uid);
     }
 
-    function isOwner() {
-      return signedIn()
-        && resource.data.ownerId == request.auth.uid;
-    }
-
-    // Prevent ownerId changes + ensure owner remains a member after update
-    function ownerLockedAndStaysMember() {
-      return request.resource.data.ownerId == resource.data.ownerId
-        && (request.resource.data.memberIds is list)
-        && (resource.data.ownerId in request.resource.data.memberIds);
-    }
-
+    // --- Buckets ---
     match /buckets/{bucketId} {
 
-      // Members can read
-      allow read: if isMember();
+      // ✅ Allow queries that filter by memberIds (array-contains)
+      allow list: if isBucketMember() || isBucketOwner();
+      allow get:  if isBucketMember() || isBucketOwner();
 
-      // Create: must be signed in, ownerId must be caller, memberIds must exist and include caller
+      // ✅ Create: validate required fields strongly
       allow create: if signedIn()
-        && (request.resource.data.memberIds is list)
-        && (request.resource.data.ownerId == request.auth.uid)
-        && (request.auth.uid in request.resource.data.memberIds);
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.memberIds is list
+        && request.auth.uid in request.resource.data.memberIds
+        && request.resource.data.name is string
+        && request.resource.data.target is number
+        && request.resource.data.balance is number;
 
-      /**
-       * Update:
-       * - Must already be a member (so outsiders cannot modify)
-       * - ownerId can never change
-       * - owner must always remain in memberIds
-       * - If memberIds is changing -> ONLY owner can do that
-       * - If memberIds is NOT changing -> any member can update other fields
-       */
-      allow update: if isMember()
-        && ownerLockedAndStaysMember()
+      // ✅ Update: members can update most fields, but ONLY owner can change memberIds
+      allow update: if (isBucketMember() || isBucketOwner())
+        // ownerId can never change
+        && request.resource.data.ownerId == resource.data.ownerId
+        // owner must always remain a member
+        && (resource.data.ownerId in request.resource.data.memberIds)
         && (
           // memberIds unchanged => any member can update other fields
           request.resource.data.memberIds == resource.data.memberIds
-
           // memberIds changed => only owner can do it
-          || isOwner()
+          || isBucketOwner()
         );
 
-      // Delete: only owner
-      allow delete: if isOwner();
+      // ✅ Delete: only owner
+      allow delete: if isBucketOwner();
     }
 
-    // Private user doc (only the owner can read/write their own)
+    // --- Private user doc (only you) ---
     match /users/{uid} {
       allow read, write: if signedIn() && request.auth.uid == uid;
     }
 
-    /**
-     * Public profile doc used for avatars + display names
-     * Anyone signed-in can read
-     * Only the user can write their own doc
-     */
+    // --- Public profiles ---
     match /publicUsers/{uid} {
       allow read: if signedIn();
-      allow create, update, delete: if signedIn() && request.auth.uid == uid;
+      allow write: if signedIn() && request.auth.uid == uid;
     }
   }
 }

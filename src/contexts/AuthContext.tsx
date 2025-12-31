@@ -1,3 +1,4 @@
+// src/contexts/AuthContext.tsx
 import { onAuthStateChanged, signOut, User } from "firebase/auth";
 import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import React, {
@@ -39,7 +40,6 @@ async function upsertPublicUser(u: User) {
     updatedAt: serverTimestamp(),
   };
 
-  // merge keeps any future fields you add
   await setDoc(ref, payload, { merge: true });
 }
 
@@ -49,16 +49,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (u) => {
-      setUser(u);
-      setLoading(false);
-
-      // Create/update public profile doc for avatar + member display names
-      if (u) {
-        try {
-          await upsertPublicUser(u);
-        } catch (e) {
-          console.warn("Failed to upsert public user profile:", e);
+      try {
+        // ✅ IMPORTANT: ensure token is ready before we mark loading=false
+        if (u) {
+          await u.getIdToken(); // forces token fetch/refresh
         }
+
+        setUser(u);
+        setLoading(false);
+
+        if (u) {
+          try {
+            await upsertPublicUser(u);
+          } catch (e) {
+            console.warn("Failed to upsert public user profile:", e);
+          }
+        }
+      } catch (e) {
+        console.warn("Auth init error:", e);
+        setUser(u ?? null);
+        setLoading(false);
       }
     });
 
