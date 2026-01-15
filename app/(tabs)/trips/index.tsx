@@ -11,6 +11,7 @@ import {
   updateDoc,
   where,
 } from "firebase/firestore";
+import { useRouter } from "expo-router";
 import React, { useEffect, useMemo, useState } from "react";
 import { FlatList, StyleSheet, View } from "react-native";
 import {
@@ -24,8 +25,8 @@ import {
   TextInput,
 } from "react-native-paper";
 
-import { db } from "../../firebase";
-import { useAuth } from "../../src/contexts/AuthContext";
+import { db } from "../../../firebase";
+import { useAuth } from "../../../src/contexts/AuthContext";
 
 type Trip = {
   id: string;
@@ -58,6 +59,7 @@ function formatCurrency(n: number) {
 }
 
 export default function TripsScreen() {
+  const router = useRouter();
   const { user, loading } = useAuth();
 
   const [trips, setTrips] = useState<Trip[]>([]);
@@ -79,6 +81,9 @@ export default function TripsScreen() {
   const [contributeSubmitting, setContributeSubmitting] = useState(false);
   const [contributeError, setContributeError] = useState<string | null>(null);
 
+  const goCreate = () => router.push("/(tabs)/trips/create");
+  const openTrip = (tripId: string) => router.push(`/(tabs)/trips/${tripId}`);
+
   const canCreate = useMemo(() => {
     if (!user) return false;
     if (!title.trim()) return false;
@@ -87,12 +92,14 @@ export default function TripsScreen() {
     return !creating;
   }, [user, title, target, creating]);
 
-  // ✅ Trips listener (wait until auth loading finishes)
+  // ✅ Trips listener
   useEffect(() => {
     if (loading) return;
+
     if (!user) {
       setTrips([]);
       setFetching(false);
+      setError(null);
       return;
     }
 
@@ -140,7 +147,7 @@ export default function TripsScreen() {
   }, [loading, user]);
 
   // --- Create Trip helpers ---
-  const openCreate = () => {
+  const openCreateDialog = () => {
     setCreateVisible(true);
     setCreateError(null);
   };
@@ -170,7 +177,7 @@ export default function TripsScreen() {
     setCreateError(null);
 
     try {
-      await addDoc(collection(db, "trips"), {
+      const ref = await addDoc(collection(db, "trips"), {
         title: title.trim(),
         location: location.trim() ? location.trim() : null,
         target: t,
@@ -185,6 +192,8 @@ export default function TripsScreen() {
       });
 
       closeCreate();
+      // Optional: open the new trip
+      openTrip(ref.id);
     } catch (e: any) {
       console.error("Failed to create trip:", e);
       setCreateError("Failed to create trip (permissions).");
@@ -253,16 +262,24 @@ export default function TripsScreen() {
 
   const renderTrip = ({ item }: { item: Trip }) => {
     const pct = item.target > 0 ? clamp(item.saved / item.target, 0, 1) : 0;
-    const remaining = Math.max(0, (Number(item.target) || 0) - (Number(item.saved) || 0));
+    const remaining = Math.max(
+      0,
+      (Number(item.target) || 0) - (Number(item.saved) || 0)
+    );
 
     return (
       <Card style={styles.card} mode="elevated">
         <Card.Content>
           <View style={styles.topRow}>
             <View style={{ flex: 1 }}>
-              <Text variant="titleMedium" style={styles.tripTitle} numberOfLines={1}>
+              <Text
+                variant="titleMedium"
+                style={styles.tripTitle}
+                numberOfLines={1}
+              >
                 {item.title?.trim() ? item.title.trim() : "Untitled Trip"}
               </Text>
+
               {!!item.location?.trim() ? (
                 <Text style={styles.muted} numberOfLines={1}>
                   {item.location}
@@ -273,7 +290,8 @@ export default function TripsScreen() {
             </View>
 
             <Chip style={styles.membersPill} compact>
-              {item.memberIds?.length ?? 1} member{(item.memberIds?.length ?? 1) === 1 ? "" : "s"}
+              {item.memberIds?.length ?? 1} member
+              {(item.memberIds?.length ?? 1) === 1 ? "" : "s"}
             </Chip>
           </View>
 
@@ -286,28 +304,48 @@ export default function TripsScreen() {
 
           <View style={styles.metaRow}>
             <Text style={styles.muted}>{Math.round(pct * 100)}% funded</Text>
-            <Text style={styles.muted}>{formatCurrency(remaining)} remaining</Text>
+            <Text style={styles.muted}>
+              {formatCurrency(remaining)} remaining
+            </Text>
           </View>
 
           <View style={styles.ctaRow}>
-            <Button mode="contained" style={styles.ctaPrimary} onPress={() => openContribute(item)}>
-              Contribute
+            <Button
+              mode="contained"
+              style={styles.ctaPrimary}
+              onPress={() => openTrip(item.id)}
+            >
+              Open
             </Button>
-            <Button mode="outlined" style={styles.ctaSecondary} onPress={() => quickContribute(item, 100)}>
-              + {formatCurrency(100)}
+
+            <Button
+              mode="outlined"
+              style={styles.ctaSecondary}
+              onPress={() => openContribute(item)}
+            >
+              Contribute
             </Button>
           </View>
 
           <View style={{ height: 10 }} />
 
           <View style={styles.quickRow}>
-            <Chip onPress={() => quickContribute(item, 25)} style={styles.quickChip}>
+            <Chip
+              onPress={() => quickContribute(item, 25)}
+              style={styles.quickChip}
+            >
               + $25
             </Chip>
-            <Chip onPress={() => quickContribute(item, 50)} style={styles.quickChip}>
+            <Chip
+              onPress={() => quickContribute(item, 50)}
+              style={styles.quickChip}
+            >
               + $50
             </Chip>
-            <Chip onPress={() => quickContribute(item, 200)} style={styles.quickChip}>
+            <Chip
+              onPress={() => quickContribute(item, 200)}
+              style={styles.quickChip}
+            >
               + $200
             </Chip>
           </View>
@@ -328,7 +366,12 @@ export default function TripsScreen() {
           </Text>
         </View>
 
-        <Button mode="contained" icon="plus" onPress={openCreate} disabled={!user || loading}>
+        <Button
+          mode="contained"
+          icon="plus"
+          onPress={goCreate}
+          disabled={!user || loading}
+        >
           New Trip
         </Button>
       </View>
@@ -336,7 +379,9 @@ export default function TripsScreen() {
       {error ? (
         <Card style={styles.noticeCard}>
           <Card.Content>
-            <Text style={{ fontWeight: "900", marginBottom: 6 }}>Can’t load trips</Text>
+            <Text style={{ fontWeight: "900", marginBottom: 6 }}>
+              Can’t load trips
+            </Text>
             <Text style={styles.muted}>{error}</Text>
           </Card.Content>
         </Card>
@@ -354,7 +399,9 @@ export default function TripsScreen() {
           data={trips}
           keyExtractor={(t) => t.id}
           renderItem={renderTrip}
-          contentContainerStyle={trips.length === 0 ? styles.emptyContainer : undefined}
+          contentContainerStyle={
+            trips.length === 0 ? styles.emptyContainer : undefined
+          }
           ListEmptyComponent={
             <Card style={styles.noticeCard}>
               <Card.Content>
@@ -365,7 +412,12 @@ export default function TripsScreen() {
                   Create your first trip and start saving with friends.
                 </Text>
                 <View style={{ height: 12 }} />
-                <Button mode="contained" icon="plus" onPress={openCreate} disabled={!user || loading}>
+                <Button
+                  mode="contained"
+                  icon="plus"
+                  onPress={goCreate}
+                  disabled={!user || loading}
+                >
                   New Trip
                 </Button>
               </Card.Content>
@@ -374,7 +426,7 @@ export default function TripsScreen() {
         />
       )}
 
-      {/* Create Trip Dialog */}
+      {/* Optional inline Create Dialog (you can remove if you only use /create) */}
       <Portal>
         <Dialog visible={createVisible} onDismiss={closeCreate}>
           <Dialog.Title>New Trip</Dialog.Title>
@@ -408,14 +460,21 @@ export default function TripsScreen() {
             />
 
             {createError ? (
-              <Text style={{ color: "#B91C1C", fontWeight: "700", marginTop: 8 }}>
+              <Text
+                style={{ color: "#B91C1C", fontWeight: "700", marginTop: 8 }}
+              >
                 {createError}
               </Text>
             ) : null}
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={closeCreate}>Cancel</Button>
-            <Button mode="contained" onPress={onCreateTrip} disabled={!canCreate} loading={creating}>
+            <Button
+              mode="contained"
+              onPress={onCreateTrip}
+              disabled={!canCreate}
+              loading={creating}
+            >
               Save
             </Button>
           </Dialog.Actions>
@@ -429,7 +488,9 @@ export default function TripsScreen() {
           <Dialog.Content>
             <Text style={{ marginBottom: 10, opacity: 0.7 }}>
               Trip:{" "}
-              <Text style={{ fontWeight: "900" }}>{contributeTrip?.title ?? ""}</Text>
+              <Text style={{ fontWeight: "900" }}>
+                {contributeTrip?.title ?? ""}
+              </Text>
             </Text>
 
             <TextInput
@@ -443,7 +504,9 @@ export default function TripsScreen() {
             />
 
             {contributeError ? (
-              <Text style={{ marginTop: 10, color: "#B91C1C", fontWeight: "700" }}>
+              <Text
+                style={{ marginTop: 10, color: "#B91C1C", fontWeight: "700" }}
+              >
                 {contributeError}
               </Text>
             ) : null}
@@ -451,13 +514,22 @@ export default function TripsScreen() {
             <View style={{ height: 10 }} />
 
             <View style={styles.quickRow}>
-              <Chip onPress={() => setContributeAmount("25")} style={styles.quickChip}>
+              <Chip
+                onPress={() => setContributeAmount("25")}
+                style={styles.quickChip}
+              >
                 $25
               </Chip>
-              <Chip onPress={() => setContributeAmount("100")} style={styles.quickChip}>
+              <Chip
+                onPress={() => setContributeAmount("100")}
+                style={styles.quickChip}
+              >
                 $100
               </Chip>
-              <Chip onPress={() => setContributeAmount("500")} style={styles.quickChip}>
+              <Chip
+                onPress={() => setContributeAmount("500")}
+                style={styles.quickChip}
+              >
                 $500
               </Chip>
             </View>
@@ -500,7 +572,12 @@ const styles = StyleSheet.create({
     backgroundColor: "white",
   },
 
-  topRow: { flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 6 },
+  topRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 6,
+  },
   tripTitle: { fontWeight: "900" },
   membersPill: { borderRadius: 999 },
 

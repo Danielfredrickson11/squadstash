@@ -20,10 +20,10 @@ export default function TabLayout() {
   const colorScheme = useColorScheme();
   const { user, loading } = useAuth();
 
-  // ✅ IMPORTANT: call hooks at the top level (not inside screenOptions)
+  // Ensure hooks are called at top level
   const headerShown = useClientOnlyValue(false, true);
 
-  // 1) Wait for Firebase to tell us if someone is logged in
+  // Loading state
   if (loading) {
     return (
       <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
@@ -32,12 +32,12 @@ export default function TabLayout() {
     );
   }
 
-  // 2) If logged out, do NOT allow tabs screens to render
+  // Redirect if logged out
   if (!user) {
     return <Redirect href="/(auth)/login" />;
   }
 
-  // 3) If logged in, show tabs normally
+  // Logged in → show tabs
   return (
     <Tabs
       screenOptions={{
@@ -51,35 +51,53 @@ export default function TabLayout() {
         name="home"
         options={{
           title: "Home",
-          tabBarIcon: ({ color }) => <TabBarIcon name="home" color={color} />,
+          tabBarIcon: ({ color }) => (
+            <TabBarIcon name="home" color={color} />
+          ),
         }}
       />
+
       <Tabs.Screen
         name="buckets"
         options={{
           title: "Buckets",
-          tabBarIcon: ({ color }) => <TabBarIcon name="pie-chart" color={color} />,
+          tabBarIcon: ({ color }) => (
+            <TabBarIcon name="pie-chart" color={color} />
+          ),
         }}
       />
+
       <Tabs.Screen
         name="trips"
         options={{
           title: "Trips",
-          tabBarIcon: ({ color }) => <TabBarIcon name="suitcase" color={color} />,
+          tabBarIcon: ({ color }) => (
+            <TabBarIcon name="suitcase" color={color} />
+          ),
         }}
       />
+
+      {/* 🚫 Hide nested Trips routes from tab bar */}
+      <Tabs.Screen name="trips/create" options={{ href: null }} />
+      <Tabs.Screen name="trips/[tripId]" options={{ href: null }} />
+
       <Tabs.Screen
         name="transactions"
         options={{
           title: "Transactions",
-          tabBarIcon: ({ color }) => <TabBarIcon name="list" color={color} />,
+          tabBarIcon: ({ color }) => (
+            <TabBarIcon name="list" color={color} />
+          ),
         }}
       />
+
       <Tabs.Screen
         name="profile"
         options={{
           title: "Profile",
-          tabBarIcon: ({ color }) => <TabBarIcon name="user" color={color} />,
+          tabBarIcon: ({ color }) => (
+            <TabBarIcon name="user" color={color} />
+          ),
         }}
       />
     </Tabs>
