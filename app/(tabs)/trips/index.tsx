@@ -1,617 +1,516 @@
+// app/(tabs)/trips/index.tsx
+import { useFocusEffect, useRouter } from "expo-router";
+import { getAuth } from "firebase/auth";
 import {
-  addDoc,
   collection,
-  doc,
-  DocumentData,
-  increment,
-  onSnapshot,
+  getDocs,
   orderBy,
   query,
-  serverTimestamp,
-  updateDoc,
+  Timestamp,
   where,
 } from "firebase/firestore";
-import { useRouter } from "expo-router";
-import React, { useEffect, useMemo, useState } from "react";
-import { FlatList, StyleSheet, View } from "react-native";
+import React, { useCallback, useMemo, useState } from "react";
 import {
-  Button,
-  Card,
-  Chip,
-  Dialog,
-  Portal,
-  ProgressBar,
+  ActivityIndicator,
+  FlatList,
+  Image,
+  Pressable,
+  SafeAreaView,
+  StyleSheet,
   Text,
   TextInput,
-} from "react-native-paper";
+  useWindowDimensions,
+  View,
+} from "react-native";
+import { useTheme } from "react-native-paper";
 
 import { db } from "../../../firebase";
-import { useAuth } from "../../../src/contexts/AuthContext";
 
-type Trip = {
+type TripDoc = {
   id: string;
-  title: string;
-  location?: string | null;
-
-  target: number;
-  saved: number;
-
-  createdAt?: any;
-
-  ownerId: string;
-  memberIds: string[];
-
-  lastUpdatedAt?: any;
-  lastUpdatedBy?: string;
+  title?: string;
+  location?: string;
+  target?: number;
+  saved?: number;
+  ownerId?: string;
+  memberIds?: string[];
+  imageUrl?: string;
+  createdAt?: Timestamp | any;
 };
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(n, max));
+const FALLBACK_IMAGE =
+  "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1200&q=60";
+
+function money(n?: number) {
+  const v = Number(n ?? 0);
+  if (!Number.isFinite(v)) return "$0";
+  return v.toLocaleString(undefined, { style: "currency", currency: "USD" });
+}
+function clamp01(x: number) {
+  return Math.max(0, Math.min(1, x));
 }
 
-function formatCurrency(n: number) {
-  const v = Number(n) || 0;
-  try {
-    return v.toLocaleString(undefined, { style: "currency", currency: "USD" });
-  } catch {
-    return `$${v.toFixed(2)}`;
-  }
-}
-
-export default function TripsScreen() {
+export default function TripsIndex() {
   const router = useRouter();
-  const { user, loading } = useAuth();
+  const theme = useTheme();
+  const { width } = useWindowDimensions();
 
-  const [trips, setTrips] = useState<Trip[]>([]);
-  const [fetching, setFetching] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [trips, setTrips] = useState<TripDoc[]>([]);
+  const [queryText, setQueryText] = useState("");
 
-  // Create Trip dialog
-  const [createVisible, setCreateVisible] = useState(false);
-  const [title, setTitle] = useState("");
-  const [location, setLocation] = useState("");
-  const [target, setTarget] = useState("");
-  const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState<string | null>(null);
+  // Responsive columns (mobile -> desktop)
+  const numColumns = useMemo(() => {
+    if (width >= 1200) return 4;
+    if (width >= 900) return 3;
+    if (width >= 600) return 2;
+    return 1;
+  }, [width]);
 
-  // Contribute dialog
-  const [contributeVisible, setContributeVisible] = useState(false);
-  const [contributeTrip, setContributeTrip] = useState<Trip | null>(null);
-  const [contributeAmount, setContributeAmount] = useState("");
-  const [contributeSubmitting, setContributeSubmitting] = useState(false);
-  const [contributeError, setContributeError] = useState<string | null>(null);
+  const cardGap = 14;
+  const contentPadding = 16;
 
-  const goCreate = () => router.push("/(tabs)/trips/create");
-  const openTrip = (tripId: string) => router.push(`/(tabs)/trips/${tripId}`);
+  const cardWidth = useMemo(() => {
+    const available = width - contentPadding * 2;
+    const totalGaps = cardGap * (numColumns - 1);
+    return Math.floor((available - totalGaps) / numColumns);
+  }, [width, numColumns]);
 
-  const canCreate = useMemo(() => {
-    if (!user) return false;
-    if (!title.trim()) return false;
-    const t = Number(target);
-    if (!Number.isFinite(t) || t <= 0) return false;
-    return !creating;
-  }, [user, title, target, creating]);
-
-  // ✅ Trips listener
-  useEffect(() => {
-    if (loading) return;
-
+  const fetchTrips = useCallback(async () => {
+    const user = getAuth().currentUser;
     if (!user) {
       setTrips([]);
-      setFetching(false);
-      setError(null);
+      setLoading(false);
       return;
     }
 
-    setFetching(true);
-    setError(null);
+    setLoading(true);
+    try {
+      const tripsRef = collection(db, "trips");
+      const q = query(
+        tripsRef,
+        where("memberIds", "array-contains", user.uid),
+        orderBy("createdAt", "desc")
+      );
 
-    const colRef = collection(db, "trips");
-    const qRef = query(
-      colRef,
-      where("memberIds", "array-contains", user.uid),
-      orderBy("createdAt", "desc")
-    );
+      const snap = await getDocs(q);
+      const rows: TripDoc[] = snap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as any),
+      }));
 
-    const unsub = onSnapshot(
-      qRef,
-      (snap) => {
-        const next: Trip[] = [];
-        snap.forEach((docSnap) => {
-          const d = docSnap.data() as DocumentData;
-          next.push({
-            id: docSnap.id,
-            title: String(d.title ?? ""),
-            location: d.location ?? null,
-            target: Number(d.target) || 0,
-            saved: Number(d.saved) || 0,
-            createdAt: d.createdAt,
-            ownerId: String(d.ownerId ?? ""),
-            memberIds: Array.isArray(d.memberIds) ? d.memberIds : [],
-            lastUpdatedAt: d.lastUpdatedAt,
-            lastUpdatedBy: d.lastUpdatedBy,
-          });
-        });
-        setTrips(next);
-        setFetching(false);
-      },
-      (err) => {
-        console.error("Trips snapshot error:", err);
-        setError("Missing or insufficient permissions.");
+      setTrips(rows);
+    } catch (e) {
+      console.log("fetchTrips error:", e);
+
+      // Fallback if createdAt/orderBy isn't present for older docs
+      try {
+        const user = getAuth().currentUser;
+        const tripsRef = collection(db, "trips");
+        const q2 = query(
+          tripsRef,
+          where("memberIds", "array-contains", user?.uid ?? "")
+        );
+        const snap2 = await getDocs(q2);
+        const rows2: TripDoc[] = snap2.docs.map((d) => ({
+          id: d.id,
+          ...(d.data() as any),
+        }));
+        setTrips(rows2);
+      } catch (e2) {
+        console.log("fetchTrips fallback error:", e2);
         setTrips([]);
-        setFetching(false);
       }
-    );
-
-    return () => unsub();
-  }, [loading, user]);
-
-  // --- Create Trip helpers ---
-  const openCreateDialog = () => {
-    setCreateVisible(true);
-    setCreateError(null);
-  };
-
-  const closeCreate = () => {
-    setCreateVisible(false);
-    setTitle("");
-    setLocation("");
-    setTarget("");
-    setCreateError(null);
-  };
-
-  const onCreateTrip = async () => {
-    if (loading || !user) return;
-
-    const t = Number(target);
-    if (!title.trim()) {
-      setCreateError("Please enter a trip name.");
-      return;
-    }
-    if (!Number.isFinite(t) || t <= 0) {
-      setCreateError("Target must be a number greater than 0.");
-      return;
-    }
-
-    setCreating(true);
-    setCreateError(null);
-
-    try {
-      const ref = await addDoc(collection(db, "trips"), {
-        title: title.trim(),
-        location: location.trim() ? location.trim() : null,
-        target: t,
-        saved: 0,
-
-        createdAt: serverTimestamp(),
-        ownerId: user.uid,
-        memberIds: [user.uid],
-
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
-      });
-
-      closeCreate();
-      // Optional: open the new trip
-      openTrip(ref.id);
-    } catch (e: any) {
-      console.error("Failed to create trip:", e);
-      setCreateError("Failed to create trip (permissions).");
     } finally {
-      setCreating(false);
+      setLoading(false);
     }
-  };
+  }, []);
 
-  // --- Contribute helpers ---
-  const openContribute = (trip: Trip) => {
-    setContributeTrip(trip);
-    setContributeAmount("");
-    setContributeError(null);
-    setContributeVisible(true);
-  };
+  useFocusEffect(
+    useCallback(() => {
+      fetchTrips();
+    }, [fetchTrips])
+  );
 
-  const closeContribute = () => {
-    setContributeVisible(false);
-    setContributeTrip(null);
-    setContributeAmount("");
-    setContributeError(null);
-  };
+  const filteredTrips = useMemo(() => {
+    const q = queryText.trim().toLowerCase();
+    if (!q) return trips;
+    return trips.filter((t) => {
+      const title = (t.title ?? "").toLowerCase();
+      const location = (t.location ?? "").toLowerCase();
+      return title.includes(q) || location.includes(q);
+    });
+  }, [trips, queryText]);
 
-  const quickContribute = async (trip: Trip, amt: number) => {
-    if (!user) return;
-    try {
-      const ref = doc(db, "trips", trip.id);
-      await updateDoc(ref, {
-        saved: increment(amt),
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
-      });
-    } catch (e) {
-      console.error("Quick contribute failed:", e);
-      setError("Failed to contribute (permissions).");
-    }
-  };
+  const emptyState = useMemo(() => {
+    if (loading) return null;
 
-  const onConfirmContribute = async () => {
-    if (!user || !contributeTrip) return;
-
-    const amt = Number(contributeAmount);
-    if (!Number.isFinite(amt) || amt <= 0) {
-      setContributeError("Enter a valid amount greater than 0.");
-      return;
-    }
-
-    setContributeSubmitting(true);
-    setContributeError(null);
-
-    try {
-      const ref = doc(db, "trips", contributeTrip.id);
-      await updateDoc(ref, {
-        saved: increment(amt),
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
-      });
-      closeContribute();
-    } catch (e) {
-      console.error("Contribute failed:", e);
-      setContributeError("Failed to contribute (permissions).");
-    } finally {
-      setContributeSubmitting(false);
-    }
-  };
-
-  const renderTrip = ({ item }: { item: Trip }) => {
-    const pct = item.target > 0 ? clamp(item.saved / item.target, 0, 1) : 0;
-    const remaining = Math.max(
-      0,
-      (Number(item.target) || 0) - (Number(item.saved) || 0)
-    );
-
-    return (
-      <Card style={styles.card} mode="elevated">
-        <Card.Content>
-          <View style={styles.topRow}>
-            <View style={{ flex: 1 }}>
-              <Text
-                variant="titleMedium"
-                style={styles.tripTitle}
-                numberOfLines={1}
-              >
-                {item.title?.trim() ? item.title.trim() : "Untitled Trip"}
-              </Text>
-
-              {!!item.location?.trim() ? (
-                <Text style={styles.muted} numberOfLines={1}>
-                  {item.location}
-                </Text>
-              ) : (
-                <Text style={styles.muted}> </Text>
-              )}
-            </View>
-
-            <Chip style={styles.membersPill} compact>
-              {item.memberIds?.length ?? 1} member
-              {(item.memberIds?.length ?? 1) === 1 ? "" : "s"}
-            </Chip>
-          </View>
-
-          <View style={styles.amountRow}>
-            <Text style={styles.bigAmount}>{formatCurrency(item.saved)}</Text>
-            <Text style={styles.ofAmount}> / {formatCurrency(item.target)}</Text>
-          </View>
-
-          <ProgressBar progress={pct} style={styles.progress} />
-
-          <View style={styles.metaRow}>
-            <Text style={styles.muted}>{Math.round(pct * 100)}% funded</Text>
-            <Text style={styles.muted}>
-              {formatCurrency(remaining)} remaining
-            </Text>
-          </View>
-
-          <View style={styles.ctaRow}>
-            <Button
-              mode="contained"
-              style={styles.ctaPrimary}
-              onPress={() => openTrip(item.id)}
-            >
-              Open
-            </Button>
-
-            <Button
-              mode="outlined"
-              style={styles.ctaSecondary}
-              onPress={() => openContribute(item)}
-            >
-              Contribute
-            </Button>
-          </View>
-
-          <View style={{ height: 10 }} />
-
-          <View style={styles.quickRow}>
-            <Chip
-              onPress={() => quickContribute(item, 25)}
-              style={styles.quickChip}
-            >
-              + $25
-            </Chip>
-            <Chip
-              onPress={() => quickContribute(item, 50)}
-              style={styles.quickChip}
-            >
-              + $50
-            </Chip>
-            <Chip
-              onPress={() => quickContribute(item, 200)}
-              style={styles.quickChip}
-            >
-              + $200
-            </Chip>
-          </View>
-        </Card.Content>
-      </Card>
-    );
-  };
-
-  return (
-    <View style={styles.container}>
-      <View style={styles.headerRow}>
-        <View style={{ flex: 1 }}>
-          <Text variant="headlineSmall" style={styles.headerTitle}>
-            Trips
+    if (trips.length === 0) {
+      return (
+        <View style={styles.emptyWrap}>
+          <Text style={[styles.emptyTitle, { color: theme.colors.onBackground }]}>
+            No trips yet
           </Text>
-          <Text style={styles.headerSubtitle}>
-            Plan together, save together, and stay on track.
+          <Text style={[styles.emptyText, { color: theme.colors.onSurfaceVariant }]}>
+            Create your first SquadStash trip and start saving together.
+          </Text>
+
+          <Pressable
+            onPress={() => router.push("/(tabs)/trips/create")}
+            style={({ pressed }) => [
+              styles.primaryBtn,
+              { backgroundColor: theme.colors.primary },
+              pressed && { transform: [{ scale: 0.98 }] },
+            ]}
+          >
+            <Text style={styles.primaryBtnText}>Create a Trip</Text>
+          </Pressable>
+        </View>
+      );
+    }
+
+    if (filteredTrips.length === 0) {
+      return (
+        <View style={styles.emptyWrap}>
+          <Text style={[styles.emptyTitle, { color: theme.colors.onBackground }]}>
+            No matches
+          </Text>
+          <Text style={[styles.emptyText, { color: theme.colors.onSurfaceVariant }]}>
+            Try searching by trip title or location.
           </Text>
         </View>
+      );
+    }
 
-        <Button
-          mode="contained"
-          icon="plus"
-          onPress={goCreate}
-          disabled={!user || loading}
-        >
-          New Trip
-        </Button>
+    return null;
+  }, [loading, trips.length, filteredTrips.length, router, theme.colors]);
+
+  return (
+    <SafeAreaView style={[styles.safe, { backgroundColor: theme.colors.background }]}>
+      <View style={[styles.container, { paddingHorizontal: contentPadding }]}>
+        {/* Header */}
+        <View style={styles.header}>
+          <View>
+            <Text style={[styles.h1, { color: theme.colors.onBackground }]}>Trips</Text>
+            <Text style={[styles.sub, { color: theme.colors.onSurfaceVariant }]}>
+              Plan, save, and go — all in one place.
+            </Text>
+          </View>
+
+          <Pressable
+            onPress={() => router.push("/(tabs)/trips/create")}
+            style={({ pressed }) => [
+              styles.addBtn,
+              { backgroundColor: theme.colors.primary },
+              pressed && { transform: [{ scale: 0.98 }] },
+            ]}
+          >
+            <Text style={styles.addBtnText}>+ New</Text>
+          </Pressable>
+        </View>
+
+        {/* Search */}
+        <View style={styles.searchRow}>
+          <TextInput
+            value={queryText}
+            onChangeText={setQueryText}
+            placeholder="Search trips (title or location)"
+            placeholderTextColor={theme.colors.onSurfaceVariant}
+            style={[
+              styles.searchInput,
+              {
+                backgroundColor: theme.colors.surface,
+                borderColor: theme.colors.outline,
+                color: theme.colors.onBackground,
+              },
+            ]}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+        </View>
+
+        {/* List */}
+        {loading ? (
+          <View style={styles.loadingWrap}>
+            <ActivityIndicator />
+            <Text style={[styles.loadingText, { color: theme.colors.onSurfaceVariant }]}>
+              Loading trips…
+            </Text>
+          </View>
+        ) : (
+          <FlatList
+            data={filteredTrips}
+            keyExtractor={(item) => item.id}
+            key={numColumns} // force layout recalculation when columns change
+            numColumns={numColumns}
+            columnWrapperStyle={numColumns > 1 ? { gap: cardGap } : undefined}
+            contentContainerStyle={{
+              paddingVertical: 14,
+              paddingBottom: 40,
+              gap: cardGap,
+            }}
+            ListEmptyComponent={emptyState}
+            renderItem={({ item }) => (
+              <TripCard
+                trip={item}
+                width={cardWidth}
+                onPress={() =>
+                  router.push({
+                    pathname: "/(tabs)/trips/[tripId]",
+                    params: { tripId: item.id },
+                  })
+                }
+              />
+            )}
+          />
+        )}
       </View>
-
-      {error ? (
-        <Card style={styles.noticeCard}>
-          <Card.Content>
-            <Text style={{ fontWeight: "900", marginBottom: 6 }}>
-              Can’t load trips
-            </Text>
-            <Text style={styles.muted}>{error}</Text>
-          </Card.Content>
-        </Card>
-      ) : null}
-
-      {fetching ? (
-        <Card style={styles.noticeCard}>
-          <Card.Content>
-            <Text style={{ fontWeight: "900", marginBottom: 6 }}>Loading…</Text>
-            <Text style={styles.muted}>Getting your trips.</Text>
-          </Card.Content>
-        </Card>
-      ) : (
-        <FlatList
-          data={trips}
-          keyExtractor={(t) => t.id}
-          renderItem={renderTrip}
-          contentContainerStyle={
-            trips.length === 0 ? styles.emptyContainer : undefined
-          }
-          ListEmptyComponent={
-            <Card style={styles.noticeCard}>
-              <Card.Content>
-                <Text style={{ fontWeight: "900", marginBottom: 6 }}>
-                  You don’t have any trips yet.
-                </Text>
-                <Text style={styles.muted}>
-                  Create your first trip and start saving with friends.
-                </Text>
-                <View style={{ height: 12 }} />
-                <Button
-                  mode="contained"
-                  icon="plus"
-                  onPress={goCreate}
-                  disabled={!user || loading}
-                >
-                  New Trip
-                </Button>
-              </Card.Content>
-            </Card>
-          }
-        />
-      )}
-
-      {/* Optional inline Create Dialog (you can remove if you only use /create) */}
-      <Portal>
-        <Dialog visible={createVisible} onDismiss={closeCreate}>
-          <Dialog.Title>New Trip</Dialog.Title>
-          <Dialog.Content>
-            <TextInput
-              label="Trip name"
-              value={title}
-              onChangeText={(v) => {
-                setTitle(v);
-                if (createError) setCreateError(null);
-              }}
-              style={{ marginBottom: 12 }}
-            />
-
-            <TextInput
-              label="Location (optional)"
-              value={location}
-              onChangeText={setLocation}
-              style={{ marginBottom: 12 }}
-            />
-
-            <TextInput
-              label="Target amount"
-              value={target}
-              onChangeText={(v) => {
-                setTarget(v);
-                if (createError) setCreateError(null);
-              }}
-              keyboardType="numeric"
-              style={{ marginBottom: 6 }}
-            />
-
-            {createError ? (
-              <Text
-                style={{ color: "#B91C1C", fontWeight: "700", marginTop: 8 }}
-              >
-                {createError}
-              </Text>
-            ) : null}
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button onPress={closeCreate}>Cancel</Button>
-            <Button
-              mode="contained"
-              onPress={onCreateTrip}
-              disabled={!canCreate}
-              loading={creating}
-            >
-              Save
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-      </Portal>
-
-      {/* Contribute Dialog */}
-      <Portal>
-        <Dialog visible={contributeVisible} onDismiss={closeContribute}>
-          <Dialog.Title>Contribute</Dialog.Title>
-          <Dialog.Content>
-            <Text style={{ marginBottom: 10, opacity: 0.7 }}>
-              Trip:{" "}
-              <Text style={{ fontWeight: "900" }}>
-                {contributeTrip?.title ?? ""}
-              </Text>
-            </Text>
-
-            <TextInput
-              label="Amount"
-              value={contributeAmount}
-              onChangeText={(v) => {
-                setContributeAmount(v);
-                if (contributeError) setContributeError(null);
-              }}
-              keyboardType="numeric"
-            />
-
-            {contributeError ? (
-              <Text
-                style={{ marginTop: 10, color: "#B91C1C", fontWeight: "700" }}
-              >
-                {contributeError}
-              </Text>
-            ) : null}
-
-            <View style={{ height: 10 }} />
-
-            <View style={styles.quickRow}>
-              <Chip
-                onPress={() => setContributeAmount("25")}
-                style={styles.quickChip}
-              >
-                $25
-              </Chip>
-              <Chip
-                onPress={() => setContributeAmount("100")}
-                style={styles.quickChip}
-              >
-                $100
-              </Chip>
-              <Chip
-                onPress={() => setContributeAmount("500")}
-                style={styles.quickChip}
-              >
-                $500
-              </Chip>
-            </View>
-          </Dialog.Content>
-
-          <Dialog.Actions>
-            <Button onPress={closeContribute}>Cancel</Button>
-            <Button
-              mode="contained"
-              onPress={onConfirmContribute}
-              loading={contributeSubmitting}
-              disabled={contributeSubmitting}
-            >
-              Add
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-      </Portal>
-    </View>
+    </SafeAreaView>
   );
 }
 
-const GAP = 12;
+function TripCard({
+  trip,
+  width,
+  onPress,
+}: {
+  trip: TripDoc;
+  width: number;
+  onPress: () => void;
+}) {
+  const theme = useTheme();
+  const [imgFailed, setImgFailed] = useState(false);
+
+  const title = trip.title?.trim() || "Untitled trip";
+  const location = trip.location?.trim() || "No location";
+  const saved = Number(trip.saved ?? 0);
+  const target = Number(trip.target ?? 0);
+  const pct = target > 0 ? clamp01(saved / target) : 0;
+
+  const uri = !imgFailed && trip.imageUrl ? trip.imageUrl : FALLBACK_IMAGE;
+
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.card,
+        {
+          width,
+          backgroundColor: theme.colors.surface,
+          borderColor: theme.colors.outline,
+        },
+        pressed && { transform: [{ scale: 0.99 }], opacity: 0.98 },
+      ]}
+    >
+      <View style={styles.imageWrap}>
+        <Image
+          source={{ uri }}
+          style={styles.image}
+          resizeMode="cover"
+          onError={() => setImgFailed(true)}
+        />
+
+        {/* soft overlay for text readability */}
+        <View style={styles.imageOverlay} />
+
+        {/* Badge */}
+        <View style={styles.badgeRow}>
+          <View
+            style={[
+              styles.badge,
+              {
+                backgroundColor: theme.dark
+                  ? "rgba(15, 21, 38, 0.85)"
+                  : "rgba(255, 255, 255, 0.88)",
+                borderColor: "rgba(0,0,0,0.10)",
+              },
+            ]}
+          >
+            <Text style={{ color: theme.colors.onBackground, fontWeight: "800", fontSize: 12 }}>
+              Active
+            </Text>
+          </View>
+        </View>
+
+        {/* Title + location */}
+        <View style={styles.imageTextWrap}>
+          <Text numberOfLines={1} style={styles.cardTitle}>
+            {title}
+          </Text>
+          <Text numberOfLines={1} style={styles.cardLocation}>
+            {location}
+          </Text>
+        </View>
+      </View>
+
+      <View style={styles.cardBody}>
+        <View style={styles.moneyRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.label, { color: theme.colors.onSurfaceVariant }]}>Saved</Text>
+            <Text style={[styles.value, { color: theme.colors.onBackground }]}>
+              {money(saved)}
+            </Text>
+          </View>
+
+          <View style={{ flex: 1, alignItems: "flex-end" }}>
+            <Text style={[styles.label, { color: theme.colors.onSurfaceVariant }]}>Target</Text>
+            <Text style={[styles.value, { color: theme.colors.onBackground }]}>
+              {money(target)}
+            </Text>
+          </View>
+        </View>
+
+        <View
+          style={[
+            styles.progressOuter,
+            {
+              backgroundColor: theme.colors.surfaceVariant,
+              borderColor: theme.colors.outline,
+            },
+          ]}
+        >
+          <View
+            style={[
+              styles.progressInner,
+              { width: `${pct * 100}%`, backgroundColor: theme.colors.primary },
+            ]}
+          />
+        </View>
+
+        <Text style={[styles.progressText, { color: theme.colors.onSurfaceVariant }]}>
+          {Math.round(pct * 100)}% funded
+        </Text>
+      </View>
+    </Pressable>
+  );
+}
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 16, backgroundColor: "#F6F7FB" },
+  safe: { flex: 1 },
+  container: { flex: 1 },
 
-  headerRow: {
+  header: {
+    paddingTop: 10,
+    paddingBottom: 12,
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-end",
+    justifyContent: "space-between",
     gap: 12,
-    marginBottom: 14,
   },
-  headerTitle: { fontWeight: "900" },
-  headerSubtitle: { opacity: 0.7, marginTop: 2 },
+  h1: {
+    fontSize: 28,
+    fontWeight: "900",
+    letterSpacing: 0.2,
+  },
+  sub: {
+    marginTop: 4,
+    fontSize: 13,
+  },
+
+  addBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+  },
+  addBtnText: { color: "#fff", fontWeight: "900", fontSize: 14 },
+
+  searchRow: {
+    marginTop: 6,
+    marginBottom: 2,
+  },
+  searchInput: {
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    fontSize: 14,
+  },
+
+  loadingWrap: { paddingTop: 40, alignItems: "center", gap: 10 },
+  loadingText: { fontSize: 13, fontWeight: "700" },
 
   card: {
-    borderRadius: 16,
-    marginBottom: GAP,
-    backgroundColor: "white",
+    borderRadius: 18,
+    overflow: "hidden",
+    borderWidth: 1,
   },
 
-  topRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    marginBottom: 6,
-  },
-  tripTitle: { fontWeight: "900" },
-  membersPill: { borderRadius: 999 },
+  imageWrap: { height: 160, position: "relative" },
+  image: { width: "100%", height: "100%" },
 
-  amountRow: {
-    flexDirection: "row",
-    alignItems: "baseline",
-    gap: 6,
-    marginTop: 10,
-    marginBottom: 10,
-  },
-  bigAmount: { fontWeight: "900", fontSize: 22 },
-  ofAmount: { opacity: 0.6 },
-
-  progress: {
-    height: 10,
-    borderRadius: 10,
-    backgroundColor: "rgba(0,0,0,0.06)",
+  imageOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.18)",
   },
 
-  metaRow: {
+  badgeRow: {
+    position: "absolute",
+    top: 12,
+    left: 12,
+    right: 12,
     flexDirection: "row",
     justifyContent: "space-between",
-    marginTop: 10,
-    marginBottom: 12,
   },
-  muted: { opacity: 0.7 },
+  badge: {
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+  },
 
-  ctaRow: { flexDirection: "row", gap: 10 },
-  ctaPrimary: { flex: 1, borderRadius: 12 },
-  ctaSecondary: { borderRadius: 12 },
+  imageTextWrap: {
+    position: "absolute",
+    left: 12,
+    right: 12,
+    bottom: 12,
+  },
+  cardTitle: {
+    color: "#fff",
+    fontSize: 18,
+    fontWeight: "900",
+    letterSpacing: 0.2,
+    textShadowColor: "rgba(0,0,0,0.35)",
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 6,
+  },
+  cardLocation: {
+    marginTop: 2,
+    color: "rgba(255,255,255,0.92)",
+    fontSize: 13,
+    fontWeight: "700",
+  },
 
-  quickRow: { flexDirection: "row", gap: 10, flexWrap: "wrap" },
-  quickChip: { borderRadius: 999 },
+  cardBody: { padding: 14, gap: 10 },
 
-  noticeCard: { borderRadius: 16, backgroundColor: "white" },
-  emptyContainer: { flexGrow: 1, justifyContent: "center" },
+  moneyRow: { flexDirection: "row", alignItems: "flex-end", gap: 12 },
+  label: { fontSize: 12, fontWeight: "700" },
+  value: { fontSize: 16, fontWeight: "900", marginTop: 2 },
+
+  progressOuter: {
+    height: 10,
+    borderRadius: 999,
+    borderWidth: 1,
+    overflow: "hidden",
+  },
+  progressInner: {
+    height: "100%",
+    borderRadius: 999,
+  },
+  progressText: { fontSize: 12, fontWeight: "700" },
+
+  emptyWrap: {
+    marginTop: 34,
+    alignItems: "center",
+    paddingHorizontal: 16,
+    gap: 10,
+  },
+  emptyTitle: { fontSize: 18, fontWeight: "900" },
+  emptyText: { fontSize: 13, textAlign: "center" },
+  primaryBtn: {
+    marginTop: 6,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 14,
+  },
+  primaryBtnText: { color: "#fff", fontWeight: "900" },
 });

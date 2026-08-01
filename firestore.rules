@@ -1,3 +1,4 @@
+// firestore.rules (replace entire file)
 rules_version = '2';
 
 service cloud.firestore {
@@ -19,7 +20,6 @@ service cloud.firestore {
     }
 
     match /buckets/{bucketId} {
-
       allow list, get: if isBucketMember() || isBucketOwner();
 
       allow create: if signedIn()
@@ -42,7 +42,7 @@ service cloud.firestore {
     }
 
     // ---------------------------------------
-    // TRIPS (query-friendly)  ✅ NEW
+    // TRIPS (query-friendly)
     // ---------------------------------------
     function isTripMember() {
       return signedIn() && (request.auth.uid in resource.data.memberIds);
@@ -53,18 +53,24 @@ service cloud.firestore {
     }
 
     match /trips/{tripId} {
-
-      // allow querying trips where memberIds array-contains uid
       allow list, get: if isTripMember() || isTripOwner();
 
-      // Create: must include ownerId/memberIds/title, and caller must be in memberIds
+      // Create requires: ownerId, memberIds includes owner, title string,
+      // target number, saved number, imageUrl string. location may be string or null.
       allow create: if signedIn()
         && request.resource.data.ownerId == request.auth.uid
         && request.resource.data.memberIds is list
         && request.auth.uid in request.resource.data.memberIds
-        && request.resource.data.title is string;
+        && request.resource.data.title is string
+        && request.resource.data.target is number
+        && request.resource.data.saved is number
+        && request.resource.data.imageUrl is string
+        && (
+          !(request.resource.data.keys().hasAny(['location']))
+          || request.resource.data.location is string
+          || request.resource.data.location == null
+        );
 
-      // Update: members can update fields, ONLY owner can change memberIds
       allow update: if (isTripMember() || isTripOwner())
         && request.resource.data.ownerId == resource.data.ownerId
         && (resource.data.ownerId in request.resource.data.memberIds)
@@ -73,7 +79,7 @@ service cloud.firestore {
           || isTripOwner()
         );
 
-      // Delete: only owner
+      // ✅ Delete: only owner
       allow delete: if isTripOwner();
     }
 

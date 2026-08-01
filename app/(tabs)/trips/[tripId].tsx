@@ -1,265 +1,499 @@
-import {
-  DocumentData,
-  doc,
-  increment,
-  onSnapshot,
-  serverTimestamp,
-  updateDoc,
-} from "firebase/firestore";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import React, { useEffect, useMemo, useState } from "react";
-import { StyleSheet, View } from "react-native";
-import { Button, Card, ProgressBar, Text } from "react-native-paper";
+import { deleteDoc, doc, getDoc } from "firebase/firestore";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import {
+    ActivityIndicator,
+    Alert,
+    Image,
+    Platform,
+    Pressable,
+    SafeAreaView,
+    ScrollView,
+    StyleSheet,
+    Text,
+    useWindowDimensions,
+    View,
+} from "react-native";
+import { useTheme } from "react-native-paper";
 
 import { db } from "../../../firebase";
 import { useAuth } from "../../../src/contexts/AuthContext";
 
-type Trip = {
-  id: string;
-  title: string;
+type TripDoc = {
+  title?: string;
   location?: string | null;
-  target: number;
-  saved: number;
-  ownerId: string;
-  memberIds: string[];
+  target?: number;
+  saved?: number;
+  imageUrl?: string;
+  ownerId?: string;
+  memberIds?: string[];
 };
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(n, max));
+const FALLBACK_IMAGE =
+  "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=60";
+
+function money(n?: number) {
+  const v = Number(n ?? 0);
+  if (!Number.isFinite(v)) return "$0";
+  return v.toLocaleString(undefined, { style: "currency", currency: "USD" });
+}
+function clamp01(x: number) {
+  return Math.max(0, Math.min(1, x));
 }
 
-function formatCurrency(n: number) {
-  const v = Number(n) || 0;
-  try {
-    return v.toLocaleString(undefined, { style: "currency", currency: "USD" });
-  } catch {
-    return `$${v.toFixed(2)}`;
-  }
-}
-
-export default function TripDetailScreen() {
+export default function TripDetails() {
   const router = useRouter();
   const { tripId } = useLocalSearchParams<{ tripId: string }>();
-  const { user, loading } = useAuth();
+  const { width } = useWindowDimensions();
+  const { user } = useAuth();
+  const theme = useTheme();
 
-  const [trip, setTrip] = useState<Trip | null>(null);
-  const [fetching, setFetching] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [trip, setTrip] = useState<TripDoc | null>(null);
+  const [imgFailed, setImgFailed] = useState(false);
+
+  const isWide = width >= 980;
+
+  const headerHeight = useMemo(() => {
+    if (width >= 1200) return 340;
+    if (width >= 800) return 300;
+    return 240;
+  }, [width]);
+
+  const notify = useCallback((title: string, message?: string) => {
+    if (Platform.OS === "web" && typeof window !== "undefined") {
+      window.alert(message ? `${title}\n\n${message}` : title);
+      return;
+    }
+    Alert.alert(title, message);
+  }, []);
+
+  const confirmDelete = useCallback((onConfirm: () => void) => {
+    if (Platform.OS === "web" && typeof window !== "undefined") {
+      const ok = window.confirm(
+        "Delete trip?\n\nThis will permanently delete this trip. This cannot be undone."
+      );
+      if (ok) onConfirm();
+      return;
+    }
+
+    Alert.alert(
+      "Delete trip?",
+      "This will permanently delete this trip. This cannot be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Delete", style: "destructive", onPress: onConfirm },
+      ]
+    );
+  }, []);
+
+  const fetchTrip = useCallback(async () => {
+    if (!tripId) return;
+    setLoading(true);
+    try {
+      const ref = doc(db, "trips", tripId);
+      const snap = await getDoc(ref);
+      setTrip(snap.exists() ? (snap.data() as TripDoc) : null);
+    } catch (e) {
+      console.log("fetchTrip error:", e);
+      setTrip(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [tripId]);
 
   useEffect(() => {
-    if (loading) return;
+    fetchTrip();
+  }, [fetchTrip]);
 
-    if (!user) {
-      setTrip(null);
-      setFetching(false);
-      setError("You must be logged in.");
-      return;
-    }
+  const isOwner = !!user?.uid && !!trip?.ownerId && user.uid === trip.ownerId;
 
-    if (!tripId) {
-      setTrip(null);
-      setFetching(false);
-      setError("Missing tripId.");
-      return;
-    }
+  const onDeleteTrip = useCallback(() => {
+    if (!tripId || !trip) return;
 
-    setFetching(true);
-    setError(null);
-
-    const ref = doc(db, "trips", String(tripId));
-    const unsub = onSnapshot(
-      ref,
-      (snap) => {
-        if (!snap.exists()) {
-          setTrip(null);
-          setFetching(false);
-          setError("Trip not found.");
-          return;
-        }
-
-        const d = snap.data() as DocumentData;
-        setTrip({
-          id: snap.id,
-          title: String(d.title ?? ""),
-          location: d.location ?? null,
-          target: Number(d.target) || 0,
-          saved: Number(d.saved) || 0,
-          ownerId: String(d.ownerId ?? ""),
-          memberIds: Array.isArray(d.memberIds) ? d.memberIds : [],
-        });
-
-        setFetching(false);
-      },
-      (err) => {
-        console.error("Trip detail snapshot error:", err);
-        setTrip(null);
-        setFetching(false);
-        setError("Missing or insufficient permissions.");
+    confirmDelete(async () => {
+      try {
+        setLoading(true);
+        await deleteDoc(doc(db, "trips", tripId));
+        router.replace("/(tabs)/trips");
+      } catch (e: any) {
+        console.log("delete trip error:", e);
+        notify(
+          "Couldn’t delete trip",
+          e?.message ||
+            "You may not have permission, or there was a network error."
+        );
+      } finally {
+        setLoading(false);
       }
-    );
+    });
+  }, [tripId, trip, confirmDelete, router, notify]);
 
-    return () => unsub();
-  }, [loading, user, tripId]);
+  const title = trip?.title?.trim() || "Trip Details";
+  const location = (trip?.location ?? "").trim() || "No location";
+  const saved = Number(trip?.saved ?? 0);
+  const target = Number(trip?.target ?? 0);
+  const pct = target > 0 ? clamp01(saved / target) : 0;
 
-  const pct = useMemo(() => {
-    if (!trip?.target) return 0;
-    return clamp((trip.saved || 0) / trip.target, 0, 1);
-  }, [trip]);
+  const imageUri =
+    !imgFailed && trip?.imageUrl ? trip.imageUrl : FALLBACK_IMAGE;
 
-  const remaining = useMemo(() => {
-    if (!trip) return 0;
-    return Math.max(0, (trip.target || 0) - (trip.saved || 0));
-  }, [trip]);
+  // ✅ Quick Analysis
+  const membersCount = Math.max(1, trip?.memberIds?.length ?? 1);
+  const remaining = Math.max(0, target - saved);
+  const perPersonTarget = target / membersCount;
+  const perPersonRemaining = remaining / membersCount;
 
-  const contribute = async (amt: number) => {
-    if (!user || !trip) return;
+  const weeklyPlans = [
+    { label: "4 wks", weeks: 4 },
+    { label: "8 wks", weeks: 8 },
+    { label: "12 wks", weeks: 12 },
+  ].map((p) => ({
+    ...p,
+    perWeekTotal: remaining / p.weeks,
+    perWeekPerPerson: perPersonRemaining / p.weeks,
+  }));
 
-    setSubmitting(true);
-    setError(null);
+  const dangerBg = theme.colors.errorContainer ?? "#FEE2E2";
+  const dangerText = theme.colors.onErrorContainer ?? "#991B1B";
 
-    try {
-      const ref = doc(db, "trips", trip.id);
-      await updateDoc(ref, {
-        saved: increment(amt),
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
-      });
-    } catch (e) {
-      console.error("Contribute failed:", e);
-      setError("Failed to contribute (permissions).");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  if (fetching) {
+  if (loading) {
     return (
-      <View style={styles.container}>
-        <Card style={styles.card}>
-          <Card.Content>
-            <Text style={{ fontWeight: "900", marginBottom: 6 }}>Loading…</Text>
-            <Text style={styles.muted}>Getting trip details.</Text>
-          </Card.Content>
-        </Card>
-      </View>
+      <SafeAreaView style={[styles.safe, { backgroundColor: theme.colors.background }]}>
+        <View style={styles.loadingWrap}>
+          <ActivityIndicator />
+          <Text style={[styles.loadingText, { color: theme.colors.onSurfaceVariant }]}>
+            Loading…
+          </Text>
+        </View>
+      </SafeAreaView>
     );
   }
 
   if (!trip) {
     return (
-      <View style={styles.container}>
-        <Card style={styles.card}>
-          <Card.Content>
-            <Text style={{ fontWeight: "900", marginBottom: 6 }}>Trip</Text>
-            <Text style={styles.muted}>{error ?? "No trip data."}</Text>
-            <View style={{ height: 12 }} />
-            <Button mode="outlined" onPress={() => router.back()}>
-              Go back
-            </Button>
-          </Card.Content>
-        </Card>
-      </View>
+      <SafeAreaView style={[styles.safe, { backgroundColor: theme.colors.background }]}>
+        <View style={styles.loadingWrap}>
+          <Text style={[styles.h1, { color: theme.colors.onBackground }]}>Trip not found</Text>
+          <Text style={[styles.sub, { color: theme.colors.onSurfaceVariant }]}>
+            This trip may have been deleted.
+          </Text>
+
+          <Pressable
+            onPress={() => router.back()}
+            style={[styles.primaryBtn, { backgroundColor: theme.colors.primary }]}
+          >
+            <Text style={styles.primaryBtnText}>Go back</Text>
+          </Pressable>
+        </View>
+      </SafeAreaView>
     );
   }
 
   return (
-    <View style={styles.container}>
-      <Card style={styles.card} mode="elevated">
-        <Card.Content>
-          <Text variant="titleLarge" style={{ fontWeight: "900" }}>
-            {trip.title?.trim() ? trip.title.trim() : "Untitled Trip"}
-          </Text>
+    <SafeAreaView style={[styles.safe, { backgroundColor: theme.colors.background }]}>
+      {/* Top bar */}
+      <View style={styles.topBar}>
+        <Pressable
+          onPress={() => router.back()}
+          style={({ pressed }) => [
+            styles.topBtn,
+            {
+              backgroundColor: theme.colors.surface,
+              borderColor: theme.colors.outline,
+            },
+            pressed && { opacity: 0.85 },
+          ]}
+          hitSlop={10}
+        >
+          <Text style={{ color: theme.colors.onBackground, fontWeight: "900" }}>← Back</Text>
+        </Pressable>
 
-          {!!trip.location?.trim() ? (
-            <Text style={styles.muted}>{trip.location}</Text>
-          ) : (
-            <Text style={styles.muted}> </Text>
-          )}
-
-          <View style={{ height: 12 }} />
-
-          <View style={styles.amountRow}>
-            <Text style={styles.bigAmount}>{formatCurrency(trip.saved)}</Text>
-            <Text style={styles.ofAmount}> / {formatCurrency(trip.target)}</Text>
-          </View>
-
-          <ProgressBar progress={pct} style={styles.progress} />
-
-          <View style={styles.metaRow}>
-            <Text style={styles.muted}>{Math.round(pct * 100)}% funded</Text>
-            <Text style={styles.muted}>
-              {formatCurrency(remaining)} remaining
+        <View style={{ flexDirection: "row", gap: 10 }}>
+          <Pressable
+            onPress={() => console.log("Record Expense")}
+            style={({ pressed }) => [
+              styles.topBtn,
+              { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline },
+              pressed && { opacity: 0.9 },
+            ]}
+            hitSlop={10}
+          >
+            <Text style={{ color: theme.colors.onBackground, fontWeight: "900" }}>
+              Record Expense
             </Text>
-          </View>
+          </Pressable>
 
-          {error ? (
-            <Text style={{ color: "#B91C1C", fontWeight: "700", marginTop: 8 }}>
-              {error}
-            </Text>
+          {isOwner ? (
+            <Pressable
+              onPress={onDeleteTrip}
+              style={({ pressed }) => [
+                styles.topBtn,
+                { backgroundColor: dangerBg, borderColor: theme.colors.outline },
+                pressed && { opacity: 0.9 },
+              ]}
+              hitSlop={12}
+            >
+              <Text style={{ color: dangerText, fontWeight: "900" }}>Delete</Text>
+            </Pressable>
           ) : null}
+        </View>
+      </View>
 
-          <View style={{ height: 14 }} />
+      <ScrollView contentContainerStyle={styles.page}>
+        <View style={isWide ? styles.gridWide : undefined}>
+          {/* Main */}
+          <View style={isWide ? styles.mainCol : undefined}>
+            <View
+              style={[
+                styles.heroWrap,
+                {
+                  height: headerHeight,
+                  backgroundColor: theme.colors.surface,
+                  borderColor: theme.colors.outline,
+                },
+              ]}
+            >
+              <Image
+                source={{ uri: imageUri }}
+                style={styles.heroImg}
+                resizeMode="cover"
+                onError={() => setImgFailed(true)}
+              />
+              <View style={styles.heroOverlay} />
 
-          <View style={styles.ctaRow}>
-            <Button
-              mode="contained"
-              style={styles.ctaPrimary}
-              onPress={() => contribute(50)}
-              loading={submitting}
-              disabled={submitting}
+              <View style={styles.heroText}>
+                <Text style={styles.heroTitle} numberOfLines={1}>
+                  {title}
+                </Text>
+                <Text style={styles.heroLocation} numberOfLines={1}>
+                  {location}
+                </Text>
+              </View>
+
+              <View
+                style={[
+                  styles.pill,
+                  {
+                    backgroundColor: theme.dark
+                      ? "rgba(17,24,42,0.85)"
+                      : "rgba(255,255,255,0.85)",
+                    borderColor: "rgba(0,0,0,0.08)",
+                  },
+                ]}
+              >
+                <Text style={{ color: theme.colors.onBackground, fontWeight: "900" }}>
+                  {Math.round(pct * 100)}% funded
+                </Text>
+              </View>
+            </View>
+
+            <View
+              style={[
+                styles.card,
+                { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline },
+              ]}
             >
-              + $50
-            </Button>
-            <Button
-              mode="outlined"
-              style={styles.ctaSecondary}
-              onPress={() => contribute(200)}
-              disabled={submitting}
-            >
-              + $200
-            </Button>
+              <Text style={[styles.cardLabel, { color: theme.colors.onSurfaceVariant }]}>
+                Progress
+              </Text>
+
+              <View style={styles.amountRow}>
+                <Text style={[styles.amountBig, { color: theme.colors.onBackground }]}>
+                  {money(saved)}
+                </Text>
+                <Text style={[styles.amountSmall, { color: theme.colors.onSurfaceVariant }]}>
+                  {" "}
+                  / {money(target)}
+                </Text>
+              </View>
+
+              <View
+                style={[
+                  styles.progressOuter,
+                  { backgroundColor: theme.colors.surfaceVariant, borderColor: theme.colors.outline },
+                ]}
+              >
+                <View
+                  style={[
+                    styles.progressInner,
+                    { width: `${pct * 100}%`, backgroundColor: theme.colors.primary },
+                  ]}
+                />
+              </View>
+
+              <Text style={[styles.remaining, { color: theme.colors.onSurfaceVariant }]}>
+                Remaining:{" "}
+                <Text style={{ fontWeight: "900", color: theme.colors.onBackground }}>
+                  {money(remaining)}
+                </Text>
+              </Text>
+            </View>
           </View>
 
-          <View style={{ height: 10 }} />
+          {/* Side */}
+          <View style={isWide ? styles.sideCol : undefined}>
+            <View
+              style={[
+                styles.card,
+                { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline },
+              ]}
+            >
+              <Text style={[styles.cardTitle, { color: theme.colors.onBackground }]}>
+                Quick Analysis
+              </Text>
+              <Text style={[styles.sub, { color: theme.colors.onSurfaceVariant }]}>
+                Based on your goal and members.
+              </Text>
 
-          <Button mode="text" onPress={() => router.back()} disabled={submitting}>
-            Back to Trips
-          </Button>
-        </Card.Content>
-      </Card>
+              <View style={{ height: 12 }} />
+
+              <Row label="Members" value={`${membersCount}`} themeText={theme.colors.onBackground} muted={theme.colors.onSurfaceVariant} />
+              <Row label="Saved" value={money(saved)} themeText={theme.colors.onBackground} muted={theme.colors.onSurfaceVariant} />
+              <Row label="Remaining" value={money(remaining)} themeText={theme.colors.onBackground} muted={theme.colors.onSurfaceVariant} />
+
+              <View style={[styles.divider, { backgroundColor: theme.colors.outline }]} />
+
+              <Row label="Target / person" value={money(perPersonTarget)} themeText={theme.colors.onBackground} muted={theme.colors.onSurfaceVariant} />
+              <Row label="Remaining / person" value={money(perPersonRemaining)} themeText={theme.colors.onBackground} muted={theme.colors.onSurfaceVariant} />
+
+              <View style={[styles.divider, { backgroundColor: theme.colors.outline }]} />
+
+              <Text style={[styles.cardLabel, { color: theme.colors.onSurfaceVariant, marginBottom: 8 }]}>
+                Suggested weekly savings (total / per person)
+              </Text>
+
+              {weeklyPlans.map((p) => (
+                <Row
+                  key={p.label}
+                  label={p.label}
+                  value={`${money(p.perWeekTotal)} / ${money(p.perWeekPerPerson)}`}
+                  themeText={theme.colors.onBackground}
+                  muted={theme.colors.onSurfaceVariant}
+                />
+              ))}
+            </View>
+          </View>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+function Row({
+  label,
+  value,
+  themeText,
+  muted,
+}: {
+  label: string;
+  value: string;
+  themeText: string;
+  muted: string;
+}) {
+  return (
+    <View style={styles.qaRow}>
+      <Text style={[styles.qaLabel, { color: muted }]}>{label}</Text>
+      <Text style={[styles.qaValue, { color: themeText }]}>{value}</Text>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 16, backgroundColor: "#F6F7FB" },
-  card: { borderRadius: 16, backgroundColor: "white" },
-  muted: { opacity: 0.7 },
+  safe: { flex: 1 },
 
-  amountRow: {
+  topBar: {
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 10,
     flexDirection: "row",
-    alignItems: "baseline",
-    gap: 6,
-    marginTop: 6,
-    marginBottom: 10,
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
   },
-  bigAmount: { fontWeight: "900", fontSize: 22 },
-  ofAmount: { opacity: 0.6 },
-
-  progress: {
-    height: 10,
-    borderRadius: 10,
-    backgroundColor: "rgba(0,0,0,0.06)",
+  topBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
   },
 
-  metaRow: {
+  page: { padding: 16, paddingBottom: 40 },
+
+  gridWide: { flexDirection: "row", gap: 16, alignItems: "flex-start" },
+  mainCol: { flex: 1, minWidth: 560 },
+  sideCol: { width: 380 },
+
+  heroWrap: {
+    borderRadius: 18,
+    overflow: "hidden",
+    borderWidth: 1,
+    position: "relative",
+  },
+  heroImg: { width: "100%", height: "100%" },
+  heroOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.28)",
+  },
+  heroText: { position: "absolute", left: 16, right: 16, bottom: 16 },
+  heroTitle: { color: "#fff", fontSize: 32, fontWeight: "900" },
+  heroLocation: { marginTop: 4, color: "rgba(255,255,255,0.9)", fontSize: 14, fontWeight: "700" },
+
+  pill: {
+    position: "absolute",
+    right: 16,
+    bottom: 16,
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+  },
+
+  card: {
+    marginTop: 14,
+    borderRadius: 18,
+    borderWidth: 1,
+    padding: 14,
+  },
+  cardTitle: { fontSize: 16, fontWeight: "900" },
+  cardLabel: { fontSize: 12, fontWeight: "800" },
+
+  amountRow: { flexDirection: "row", alignItems: "flex-end", marginTop: 6 },
+  amountBig: { fontSize: 34, fontWeight: "900" },
+  amountSmall: { fontSize: 14, fontWeight: "800", marginBottom: 6 },
+
+  progressOuter: {
+    marginTop: 10,
+    height: 12,
+    borderRadius: 999,
+    borderWidth: 1,
+    overflow: "hidden",
+  },
+  progressInner: { height: "100%", borderRadius: 999 },
+
+  remaining: { marginTop: 10, fontSize: 13, fontWeight: "800" },
+
+  divider: { height: 1, marginVertical: 12 },
+
+  qaRow: {
     flexDirection: "row",
     justifyContent: "space-between",
+    alignItems: "center",
     marginTop: 10,
   },
+  qaLabel: { fontWeight: "800" },
+  qaValue: { fontWeight: "900" },
 
-  ctaRow: { flexDirection: "row", gap: 10 },
-  ctaPrimary: { flex: 1, borderRadius: 12 },
-  ctaSecondary: { borderRadius: 12 },
+  loadingWrap: { paddingTop: 60, alignItems: "center", gap: 10 },
+  loadingText: { fontSize: 13 },
+  h1: { fontSize: 20, fontWeight: "900" },
+  sub: { fontSize: 13, marginTop: 6 },
+
+  primaryBtn: {
+    marginTop: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 14,
+  },
+  primaryBtnText: { color: "#fff", fontWeight: "900" },
 });
