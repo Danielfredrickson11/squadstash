@@ -31,7 +31,12 @@ yarn-error.*
 *.pem
 
 # local env files
-.env*.local
+# Ignore any .env file/variant so real secrets can never be committed
+# accidentally, but explicitly allow an intentionally committed
+# .env.example template if one is added later.
+.env
+.env.*
+!.env.example
 
 # typescript
 *.tsbuildinfo

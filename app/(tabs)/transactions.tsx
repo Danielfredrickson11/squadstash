@@ -12,7 +12,7 @@ export default function TransactionsScreen() {
             This tab will display all of your personal and group transactions.
           </Text>
           <Text style={styles.text}>
-            Soon, you'll be able to view, edit, and categorize your spending.
+            Soon, you&apos;ll be able to view, edit, and categorize your spending.
           </Text>
         </Card.Content>
         <Card.Actions>

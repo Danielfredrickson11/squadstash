@@ -30,12 +30,24 @@ service cloud.firestore {
         && request.resource.data.target is number
         && request.resource.data.balance is number;
 
+      // SEC-001 fix: field-level allowlists for update, for both owner and
+      // non-owner members. ownerId, memberIds, balance and target remain
+      // owner-controlled only. These fields remain prototype/planning
+      // numbers, NOT real-money balances - no ledger exists yet (see
+      // Milestone 1 audit, SEC-001).
       allow update: if (isBucketMember() || isBucketOwner())
         && request.resource.data.ownerId == resource.data.ownerId
         && (resource.data.ownerId in request.resource.data.memberIds)
+        && request.resource.data.name is string
+        && request.resource.data.target is number
+        && request.resource.data.balance is number
+        && request.resource.data.memberIds is list
         && (
-          request.resource.data.memberIds == resource.data.memberIds
-          || isBucketOwner()
+          isBucketOwner()
+            ? request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['name', 'target', 'balance', 'color', 'memberIds', 'lastUpdatedAt', 'lastUpdatedBy'])
+            : request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['name', 'color', 'lastUpdatedAt', 'lastUpdatedBy'])
         );
 
       allow delete: if isBucketOwner();
@@ -71,15 +83,30 @@ service cloud.firestore {
           || request.resource.data.location == null
         );
 
+      // SEC-001 fix: field-level allowlists for update, for both owner and
+      // non-owner members. ownerId, memberIds, target and saved remain
+      // owner-controlled only. These fields remain prototype/planning
+      // numbers, NOT real-money balances - no ledger exists yet (see
+      // Milestone 1 audit, SEC-001).
+      // Note: no current screen calls update() on trips; this is
+      // defense-in-depth hardening with no observed UI impact.
       allow update: if (isTripMember() || isTripOwner())
         && request.resource.data.ownerId == resource.data.ownerId
         && (resource.data.ownerId in request.resource.data.memberIds)
+        && request.resource.data.title is string
+        && request.resource.data.target is number
+        && request.resource.data.saved is number
+        && request.resource.data.imageUrl is string
+        && request.resource.data.memberIds is list
         && (
-          request.resource.data.memberIds == resource.data.memberIds
-          || isTripOwner()
+          isTripOwner()
+            ? request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['title', 'location', 'target', 'saved', 'imageUrl', 'memberIds', 'lastUpdatedAt', 'lastUpdatedBy'])
+            : request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['title', 'location', 'imageUrl', 'lastUpdatedAt', 'lastUpdatedBy'])
         );
 
-      // ✅ Delete: only owner
+      // Delete: only owner
       allow delete: if isTripOwner();
     }
 
