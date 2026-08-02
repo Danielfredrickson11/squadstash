@@ -17,4 +17,15 @@ module.exports = [
       },
     },
   },
+  {
+    // Plain CommonJS Node files: the Jest config for Firestore rules tests
+    // and the rules-test scaffold itself (both run under Node, not RN/web).
+    files: ['jest.rules.config.js', 'tests/firestore-rules/**/*.js'],
+    languageOptions: {
+      globals: {
+        ...globals.node,
+        ...globals.jest,
+      },
+    },
+  },
 ];
