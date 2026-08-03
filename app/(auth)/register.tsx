@@ -64,7 +64,6 @@ export default function Register() {
           uid: cred.user.uid,
           displayName,
           photoURL: cred.user.photoURL ?? "",
-          emailLower: cleanEmail,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         },

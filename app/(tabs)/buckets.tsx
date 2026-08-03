@@ -56,7 +56,6 @@ type PublicUser = {
   uid: string;
   displayName?: string;
   photoURL?: string;
-  emailLower?: string;
 };
 
 const COLORS = [
@@ -253,7 +252,6 @@ export default function BucketsScreen() {
                 uid: docSnap.id,
                 displayName: String(d.displayName ?? ""),
                 photoURL: String(d.photoURL ?? ""),
-                emailLower: String(d.emailLower ?? ""),
               };
             });
             return next;

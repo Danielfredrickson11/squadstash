@@ -118,8 +118,43 @@ service cloud.firestore {
     }
 
     match /publicUsers/{uid} {
+      // Milestone 1B checkpoint 3B: read/list scope intentionally left
+      // unchanged for now - narrowing member-discovery access is a
+      // separate, larger decision, not part of this checkpoint.
       allow read: if signedIn();
-      allow write: if signedIn() && request.auth.uid == uid;
+
+      // Approved profile shape only. emailLower must never be written
+      // again (see Milestone 1B privacy inspection) - it is deliberately
+      // excluded from this allowlist.
+      allow create: if signedIn()
+        && uid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.displayName is string
+        && request.resource.data.photoURL is string
+        && request.resource.data.keys()
+            .hasOnly(['uid', 'displayName', 'photoURL', 'createdAt', 'updatedAt']);
+
+      // Only the document owner may update, only approved fields may
+      // change value, and uid/document ownership is immutable.
+      //
+      // IMPORTANT: this uses diff().affectedKeys() (changed VALUES only),
+      // not keys() (all keys present). A legacy document that already
+      // contains emailLower can still be updated as long as emailLower's
+      // value is left unchanged - it simply never appears in the diff,
+      // so no live-data migration is required for existing profiles to
+      // remain editable. Any attempt to add, change, or restore
+      // emailLower on any document (legacy or modern) is blocked because
+      // 'emailLower' is not in this allowlist.
+      allow update: if signedIn()
+        && uid == request.auth.uid
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.displayName is string
+        && request.resource.data.photoURL is string
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['displayName', 'photoURL', 'updatedAt']);
+
+      // Delete: self-only, unchanged from prior behavior.
+      allow delete: if signedIn() && uid == request.auth.uid;
     }
   }
 }
