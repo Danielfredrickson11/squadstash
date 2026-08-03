@@ -17,6 +17,7 @@ import {
 import { httpsCallable } from "firebase/functions";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Alert,
   FlatList,
   Image,
   Text as RNText,
@@ -89,6 +90,18 @@ function isValidInviteEmail(email: string) {
   return e.includes("@") && e.includes(".") && e.length >= 6;
 }
 
+function isPermissionDeniedError(e: unknown): boolean {
+  return (e as { code?: string } | null | undefined)?.code === "permission-denied";
+}
+
+// Never surfaces raw Firebase error details to the user - only a coarse
+// permission-denied vs. other-failure distinction.
+function permissionAwareErrorMessage(e: unknown): string {
+  return isPermissionDeniedError(e)
+    ? "You do not have permission to change one or more of these bucket fields."
+    : "We could not save your changes. Please try again.";
+}
+
 function AvatarCircle(props: {
   index: number;
   label: string;
@@ -125,6 +138,12 @@ export default function BucketsScreen() {
   const { user, loading } = useAuth();
   const { width } = useWindowDimensions();
 
+  // Ownership here is a UI affordance only (hide/disable actions that are
+  // guaranteed to fail). Firestore rules remain the authoritative
+  // permission check for every write - see firestore.rules SEC-001.
+  const isBucketOwner = (b: { ownerId?: string } | null | undefined) =>
+    !!(user?.uid && b?.ownerId === user.uid);
+
   const numColumns = useMemo(() => {
     if (width >= 1100) return 3;
     if (width >= 700) return 2;
@@ -144,6 +163,10 @@ export default function BucketsScreen() {
   const [balance, setBalance] = useState("");
   const [color, setColor] = useState<string | null>(COLORS[0]);
   const [submitting, setSubmitting] = useState(false);
+
+  // Tracks which bucket's quick-add is currently in flight, so buttons on
+  // other buckets stay interactive and this always resets on success/failure.
+  const [quickAddSubmittingId, setQuickAddSubmittingId] = useState<string | null>(null);
 
   // Edit/Delete state
   const [menuAnchor, setMenuAnchor] = useState<string | null>(null);
@@ -330,20 +353,32 @@ export default function BucketsScreen() {
     if (!Number.isFinite(t) || t <= 0) return;
     if (!Number.isFinite(b) || b < 0) return;
 
+    const editingOwner = isBucketOwner(editing);
+
     setSubmitting(true);
     try {
       const ref = doc(db, "buckets", editing.id);
-      await updateDoc(ref, {
+
+      const payload: Record<string, unknown> = {
         name: String(editing.name ?? "").trim(),
-        target: t,
-        balance: b,
         color: editing.color ?? null,
         lastUpdatedAt: serverTimestamp(),
         lastUpdatedBy: user.uid,
-      });
+      };
+
+      // Only the bucket owner may change target/balance. Never send these
+      // fields from a non-owner save - Firestore rules would reject them
+      // anyway, but this keeps the request itself honest and minimal.
+      if (editingOwner) {
+        payload.target = t;
+        payload.balance = b;
+      }
+
+      await updateDoc(ref, payload);
       closeEdit();
     } catch (e) {
       console.error("Failed to update bucket:", e);
+      Alert.alert("Couldn't save changes", permissionAwareErrorMessage(e));
     } finally {
       setSubmitting(false);
     }
@@ -382,7 +417,12 @@ export default function BucketsScreen() {
 
   const quickAdd = async (bucket: Bucket, amount: number) => {
     if (!user) return;
+    // UI already hides quick-add for non-owners; Firestore rules remain
+    // the authoritative check regardless.
+    if (!isBucketOwner(bucket)) return;
+
     const nextBalance = (Number(bucket.balance) || 0) + amount;
+    setQuickAddSubmittingId(bucket.id);
     try {
       const ref = doc(db, "buckets", bucket.id);
       await updateDoc(ref, {
@@ -392,6 +432,9 @@ export default function BucketsScreen() {
       });
     } catch (e) {
       console.error("Failed to quick add:", e);
+      Alert.alert("Couldn't update balance", permissionAwareErrorMessage(e));
+    } finally {
+      setQuickAddSubmittingId(null);
     }
   };
 
@@ -411,7 +454,8 @@ export default function BucketsScreen() {
   };
 
   const currentMembers = membersBucket?.memberIds ?? [];
-  const currentIsOwner = !!(user?.uid && membersBucket?.ownerId === user.uid);
+  const currentIsOwner = isBucketOwner(membersBucket);
+  const editingIsOwner = isBucketOwner(editing);
 
   const nameForUid = (uid: string) => {
     const pu = publicUsers[uid];
@@ -510,7 +554,7 @@ export default function BucketsScreen() {
     }
   };
 
-  const leaveBucket = async () => {
+  const leaveBucket = () => {
     if (!user || !membersBucket) return;
 
     if (membersBucket.ownerId === user.uid) {
@@ -518,23 +562,14 @@ export default function BucketsScreen() {
       return;
     }
 
-    setMembersSubmitting(true);
-    setMembersError(null);
-
-    try {
-      const ref = doc(db, "buckets", membersBucket.id);
-      await updateDoc(ref, {
-        memberIds: arrayRemove(user.uid),
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
-      });
-      closeMembers();
-    } catch (e) {
-      console.error("Failed to leave bucket:", e);
-      setMembersError("Failed to leave bucket.");
-    } finally {
-      setMembersSubmitting(false);
-    }
+    // Non-owners can never successfully change memberIds under the
+    // current Firestore rules (Milestone 1 SEC-001 hardening), so this
+    // would always be denied. Tell the user directly instead of sending
+    // a write that is guaranteed to fail.
+    Alert.alert(
+      "Leaving isn't available yet",
+      "Leaving a shared bucket isn't available yet. Ask the bucket owner to remove you as a member."
+    );
   };
 
   const inviteDisabled = useMemo(() => {
@@ -550,7 +585,7 @@ export default function BucketsScreen() {
     const pct = item.target > 0 ? clamp(item.balance / item.target, 0, 1) : 0;
 
     const isMenuOpen = menuAnchor === item.id;
-    const isOwner = !!(user?.uid && item.ownerId === user.uid);
+    const isOwner = isBucketOwner(item);
     const displayName = item.name?.trim() ? item.name.trim() : "Untitled";
 
     const memberIds = item.memberIds ?? [];
@@ -632,14 +667,30 @@ export default function BucketsScreen() {
             </Text>
           </View>
 
-          <View style={styles.quickRow}>
-            <Button mode="outlined" onPress={() => quickAdd(item, 50)} style={styles.quickBtn} compact>
-              + {formatCurrency(50)}
-            </Button>
-            <Button mode="outlined" onPress={() => quickAdd(item, 100)} style={styles.quickBtn} compact>
-              + {formatCurrency(100)}
-            </Button>
-          </View>
+          {isOwner ? (
+            <View style={styles.quickRow}>
+              <Button
+                mode="outlined"
+                onPress={() => quickAdd(item, 50)}
+                style={styles.quickBtn}
+                compact
+                loading={quickAddSubmittingId === item.id}
+                disabled={quickAddSubmittingId === item.id}
+              >
+                + {formatCurrency(50)}
+              </Button>
+              <Button
+                mode="outlined"
+                onPress={() => quickAdd(item, 100)}
+                style={styles.quickBtn}
+                compact
+                loading={quickAddSubmittingId === item.id}
+                disabled={quickAddSubmittingId === item.id}
+              >
+                + {formatCurrency(100)}
+              </Button>
+            </View>
+          ) : null}
         </Card.Content>
       </Card>
     );
@@ -860,6 +911,7 @@ export default function BucketsScreen() {
               value={editing?.target?.toString() ?? ""}
               onChangeText={(v) => setEditing((p) => (p ? { ...p, target: Number(v) || 0 } : p))}
               keyboardType="numeric"
+              disabled={!editingIsOwner}
               style={{ marginBottom: 12 }}
             />
             <TextInput
@@ -867,8 +919,15 @@ export default function BucketsScreen() {
               value={editing?.balance?.toString() ?? ""}
               onChangeText={(v) => setEditing((p) => (p ? { ...p, balance: Number(v) || 0 } : p))}
               keyboardType="numeric"
+              disabled={!editingIsOwner}
               style={{ marginBottom: 16 }}
             />
+
+            {!editingIsOwner ? (
+              <Text style={{ marginBottom: 12, opacity: 0.7, fontSize: 12 }}>
+                Only the bucket owner can change the target and balance.
+              </Text>
+            ) : null}
 
             <Text style={{ marginBottom: 8 }}>Accent Color</Text>
             <View style={styles.colorRow}>
