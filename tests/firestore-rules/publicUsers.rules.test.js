@@ -11,6 +11,8 @@ const { createTestEnv } = require('./helpers/testEnv');
 const {
   MODERN_OWNER_UID,
   LEGACY_OWNER_UID,
+  LEGACY_CREATED_AT_UID,
+  LEGACY_BOTH_UID,
   OTHER_UID,
   validPublicUserData,
   legacyPublicUserData,
@@ -42,6 +44,12 @@ function asModernOwner() {
 function asLegacyOwner() {
   return testEnv.authenticatedContext(LEGACY_OWNER_UID);
 }
+function asCreatedAtOwner() {
+  return testEnv.authenticatedContext(LEGACY_CREATED_AT_UID);
+}
+function asBothLegacyOwner() {
+  return testEnv.authenticatedContext(LEGACY_BOTH_UID);
+}
 function asOther() {
   return testEnv.authenticatedContext(OTHER_UID);
 }
@@ -55,6 +63,29 @@ async function seedModernProfile() {
 
 async function seedLegacyProfile() {
   await seedPublicUser(testEnv, LEGACY_OWNER_UID, legacyPublicUserData(LEGACY_OWNER_UID));
+}
+
+// Represents a document created before checkpoint 5C's fix, when
+// register.tsx still sent createdAt to publicUsers.
+async function seedLegacyCreatedAtProfile() {
+  await seedPublicUser(
+    testEnv,
+    LEGACY_CREATED_AT_UID,
+    validPublicUserData(LEGACY_CREATED_AT_UID, { createdAt: new Date('2025-01-01') })
+  );
+}
+
+// Represents the oldest-style document: both emailLower (pre-3B) and
+// createdAt (pre-5C) still present.
+async function seedLegacyBothProfile() {
+  await seedPublicUser(
+    testEnv,
+    LEGACY_BOTH_UID,
+    validPublicUserData(LEGACY_BOTH_UID, {
+      createdAt: new Date('2024-06-01'),
+      emailLower: 'both-legacy@example.com',
+    })
+  );
 }
 
 describe('firestore.rules: publicUsers - reads and queries', () => {
@@ -140,6 +171,14 @@ describe('firestore.rules: publicUsers - create', () => {
       )
     );
   });
+
+  it('create: createdAt is rejected in a new document', async () => {
+    await assertFails(
+      publicUserDoc(asModernOwner(), MODERN_OWNER_UID).set(
+        validPublicUserData(MODERN_OWNER_UID, { createdAt: new Date() })
+      )
+    );
+  });
 });
 
 describe('firestore.rules: publicUsers - update (modern profile)', () => {
@@ -177,6 +216,17 @@ describe('firestore.rules: publicUsers - update (modern profile)', () => {
     await assertFails(
       publicUserDoc(asModernOwner(), MODERN_OWNER_UID).update({
         emailLower: 'sneaky@example.com',
+      })
+    );
+  });
+
+  it('owner: cannot add createdAt to a modern profile', async () => {
+    // Reproduces the original write-order bug scenario directly: a
+    // document created without createdAt must never be able to gain it
+    // via a later update, regardless of which screen attempts the write.
+    await assertFails(
+      publicUserDoc(asModernOwner(), MODERN_OWNER_UID).update({
+        createdAt: new Date(),
       })
     );
   });
@@ -221,6 +271,82 @@ describe('firestore.rules: publicUsers - update (legacy profile with emailLower)
     await assertFails(
       publicUserDoc(asLegacyOwner(), LEGACY_OWNER_UID).update({
         emailLower: 'changed@example.com',
+      })
+    );
+  });
+});
+
+describe('firestore.rules: publicUsers - AuthContext create-then-merge flow', () => {
+  it('a profile created with the AuthContext payload shape (no createdAt) can be created, then later merge-updated with uid, displayName, photoURL, and updatedAt', async () => {
+    // Step 1: simulates AuthContext.upsertPublicUser's very first write for
+    // a brand-new user - {uid, displayName, photoURL, updatedAt}, no
+    // createdAt. This must succeed under the create rule.
+    await assertSucceeds(
+      publicUserDoc(asModernOwner(), MODERN_OWNER_UID).set({
+        ...validPublicUserData(MODERN_OWNER_UID),
+        updatedAt: new Date(),
+      })
+    );
+
+    // Step 2: simulates a later session's AuthContext upsert (merge
+    // write) touching the same allowed fields. This is exactly the write
+    // that used to fail if a registration write raced with it and had
+    // already added createdAt - now neither write ever sends createdAt,
+    // so this always succeeds regardless of ordering.
+    await assertSucceeds(
+      publicUserDoc(asModernOwner(), MODERN_OWNER_UID).update({
+        uid: MODERN_OWNER_UID,
+        displayName: 'Updated Name',
+        photoURL: 'https://example.com/updated.png',
+        updatedAt: new Date(),
+      })
+    );
+  });
+});
+
+describe('firestore.rules: publicUsers - update (legacy profile with createdAt)', () => {
+  beforeEach(async () => {
+    await seedLegacyCreatedAtProfile();
+  });
+
+  it('owner: can update an allowed field while legacy createdAt remains unchanged (no live-data migration required)', async () => {
+    await assertSucceeds(
+      publicUserDoc(asCreatedAtOwner(), LEGACY_CREATED_AT_UID).update({
+        displayName: 'Still Has CreatedAt',
+      })
+    );
+  });
+
+  it('owner: cannot change the existing legacy createdAt value', async () => {
+    await assertFails(
+      publicUserDoc(asCreatedAtOwner(), LEGACY_CREATED_AT_UID).update({
+        createdAt: new Date('2030-01-01'),
+      })
+    );
+  });
+
+  it('owner: cannot remove the existing legacy createdAt value via full document replacement', async () => {
+    // A non-merge set() on an existing document is evaluated under the
+    // update rule with the full replacement document as
+    // request.resource.data - omitting createdAt here would remove it,
+    // which must be blocked the same as changing its value.
+    await assertFails(
+      publicUserDoc(asCreatedAtOwner(), LEGACY_CREATED_AT_UID).set(
+        validPublicUserData(LEGACY_CREATED_AT_UID)
+      )
+    );
+  });
+});
+
+describe('firestore.rules: publicUsers - update (legacy profile with both emailLower and createdAt)', () => {
+  beforeEach(async () => {
+    await seedLegacyBothProfile();
+  });
+
+  it('owner: can update an allowed field while both legacy emailLower and createdAt remain unchanged', async () => {
+    await assertSucceeds(
+      publicUserDoc(asBothLegacyOwner(), LEGACY_BOTH_UID).update({
+        displayName: 'Still Has Both Legacy Fields',
       })
     );
   });

@@ -1,13 +1,17 @@
 // Shared fixtures/helpers for publicUsers rules tests. Mirrors the
 // structure of helpers/buckets.js and helpers/trips.js.
 //
-// Two distinct seeded-document shapes matter for this collection:
-// - a "modern" profile that never had emailLower
+// Several distinct seeded-document shapes matter for this collection:
+// - a "modern" profile that never had emailLower or createdAt
 // - a "legacy" profile that still has emailLower from before Milestone 1B
-// Checkpoint 3B's rules must keep both updatable without a live-data
+// - a legacy profile that has createdAt (from before checkpoint 5C's fix)
+// - a legacy profile with both emailLower and createdAt
+// The rules must keep all of these updatable without a live-data
 // migration - see the test file for how that's verified.
 const MODERN_OWNER_UID = 'modern-owner-uid';
 const LEGACY_OWNER_UID = 'legacy-owner-uid';
+const LEGACY_CREATED_AT_UID = 'legacy-createdat-uid';
+const LEGACY_BOTH_UID = 'legacy-both-uid';
 const OTHER_UID = 'other-uid';
 
 function validPublicUserData(uid, overrides = {}) {
@@ -49,6 +53,8 @@ function publicUsersCollection(context) {
 module.exports = {
   MODERN_OWNER_UID,
   LEGACY_OWNER_UID,
+  LEGACY_CREATED_AT_UID,
+  LEGACY_BOTH_UID,
   OTHER_UID,
   validPublicUserData,
   legacyPublicUserData,

@@ -126,25 +126,34 @@ service cloud.firestore {
       // Approved profile shape only. emailLower must never be written
       // again (see Milestone 1B privacy inspection) - it is deliberately
       // excluded from this allowlist.
+      //
+      // createdAt is also intentionally excluded: the private `users/{uid}`
+      // document is the source of account-lifecycle metadata, not
+      // publicUsers. This also fixes a write-order bug where AuthContext's
+      // upsert (no createdAt) could create the document first, turning a
+      // later registration write that included createdAt into an update
+      // that adds a new field - which the update rule below has never
+      // allowed. Existing documents that already contain createdAt remain
+      // fully compatible; see the update rule's comment.
       allow create: if signedIn()
         && uid == request.auth.uid
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.displayName is string
         && request.resource.data.photoURL is string
         && request.resource.data.keys()
-            .hasOnly(['uid', 'displayName', 'photoURL', 'createdAt', 'updatedAt']);
+            .hasOnly(['uid', 'displayName', 'photoURL', 'updatedAt']);
 
       // Only the document owner may update, only approved fields may
       // change value, and uid/document ownership is immutable.
       //
       // IMPORTANT: this uses diff().affectedKeys() (changed VALUES only),
       // not keys() (all keys present). A legacy document that already
-      // contains emailLower can still be updated as long as emailLower's
-      // value is left unchanged - it simply never appears in the diff,
-      // so no live-data migration is required for existing profiles to
-      // remain editable. Any attempt to add, change, or restore
-      // emailLower on any document (legacy or modern) is blocked because
-      // 'emailLower' is not in this allowlist.
+      // contains emailLower and/or createdAt can still be updated as long
+      // as those fields' values are left unchanged - they simply never
+      // appear in the diff, so no live-data migration is required for
+      // existing profiles to remain editable. Any attempt to add, change,
+      // or restore emailLower or createdAt on any document (legacy or
+      // modern) is blocked because neither is in this allowlist.
       allow update: if signedIn()
         && uid == request.auth.uid
         && request.resource.data.uid == resource.data.uid
