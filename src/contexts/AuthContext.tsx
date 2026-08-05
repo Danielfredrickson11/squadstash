@@ -36,7 +36,6 @@ async function upsertPublicUser(u: User) {
     uid: u.uid,
     displayName,
     photoURL: u.photoURL ?? "",
-    emailLower: (u.email ?? "").toLowerCase(),
     updatedAt: serverTimestamp(),
   };
 

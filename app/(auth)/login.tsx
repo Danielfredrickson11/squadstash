@@ -57,7 +57,6 @@ export default function Login() {
           uid: u.uid,
           displayName,
           photoURL: u.photoURL ?? "",
-          emailLower: (u.email ?? cleanEmail).toLowerCase(),
           updatedAt: serverTimestamp(),
         },
         { merge: true }

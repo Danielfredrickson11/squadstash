@@ -58,14 +58,16 @@ export default function Register() {
       );
 
       // ✅ Public profile doc (readable by other bucket members)
+      // Account creation time lives on the private `users` doc above -
+      // publicUsers never stores createdAt, so this write is compatible
+      // regardless of whether AuthContext's upsert already created the
+      // document first (see firestore.rules publicUsers create allowlist).
       await setDoc(
         doc(db, "publicUsers", cred.user.uid),
         {
           uid: cred.user.uid,
           displayName,
           photoURL: cred.user.photoURL ?? "",
-          emailLower: cleanEmail,
-          createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         },
         { merge: true }
