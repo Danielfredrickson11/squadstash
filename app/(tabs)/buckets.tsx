@@ -20,6 +20,7 @@ import {
   Alert,
   FlatList,
   Image,
+  Platform,
   Text as RNText,
   StyleSheet,
   View,
@@ -100,6 +101,20 @@ function permissionAwareErrorMessage(e: unknown): string {
   return isPermissionDeniedError(e)
     ? "You do not have permission to change one or more of these bucket fields."
     : "We could not save your changes. Please try again.";
+}
+
+// React Native's Alert.alert() is not reliably implemented on React
+// Native Web, so failure alerts need a web fallback. Mirrors the same
+// Platform.OS branch already used elsewhere in the app (see
+// app/(tabs)/trips/[tripId].tsx's `notify`), kept local here rather than
+// shared to stay a small, contained fix. Native wording/behavior is
+// unchanged - only the web path goes from silent/no-op to working.
+function notifyError(title: string, message: string) {
+  if (Platform.OS === "web" && typeof window !== "undefined") {
+    window.alert(`${title}\n\n${message}`);
+    return;
+  }
+  Alert.alert(title, message);
 }
 
 function AvatarCircle(props: {
@@ -378,7 +393,7 @@ export default function BucketsScreen() {
       closeEdit();
     } catch (e) {
       console.error("Failed to update bucket:", e);
-      Alert.alert("Couldn't save changes", permissionAwareErrorMessage(e));
+      notifyError("Couldn't save changes", permissionAwareErrorMessage(e));
     } finally {
       setSubmitting(false);
     }
@@ -432,7 +447,7 @@ export default function BucketsScreen() {
       });
     } catch (e) {
       console.error("Failed to quick add:", e);
-      Alert.alert("Couldn't update balance", permissionAwareErrorMessage(e));
+      notifyError("Couldn't update balance", permissionAwareErrorMessage(e));
     } finally {
       setQuickAddSubmittingId(null);
     }
@@ -564,10 +579,11 @@ export default function BucketsScreen() {
 
     // Non-owners can never successfully change memberIds under the
     // current Firestore rules (Milestone 1 SEC-001 hardening), so this
-    // would always be denied. Tell the user directly instead of sending
-    // a write that is guaranteed to fail.
-    Alert.alert(
-      "Leaving isn't available yet",
+    // would always be denied. Show this inline via membersError instead
+    // of sending a write that is guaranteed to fail - Alert.alert is not
+    // reliably implemented on React Native Web, so this cannot depend on
+    // the native Alert API (see PR #2 web smoke-test finding).
+    setMembersError(
       "Leaving a shared bucket isn't available yet. Ask the bucket owner to remove you as a member."
     );
   };
@@ -754,6 +770,10 @@ export default function BucketsScreen() {
                 <Text style={{ marginBottom: 12, opacity: 0.7 }}>
                   Only the bucket owner can add/remove members.
                 </Text>
+
+                {membersError ? (
+                  <Text style={{ color: "#B91C1C", marginBottom: 8 }}>{membersError}</Text>
+                ) : null}
 
                 <Button
                   mode="outlined"
