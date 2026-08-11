@@ -1,10 +1,10 @@
 import { Link, router } from "expo-router";
 import { signInWithEmailAndPassword } from "firebase/auth";
-import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import React, { useMemo, useState } from "react";
 import { View } from "react-native";
 import { Button, Card, HelperText, Text, TextInput } from "react-native-paper";
-import { auth, db } from "../../firebase";
+import { auth } from "../../firebase";
+import { upsertPublicProfile, upsertUserProfile } from "../../src/services/firebase/users";
 
 function isValidEmail(email: string) {
   const e = email.trim().toLowerCase();
@@ -39,28 +39,18 @@ export default function Login() {
         (u.displayName && u.displayName.trim()) ||
         (u.email ? u.email.split("@")[0] : "User");
 
-      await setDoc(
-        doc(db, "users", u.uid),
-        {
-          uid: u.uid,
-          displayName,
-          email: (u.email ?? cleanEmail).toLowerCase(),
-          photoURL: u.photoURL ?? null,
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+      await upsertUserProfile({
+        uid: u.uid,
+        displayName,
+        email: (u.email ?? cleanEmail).toLowerCase(),
+        photoURL: u.photoURL ?? null,
+      });
 
-      await setDoc(
-        doc(db, "publicUsers", u.uid),
-        {
-          uid: u.uid,
-          displayName,
-          photoURL: u.photoURL ?? "",
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+      await upsertPublicProfile({
+        uid: u.uid,
+        displayName,
+        photoURL: u.photoURL ?? "",
+      });
 
       router.replace("/(tabs)/home");
     } catch (e: any) {
