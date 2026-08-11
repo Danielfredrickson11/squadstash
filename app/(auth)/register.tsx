@@ -1,9 +1,8 @@
 import { router } from "expo-router";
-import { createUserWithEmailAndPassword, updateProfile } from "firebase/auth";
 import React, { useMemo, useState } from "react";
 import { View } from "react-native";
 import { Button, Card, HelperText, TextInput } from "react-native-paper";
-import { auth } from "../../firebase";
+import { signUp, updateAuthProfile } from "../../src/services/firebase/auth";
 import { upsertPublicProfile, upsertUserProfile } from "../../src/services/firebase/users";
 
 function isValidEmail(email: string) {
@@ -38,10 +37,10 @@ export default function Register() {
     setSubmitting(true);
 
     try {
-      const cred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+      const cred = await signUp(cleanEmail, password);
 
       // Set Firebase Auth display name
-      await updateProfile(cred.user, { displayName });
+      await updateAuthProfile(cred.user, { displayName });
 
       // ✅ Private profile doc (safe place for email, later settings, etc.)
       await upsertUserProfile({

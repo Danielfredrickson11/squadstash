@@ -1,9 +1,8 @@
 import { Link, router } from "expo-router";
-import { signInWithEmailAndPassword } from "firebase/auth";
 import React, { useMemo, useState } from "react";
 import { View } from "react-native";
 import { Button, Card, HelperText, Text, TextInput } from "react-native-paper";
-import { auth } from "../../firebase";
+import { signIn } from "../../src/services/firebase/auth";
 import { upsertPublicProfile, upsertUserProfile } from "../../src/services/firebase/users";
 
 function isValidEmail(email: string) {
@@ -31,7 +30,7 @@ export default function Login() {
     setSubmitting(true);
 
     try {
-      const cred = await signInWithEmailAndPassword(auth, cleanEmail, password);
+      const cred = await signIn(cleanEmail, password);
 
       // ✅ self-heal: ensure both profile docs exist
       const u = cred.user;
