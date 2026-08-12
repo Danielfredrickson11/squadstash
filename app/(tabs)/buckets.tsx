@@ -1,10 +1,8 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import {
-  addDoc,
   arrayRemove,
   arrayUnion,
   collection,
-  deleteDoc,
   doc,
   onSnapshot,
   query,
@@ -39,7 +37,13 @@ import {
 
 import { db, functions } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
-import { subscribeToUserBuckets } from "../../src/services/firebase/buckets";
+import {
+  createBucket,
+  deleteBucket,
+  subscribeToUserBuckets,
+  updateBucket,
+  updateBucketBalance,
+} from "../../src/services/firebase/buckets";
 import { formatCurrency } from "../../utils/format";
 
 type Bucket = {
@@ -302,17 +306,12 @@ export default function BucketsScreen() {
 
     setSubmitting(true);
     try {
-      const colRef = collection(db, "buckets");
-      await addDoc(colRef, {
+      await createBucket({
         name: name.trim(),
         target: t,
         balance: b,
         color: color ?? null,
-        createdAt: serverTimestamp(),
         ownerId: user.uid,
-        memberIds: [user.uid],
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
       });
       closeCreate();
     } catch (e) {
@@ -350,8 +349,6 @@ export default function BucketsScreen() {
 
     setSubmitting(true);
     try {
-      const ref = doc(db, "buckets", editing.id);
-
       const payload: Record<string, unknown> = {
         name: String(editing.name ?? "").trim(),
         color: editing.color ?? null,
@@ -367,7 +364,7 @@ export default function BucketsScreen() {
         payload.balance = b;
       }
 
-      await updateDoc(ref, payload);
+      await updateBucket(editing.id, payload);
       closeEdit();
     } catch (e) {
       console.error("Failed to update bucket:", e);
@@ -398,8 +395,7 @@ export default function BucketsScreen() {
         console.warn("Only the owner can delete this bucket.");
         return;
       }
-      const ref = doc(db, "buckets", editing.id);
-      await deleteDoc(ref);
+      await deleteBucket(editing.id);
       closeDelete();
     } catch (e) {
       console.error("Failed to delete bucket:", e);
@@ -417,12 +413,7 @@ export default function BucketsScreen() {
     const nextBalance = (Number(bucket.balance) || 0) + amount;
     setQuickAddSubmittingId(bucket.id);
     try {
-      const ref = doc(db, "buckets", bucket.id);
-      await updateDoc(ref, {
-        balance: nextBalance,
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
-      });
+      await updateBucketBalance(bucket.id, nextBalance, user.uid);
     } catch (e) {
       console.error("Failed to quick add:", e);
       notifyError("Couldn't update balance", permissionAwareErrorMessage(e));
