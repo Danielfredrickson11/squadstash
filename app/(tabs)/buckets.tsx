@@ -1,6 +1,5 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import {
-  DocumentData,
   addDoc,
   arrayRemove,
   arrayUnion,
@@ -8,7 +7,6 @@ import {
   deleteDoc,
   doc,
   onSnapshot,
-  orderBy,
   query,
   serverTimestamp,
   updateDoc,
@@ -41,6 +39,7 @@ import {
 
 import { db, functions } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
+import { subscribeToUserBuckets } from "../../src/services/firebase/buckets";
 import { formatCurrency } from "../../utils/format";
 
 type Bucket = {
@@ -216,31 +215,10 @@ export default function BucketsScreen() {
 
     setReadError(null);
 
-    const colRef = collection(db, "buckets");
-    const qRef = query(
-      colRef,
-      where("memberIds", "array-contains", user.uid),
-      orderBy("createdAt", "desc")
-    );
-
-    const unsub = onSnapshot(
-      qRef,
-      (snap) => {
-        const next: Bucket[] = [];
-        snap.forEach((docSnap) => {
-          const d = docSnap.data() as DocumentData;
-          next.push({
-            id: docSnap.id,
-            name: String(d.name ?? ""),
-            target: Number(d.target) || 0,
-            balance: Number(d.balance) || 0,
-            color: d.color ?? null,
-            createdAt: d.createdAt,
-            ownerId: String(d.ownerId ?? ""),
-            memberIds: Array.isArray(d.memberIds) ? d.memberIds : [],
-          });
-        });
-        setBuckets(next);
+    const unsub = subscribeToUserBuckets(
+      user.uid,
+      (next) => {
+        setBuckets(next.map((b) => ({ ...b, name: String(b.name ?? "") })));
       },
       (err) => {
         console.error("Buckets snapshot error:", err);
