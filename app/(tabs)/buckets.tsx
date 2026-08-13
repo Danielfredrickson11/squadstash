@@ -10,7 +10,6 @@ import {
   updateDoc,
   where,
 } from "firebase/firestore";
-import { httpsCallable } from "firebase/functions";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
@@ -35,7 +34,7 @@ import {
   TextInput,
 } from "react-native-paper";
 
-import { db, functions } from "../../firebase";
+import { db } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
 import {
   createBucket,
@@ -44,6 +43,7 @@ import {
   updateBucket,
   updateBucketBalance,
 } from "../../src/services/firebase/buckets";
+import { lookupUserByEmail } from "../../src/services/firebase/functions";
 import { formatCurrency } from "../../utils/format";
 
 type Bucket = {
@@ -477,10 +477,7 @@ export default function BucketsScreen() {
     setMembersError(null);
 
     try {
-      const lookup = httpsCallable(functions, "lookupUserByEmail");
-      const res = await lookup({ email });
-
-      const data = res.data as any;
+      const data = await lookupUserByEmail(email);
       const uid = String(data?.uid ?? "").trim();
 
       if (!uid) {
