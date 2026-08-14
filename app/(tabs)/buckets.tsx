@@ -1,13 +1,9 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import {
-  arrayRemove,
-  arrayUnion,
   collection,
-  doc,
   onSnapshot,
   query,
   serverTimestamp,
-  updateDoc,
   where,
 } from "firebase/firestore";
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -37,8 +33,10 @@ import {
 import { db } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
 import {
+  addBucketMember,
   createBucket,
   deleteBucket,
+  removeBucketMember,
   subscribeToUserBuckets,
   updateBucket,
   updateBucketBalance,
@@ -489,12 +487,7 @@ export default function BucketsScreen() {
         return;
       }
 
-      const ref = doc(db, "buckets", membersBucket.id);
-      await updateDoc(ref, {
-        memberIds: arrayUnion(uid),
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
-      });
+      await addBucketMember(membersBucket.id, uid, user.uid);
 
       setInviteEmail("");
     } catch (e: any) {
@@ -521,12 +514,7 @@ export default function BucketsScreen() {
     setMembersError(null);
 
     try {
-      const ref = doc(db, "buckets", membersBucket.id);
-      await updateDoc(ref, {
-        memberIds: arrayRemove(uidToRemove),
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
-      });
+      await removeBucketMember(membersBucket.id, uidToRemove, user.uid);
     } catch (e) {
       console.error("Failed to remove member:", e);
       setMembersError("Failed to remove member.");

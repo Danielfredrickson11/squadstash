@@ -13,6 +13,8 @@
 // has already decided to write.
 import {
   addDoc,
+  arrayRemove,
+  arrayUnion,
   collection,
   deleteDoc,
   doc,
@@ -116,6 +118,30 @@ export async function updateBucketBalance(
 ): Promise<void> {
   await updateDoc(doc(db, "buckets", bucketId), {
     balance,
+    lastUpdatedAt: serverTimestamp(),
+    lastUpdatedBy: updatedBy,
+  });
+}
+
+export async function addBucketMember(
+  bucketId: string,
+  memberUid: string,
+  updatedBy: string
+): Promise<void> {
+  await updateDoc(doc(db, "buckets", bucketId), {
+    memberIds: arrayUnion(memberUid),
+    lastUpdatedAt: serverTimestamp(),
+    lastUpdatedBy: updatedBy,
+  });
+}
+
+export async function removeBucketMember(
+  bucketId: string,
+  memberUid: string,
+  updatedBy: string
+): Promise<void> {
+  await updateDoc(doc(db, "buckets", bucketId), {
+    memberIds: arrayRemove(memberUid),
     lastUpdatedAt: serverTimestamp(),
     lastUpdatedBy: updatedBy,
   });
