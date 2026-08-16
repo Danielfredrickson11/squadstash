@@ -1,11 +1,5 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
-import {
-  collection,
-  onSnapshot,
-  query,
-  serverTimestamp,
-  where,
-} from "firebase/firestore";
+import { serverTimestamp } from "firebase/firestore";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
@@ -30,7 +24,6 @@ import {
   TextInput,
 } from "react-native-paper";
 
-import { db } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
 import {
   addBucketMember,
@@ -42,6 +35,7 @@ import {
   updateBucketBalance,
 } from "../../src/services/firebase/buckets";
 import { lookupUserByEmail } from "../../src/services/firebase/functions";
+import { subscribeToPublicUsersByIds } from "../../src/services/firebase/users";
 import { formatCurrency } from "../../utils/format";
 
 type Bucket = {
@@ -254,23 +248,13 @@ export default function BucketsScreen() {
     const unsubs: Array<() => void> = [];
 
     chunks.forEach((chunk) => {
-      const qRef = query(
-        collection(db, "publicUsers"),
-        where("__name__", "in", chunk)
-      );
-
-      const unsub = onSnapshot(
-        qRef,
-        (snap) => {
+      const unsub = subscribeToPublicUsersByIds(
+        chunk,
+        (users) => {
           setPublicUsers((prev) => {
             const next = { ...prev };
-            snap.forEach((docSnap) => {
-              const d = docSnap.data() as any;
-              next[docSnap.id] = {
-                uid: docSnap.id,
-                displayName: String(d.displayName ?? ""),
-                photoURL: String(d.photoURL ?? ""),
-              };
+            users.forEach((publicUser) => {
+              next[publicUser.uid] = publicUser;
             });
             return next;
           });
