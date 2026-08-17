@@ -1,5 +1,4 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
-import { serverTimestamp } from "firebase/firestore";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
@@ -334,7 +333,6 @@ export default function BucketsScreen() {
       const payload: Record<string, unknown> = {
         name: String(editing.name ?? "").trim(),
         color: editing.color ?? null,
-        lastUpdatedAt: serverTimestamp(),
         lastUpdatedBy: user.uid,
       };
 

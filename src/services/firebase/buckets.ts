@@ -104,7 +104,10 @@ export async function updateBucket(
   bucketId: string,
   payload: Record<string, unknown>
 ): Promise<void> {
-  await updateDoc(doc(db, "buckets", bucketId), payload);
+  await updateDoc(doc(db, "buckets", bucketId), {
+    ...payload,
+    lastUpdatedAt: serverTimestamp(),
+  });
 }
 
 export async function deleteBucket(bucketId: string): Promise<void> {
