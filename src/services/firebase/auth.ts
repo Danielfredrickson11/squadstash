@@ -3,6 +3,7 @@
 // so screens keep their existing try/catch behavior unchanged.
 import {
   createUserWithEmailAndPassword,
+  getAuth,
   signInWithEmailAndPassword,
   updateProfile,
 } from "firebase/auth";
@@ -28,4 +29,8 @@ export function updateAuthProfile(
   profile: { displayName?: string | null; photoURL?: string | null }
 ): Promise<void> {
   return updateProfile(user, profile);
+}
+
+export function getCurrentUser(): User | null {
+  return getAuth().currentUser;
 }
