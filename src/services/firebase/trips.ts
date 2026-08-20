@@ -6,6 +6,9 @@
 import {
   addDoc,
   collection,
+  deleteDoc,
+  doc,
+  getDoc,
   getDocs,
   orderBy,
   query,
@@ -80,4 +83,16 @@ export async function createTrip(input: {
   });
 
   return ref.id;
+}
+
+export async function fetchTripById(
+  tripId: string
+): Promise<TripRecord | null> {
+  const snap = await getDoc(doc(db, "trips", tripId));
+  if (!snap.exists()) return null;
+  return { id: snap.id, ...(snap.data() as DocumentData) } as TripRecord;
+}
+
+export async function deleteTrip(tripId: string): Promise<void> {
+  await deleteDoc(doc(db, "trips", tripId));
 }
