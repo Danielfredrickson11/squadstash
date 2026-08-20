@@ -4,11 +4,15 @@
 import {
   createUserWithEmailAndPassword,
   getAuth,
+  onAuthStateChanged,
   signInWithEmailAndPassword,
+  signOut,
   updateProfile,
 } from "firebase/auth";
-import type { User, UserCredential } from "firebase/auth";
+import type { Unsubscribe, User, UserCredential } from "firebase/auth";
 import { auth } from "../../../firebase";
+
+export type { User };
 
 export function signIn(
   email: string,
@@ -33,4 +37,14 @@ export function updateAuthProfile(
 
 export function getCurrentUser(): User | null {
   return getAuth().currentUser;
+}
+
+export function subscribeToAuthState(
+  onChange: (user: User | null) => void
+): Unsubscribe {
+  return onAuthStateChanged(auth, onChange);
+}
+
+export function signOutUser(): Promise<void> {
+  return signOut(auth);
 }
