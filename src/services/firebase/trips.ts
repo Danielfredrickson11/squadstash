@@ -3,8 +3,16 @@
 // primary/fallback ordering, error handling, and console logging stay in
 // the screen, since fetchMemberTripsOrdered and fetchMemberTrips are
 // meant to be thin, error-propagating building blocks for that logic.
-import { collection, getDocs, orderBy, query, where } from "firebase/firestore";
-import type { DocumentData } from "firebase/firestore";
+import {
+  addDoc,
+  collection,
+  getDocs,
+  orderBy,
+  query,
+  serverTimestamp,
+  type DocumentData,
+  where,
+} from "firebase/firestore";
 import { db } from "../../../firebase";
 
 export type TripRecord = {
@@ -44,4 +52,32 @@ export async function fetchMemberTrips(uid: string): Promise<TripRecord[]> {
     id: d.id,
     ...(d.data() as DocumentData),
   })) as TripRecord[];
+}
+
+export async function createTrip(input: {
+  title: string;
+  location: string | null;
+  target: number;
+  imageUrl: string;
+  ownerId: string;
+}): Promise<string> {
+  const { title, location, target, imageUrl, ownerId } = input;
+
+  const ref = await addDoc(collection(db, "trips"), {
+    title,
+    location,
+    target,
+    saved: 0,
+
+    imageUrl,
+
+    createdAt: serverTimestamp(),
+    ownerId,
+    memberIds: [ownerId],
+
+    lastUpdatedAt: serverTimestamp(),
+    lastUpdatedBy: ownerId,
+  });
+
+  return ref.id;
 }
