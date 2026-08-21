@@ -1,11 +1,10 @@
 import { useRouter } from "expo-router";
-import { addDoc, collection, serverTimestamp } from "firebase/firestore";
 import React, { useMemo, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { Button, Card, Text, TextInput } from "react-native-paper";
 
-import { db } from "../../../firebase";
 import { useAuth } from "../../../src/contexts/AuthContext";
+import { createTrip } from "../../../src/services/firebase/trips";
 
 /** Turn "Scottsdale, Arizona, US" -> "scottsdale,arizona" (good for fallback tags) */
 function normalizeLocation(location?: string | null) {
@@ -129,24 +128,15 @@ export default function CreateTripScreen() {
       const wikiImage = await tryGetWikipediaImage(wikiQuery);
       const imageUrl = wikiImage ?? buildFallbackTripImageUrl(seed, cleanLocation || null, cleanTitle);
 
-      const ref = await addDoc(collection(db, "trips"), {
+      const tripId = await createTrip({
         title: cleanTitle,
         location: cleanLocation ? cleanLocation : null,
         target: t,
-        saved: 0,
-
-        // ✅ Saved once, used everywhere (list + details)
         imageUrl,
-
-        createdAt: serverTimestamp(),
         ownerId: user.uid,
-        memberIds: [user.uid],
-
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
       });
 
-      router.replace(`/(tabs)/trips/${ref.id}`);
+      router.replace(`/(tabs)/trips/${tripId}`);
     } catch (e) {
       console.error("Failed to create trip:", e);
       setErr("Failed to create trip (permissions or network).");

@@ -1,6 +1,4 @@
 // src/contexts/AuthContext.tsx
-import { onAuthStateChanged, signOut, User } from "firebase/auth";
-import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import React, {
   createContext,
   ReactNode,
@@ -9,7 +7,12 @@ import React, {
   useMemo,
   useState,
 } from "react";
-import { auth, db } from "../../firebase";
+import {
+  signOutUser,
+  subscribeToAuthState,
+} from "../services/firebase/auth";
+import type { User } from "../services/firebase/auth";
+import { upsertPublicProfile } from "../services/firebase/users";
 
 type AuthContextType = {
   user: User | null;
@@ -26,20 +29,15 @@ export function useAuth() {
 }
 
 async function upsertPublicUser(u: User) {
-  const ref = doc(db, "publicUsers", u.uid);
-
   const displayName =
     (u.displayName && u.displayName.trim()) ||
     (u.email ? u.email.split("@")[0] : "User");
 
-  const payload = {
+  await upsertPublicProfile({
     uid: u.uid,
     displayName,
     photoURL: u.photoURL ?? "",
-    updatedAt: serverTimestamp(),
-  };
-
-  await setDoc(ref, payload, { merge: true });
+  });
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -47,7 +45,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (u) => {
+    const unsub = subscribeToAuthState(async (u) => {
       try {
         // ✅ IMPORTANT: ensure token is ready before we mark loading=false
         if (u) {
@@ -75,7 +73,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const logout = async () => {
-    await signOut(auth);
+    await signOutUser();
   };
 
   const value = useMemo(() => ({ user, loading, logout }), [user, loading]);

@@ -1,18 +1,10 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { router } from "expo-router";
-import {
-  collection,
-  DocumentData,
-  onSnapshot,
-  orderBy,
-  query,
-  where,
-} from "firebase/firestore";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ScrollView, StyleSheet, View } from "react-native";
 import { Button, Card, Divider, ProgressBar, Text } from "react-native-paper";
-import { db } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
+import { subscribeToUserBuckets } from "../../src/services/firebase/buckets";
 import { formatCurrency } from "../../utils/format";
 
 type MiniBucket = {
@@ -58,24 +50,13 @@ export default function HomeScreen() {
   useEffect(() => {
     if (!user) return;
 
-    // ✅ NEW: shared buckets query (memberIds contains my uid)
-    const qRef = query(
-      collection(db, "buckets"),
-      where("memberIds", "array-contains", user.uid),
-      orderBy("createdAt", "desc")
-    );
-
-    const unsub = onSnapshot(qRef, (snap) => {
-      const list: MiniBucket[] = [];
-
-      snap.forEach((d) => {
-        const data = d.data() as DocumentData;
-        list.push({
-          name: String(data.name ?? "Untitled"),
-          balance: Number(data.balance) || 0,
-          target: Number(data.target) || 0,
-        });
-      });
+    // ✅ shared buckets query (memberIds contains my uid)
+    const unsub = subscribeToUserBuckets(user.uid, (next) => {
+      const list: MiniBucket[] = next.map((b) => ({
+        name: String(b.name ?? "Untitled"),
+        balance: b.balance,
+        target: b.target,
+      }));
 
       setBuckets(list);
 

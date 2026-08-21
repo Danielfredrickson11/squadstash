@@ -1,20 +1,4 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
-import {
-  DocumentData,
-  addDoc,
-  arrayRemove,
-  arrayUnion,
-  collection,
-  deleteDoc,
-  doc,
-  onSnapshot,
-  orderBy,
-  query,
-  serverTimestamp,
-  updateDoc,
-  where,
-} from "firebase/firestore";
-import { httpsCallable } from "firebase/functions";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
@@ -39,8 +23,18 @@ import {
   TextInput,
 } from "react-native-paper";
 
-import { db, functions } from "../../firebase";
 import { useAuth } from "../../src/contexts/AuthContext";
+import {
+  addBucketMember,
+  createBucket,
+  deleteBucket,
+  removeBucketMember,
+  subscribeToUserBuckets,
+  updateBucket,
+  updateBucketBalance,
+} from "../../src/services/firebase/buckets";
+import { lookupUserByEmail } from "../../src/services/firebase/functions";
+import { subscribeToPublicUsersByIds } from "../../src/services/firebase/users";
 import { formatCurrency } from "../../utils/format";
 
 type Bucket = {
@@ -216,31 +210,10 @@ export default function BucketsScreen() {
 
     setReadError(null);
 
-    const colRef = collection(db, "buckets");
-    const qRef = query(
-      colRef,
-      where("memberIds", "array-contains", user.uid),
-      orderBy("createdAt", "desc")
-    );
-
-    const unsub = onSnapshot(
-      qRef,
-      (snap) => {
-        const next: Bucket[] = [];
-        snap.forEach((docSnap) => {
-          const d = docSnap.data() as DocumentData;
-          next.push({
-            id: docSnap.id,
-            name: String(d.name ?? ""),
-            target: Number(d.target) || 0,
-            balance: Number(d.balance) || 0,
-            color: d.color ?? null,
-            createdAt: d.createdAt,
-            ownerId: String(d.ownerId ?? ""),
-            memberIds: Array.isArray(d.memberIds) ? d.memberIds : [],
-          });
-        });
-        setBuckets(next);
+    const unsub = subscribeToUserBuckets(
+      user.uid,
+      (next) => {
+        setBuckets(next.map((b) => ({ ...b, name: String(b.name ?? "") })));
       },
       (err) => {
         console.error("Buckets snapshot error:", err);
@@ -274,23 +247,13 @@ export default function BucketsScreen() {
     const unsubs: Array<() => void> = [];
 
     chunks.forEach((chunk) => {
-      const qRef = query(
-        collection(db, "publicUsers"),
-        where("__name__", "in", chunk)
-      );
-
-      const unsub = onSnapshot(
-        qRef,
-        (snap) => {
+      const unsub = subscribeToPublicUsersByIds(
+        chunk,
+        (users) => {
           setPublicUsers((prev) => {
             const next = { ...prev };
-            snap.forEach((docSnap) => {
-              const d = docSnap.data() as any;
-              next[docSnap.id] = {
-                uid: docSnap.id,
-                displayName: String(d.displayName ?? ""),
-                photoURL: String(d.photoURL ?? ""),
-              };
+            users.forEach((publicUser) => {
+              next[publicUser.uid] = publicUser;
             });
             return next;
           });
@@ -324,17 +287,12 @@ export default function BucketsScreen() {
 
     setSubmitting(true);
     try {
-      const colRef = collection(db, "buckets");
-      await addDoc(colRef, {
+      await createBucket({
         name: name.trim(),
         target: t,
         balance: b,
         color: color ?? null,
-        createdAt: serverTimestamp(),
         ownerId: user.uid,
-        memberIds: [user.uid],
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
       });
       closeCreate();
     } catch (e) {
@@ -372,12 +330,9 @@ export default function BucketsScreen() {
 
     setSubmitting(true);
     try {
-      const ref = doc(db, "buckets", editing.id);
-
       const payload: Record<string, unknown> = {
         name: String(editing.name ?? "").trim(),
         color: editing.color ?? null,
-        lastUpdatedAt: serverTimestamp(),
         lastUpdatedBy: user.uid,
       };
 
@@ -389,7 +344,7 @@ export default function BucketsScreen() {
         payload.balance = b;
       }
 
-      await updateDoc(ref, payload);
+      await updateBucket(editing.id, payload);
       closeEdit();
     } catch (e) {
       console.error("Failed to update bucket:", e);
@@ -420,8 +375,7 @@ export default function BucketsScreen() {
         console.warn("Only the owner can delete this bucket.");
         return;
       }
-      const ref = doc(db, "buckets", editing.id);
-      await deleteDoc(ref);
+      await deleteBucket(editing.id);
       closeDelete();
     } catch (e) {
       console.error("Failed to delete bucket:", e);
@@ -439,12 +393,7 @@ export default function BucketsScreen() {
     const nextBalance = (Number(bucket.balance) || 0) + amount;
     setQuickAddSubmittingId(bucket.id);
     try {
-      const ref = doc(db, "buckets", bucket.id);
-      await updateDoc(ref, {
-        balance: nextBalance,
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
-      });
+      await updateBucketBalance(bucket.id, nextBalance, user.uid);
     } catch (e) {
       console.error("Failed to quick add:", e);
       notifyError("Couldn't update balance", permissionAwareErrorMessage(e));
@@ -508,10 +457,7 @@ export default function BucketsScreen() {
     setMembersError(null);
 
     try {
-      const lookup = httpsCallable(functions, "lookupUserByEmail");
-      const res = await lookup({ email });
-
-      const data = res.data as any;
+      const data = await lookupUserByEmail(email);
       const uid = String(data?.uid ?? "").trim();
 
       if (!uid) {
@@ -523,12 +469,7 @@ export default function BucketsScreen() {
         return;
       }
 
-      const ref = doc(db, "buckets", membersBucket.id);
-      await updateDoc(ref, {
-        memberIds: arrayUnion(uid),
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
-      });
+      await addBucketMember(membersBucket.id, uid, user.uid);
 
       setInviteEmail("");
     } catch (e: any) {
@@ -555,12 +496,7 @@ export default function BucketsScreen() {
     setMembersError(null);
 
     try {
-      const ref = doc(db, "buckets", membersBucket.id);
-      await updateDoc(ref, {
-        memberIds: arrayRemove(uidToRemove),
-        lastUpdatedAt: serverTimestamp(),
-        lastUpdatedBy: user.uid,
-      });
+      await removeBucketMember(membersBucket.id, uidToRemove, user.uid);
     } catch (e) {
       console.error("Failed to remove member:", e);
       setMembersError("Failed to remove member.");

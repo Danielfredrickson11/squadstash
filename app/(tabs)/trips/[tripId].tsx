@@ -1,5 +1,4 @@
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { deleteDoc, doc, getDoc } from "firebase/firestore";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
     ActivityIndicator,
@@ -16,8 +15,8 @@ import {
 } from "react-native";
 import { useTheme } from "react-native-paper";
 
-import { db } from "../../../firebase";
 import { useAuth } from "../../../src/contexts/AuthContext";
+import { deleteTrip, fetchTripById } from "../../../src/services/firebase/trips";
 
 type TripDoc = {
   title?: string;
@@ -91,9 +90,8 @@ export default function TripDetails() {
     if (!tripId) return;
     setLoading(true);
     try {
-      const ref = doc(db, "trips", tripId);
-      const snap = await getDoc(ref);
-      setTrip(snap.exists() ? (snap.data() as TripDoc) : null);
+      const result = await fetchTripById(tripId);
+      setTrip(result);
     } catch (e) {
       console.log("fetchTrip error:", e);
       setTrip(null);
@@ -114,7 +112,7 @@ export default function TripDetails() {
     confirmDelete(async () => {
       try {
         setLoading(true);
-        await deleteDoc(doc(db, "trips", tripId));
+        await deleteTrip(tripId);
         router.replace("/(tabs)/trips");
       } catch (e: any) {
         console.log("delete trip error:", e);

@@ -1,10 +1,9 @@
 import { router } from "expo-router";
-import { createUserWithEmailAndPassword, updateProfile } from "firebase/auth";
-import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import React, { useMemo, useState } from "react";
 import { View } from "react-native";
 import { Button, Card, HelperText, TextInput } from "react-native-paper";
-import { auth, db } from "../../firebase";
+import { signUp, updateAuthProfile } from "../../src/services/firebase/auth";
+import { upsertPublicProfile, upsertUserProfile } from "../../src/services/firebase/users";
 
 function isValidEmail(email: string) {
   const e = email.trim().toLowerCase();
@@ -38,40 +37,30 @@ export default function Register() {
     setSubmitting(true);
 
     try {
-      const cred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+      const cred = await signUp(cleanEmail, password);
 
       // Set Firebase Auth display name
-      await updateProfile(cred.user, { displayName });
+      await updateAuthProfile(cred.user, { displayName });
 
       // ✅ Private profile doc (safe place for email, later settings, etc.)
-      await setDoc(
-        doc(db, "users", cred.user.uid),
-        {
-          uid: cred.user.uid,
-          displayName,
-          email: cleanEmail,
-          photoURL: cred.user.photoURL ?? null,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+      await upsertUserProfile({
+        uid: cred.user.uid,
+        displayName,
+        email: cleanEmail,
+        photoURL: cred.user.photoURL ?? null,
+        includeCreatedAt: true,
+      });
 
       // ✅ Public profile doc (readable by other bucket members)
       // Account creation time lives on the private `users` doc above -
       // publicUsers never stores createdAt, so this write is compatible
       // regardless of whether AuthContext's upsert already created the
       // document first (see firestore.rules publicUsers create allowlist).
-      await setDoc(
-        doc(db, "publicUsers", cred.user.uid),
-        {
-          uid: cred.user.uid,
-          displayName,
-          photoURL: cred.user.photoURL ?? "",
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+      await upsertPublicProfile({
+        uid: cred.user.uid,
+        displayName,
+        photoURL: cred.user.photoURL ?? "",
+      });
 
       router.replace("/(tabs)/home");
     } catch (e: any) {

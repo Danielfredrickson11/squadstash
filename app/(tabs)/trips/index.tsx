@@ -1,14 +1,5 @@
 // app/(tabs)/trips/index.tsx
 import { useFocusEffect, useRouter } from "expo-router";
-import { getAuth } from "firebase/auth";
-import {
-  collection,
-  getDocs,
-  orderBy,
-  query,
-  Timestamp,
-  where,
-} from "firebase/firestore";
 import React, { useCallback, useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -24,19 +15,12 @@ import {
 } from "react-native";
 import { useTheme } from "react-native-paper";
 
-import { db } from "../../../firebase";
-
-type TripDoc = {
-  id: string;
-  title?: string;
-  location?: string;
-  target?: number;
-  saved?: number;
-  ownerId?: string;
-  memberIds?: string[];
-  imageUrl?: string;
-  createdAt?: Timestamp | any;
-};
+import { getCurrentUser } from "../../../src/services/firebase/auth";
+import {
+  fetchMemberTrips,
+  fetchMemberTripsOrdered,
+} from "../../../src/services/firebase/trips";
+import type { TripRecord } from "../../../src/services/firebase/trips";
 
 const FALLBACK_IMAGE =
   "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1200&q=60";
@@ -56,7 +40,7 @@ export default function TripsIndex() {
   const { width } = useWindowDimensions();
 
   const [loading, setLoading] = useState(true);
-  const [trips, setTrips] = useState<TripDoc[]>([]);
+  const [trips, setTrips] = useState<TripRecord[]>([]);
   const [queryText, setQueryText] = useState("");
 
   // Responsive columns (mobile -> desktop)
@@ -77,7 +61,7 @@ export default function TripsIndex() {
   }, [width, numColumns]);
 
   const fetchTrips = useCallback(async () => {
-    const user = getAuth().currentUser;
+    const user = getCurrentUser();
     if (!user) {
       setTrips([]);
       setLoading(false);
@@ -86,36 +70,15 @@ export default function TripsIndex() {
 
     setLoading(true);
     try {
-      const tripsRef = collection(db, "trips");
-      const q = query(
-        tripsRef,
-        where("memberIds", "array-contains", user.uid),
-        orderBy("createdAt", "desc")
-      );
-
-      const snap = await getDocs(q);
-      const rows: TripDoc[] = snap.docs.map((d) => ({
-        id: d.id,
-        ...(d.data() as any),
-      }));
-
+      const rows = await fetchMemberTripsOrdered(user.uid);
       setTrips(rows);
     } catch (e) {
       console.log("fetchTrips error:", e);
 
       // Fallback if createdAt/orderBy isn't present for older docs
       try {
-        const user = getAuth().currentUser;
-        const tripsRef = collection(db, "trips");
-        const q2 = query(
-          tripsRef,
-          where("memberIds", "array-contains", user?.uid ?? "")
-        );
-        const snap2 = await getDocs(q2);
-        const rows2: TripDoc[] = snap2.docs.map((d) => ({
-          id: d.id,
-          ...(d.data() as any),
-        }));
+        const user = getCurrentUser();
+        const rows2 = await fetchMemberTrips(user?.uid ?? "");
         setTrips(rows2);
       } catch (e2) {
         console.log("fetchTrips fallback error:", e2);
@@ -274,7 +237,7 @@ function TripCard({
   width,
   onPress,
 }: {
-  trip: TripDoc;
+  trip: TripRecord;
   width: number;
   onPress: () => void;
 }) {
