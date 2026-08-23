@@ -20,7 +20,7 @@ import {
   fetchMemberTrips,
   fetchMemberTripsOrdered,
 } from "../../../src/services/firebase/trips";
-import type { TripRecord } from "../../../src/services/firebase/trips";
+import type { Trip } from "../../../src/types/domain";
 
 const FALLBACK_IMAGE =
   "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1200&q=60";
@@ -40,7 +40,7 @@ export default function TripsIndex() {
   const { width } = useWindowDimensions();
 
   const [loading, setLoading] = useState(true);
-  const [trips, setTrips] = useState<TripRecord[]>([]);
+  const [trips, setTrips] = useState<Trip[]>([]);
   const [queryText, setQueryText] = useState("");
 
   // Responsive columns (mobile -> desktop)
@@ -237,7 +237,7 @@ function TripCard({
   width,
   onPress,
 }: {
-  trip: TripRecord;
+  trip: Trip;
   width: number;
   onPress: () => void;
 }) {

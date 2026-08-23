@@ -12,14 +12,15 @@ import {
 } from "firebase/firestore";
 import type { DocumentData, Unsubscribe } from "firebase/firestore";
 import { db } from "../../../firebase";
+import type {
+  PublicProfile,
+  UpsertPublicProfileInput,
+  UpsertUserProfileInput,
+} from "../../types/domain";
 
-export async function upsertUserProfile(input: {
-  uid: string;
-  displayName: string;
-  email: string;
-  photoURL: string | null;
-  includeCreatedAt?: boolean;
-}): Promise<void> {
+export async function upsertUserProfile(
+  input: UpsertUserProfileInput
+): Promise<void> {
   const { uid, displayName, email, photoURL, includeCreatedAt } = input;
 
   const payload: Record<string, unknown> = {
@@ -37,11 +38,9 @@ export async function upsertUserProfile(input: {
   await setDoc(doc(db, "users", uid), payload, { merge: true });
 }
 
-export async function upsertPublicProfile(input: {
-  uid: string;
-  displayName: string;
-  photoURL: string;
-}): Promise<void> {
+export async function upsertPublicProfile(
+  input: UpsertPublicProfileInput
+): Promise<void> {
   const { uid, displayName, photoURL } = input;
 
   await setDoc(
@@ -56,15 +55,9 @@ export async function upsertPublicProfile(input: {
   );
 }
 
-export type PublicUserRecord = {
-  uid: string;
-  displayName: string;
-  photoURL: string;
-};
-
 export function subscribeToPublicUsersByIds(
   uids: string[],
-  onChange: (users: PublicUserRecord[]) => void,
+  onChange: (users: PublicProfile[]) => void,
   onError?: (error: unknown) => void
 ): Unsubscribe {
   const qRef = query(
@@ -75,7 +68,7 @@ export function subscribeToPublicUsersByIds(
   return onSnapshot(
     qRef,
     (snap) => {
-      const next: PublicUserRecord[] = [];
+      const next: PublicProfile[] = [];
       snap.forEach((docSnap) => {
         const d = docSnap.data() as DocumentData;
         next.push({

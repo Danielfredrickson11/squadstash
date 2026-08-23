@@ -35,24 +35,8 @@ import {
 } from "../../src/services/firebase/buckets";
 import { lookupUserByEmail } from "../../src/services/firebase/functions";
 import { subscribeToPublicUsersByIds } from "../../src/services/firebase/users";
+import type { Bucket, PublicProfile } from "../../src/types/domain";
 import { formatCurrency } from "../../utils/format";
-
-type Bucket = {
-  id: string;
-  name: string;
-  target: number;
-  balance: number;
-  color?: string | null;
-  createdAt?: any;
-  ownerId: string;
-  memberIds: string[];
-};
-
-type PublicUser = {
-  uid: string;
-  displayName?: string;
-  photoURL?: string;
-};
 
 const COLORS = [
   "#2563EB",
@@ -160,7 +144,7 @@ export default function BucketsScreen() {
   }, [width]);
 
   const [buckets, setBuckets] = useState<Bucket[]>([]);
-  const [publicUsers, setPublicUsers] = useState<Record<string, PublicUser>>({});
+  const [publicUsers, setPublicUsers] = useState<Record<string, PublicProfile>>({});
 
   // Optional: show a friendly message if permissions fail
   const [readError, setReadError] = useState<string | null>(null);
