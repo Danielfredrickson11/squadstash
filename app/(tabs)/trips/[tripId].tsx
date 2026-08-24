@@ -17,16 +17,7 @@ import { useTheme } from "react-native-paper";
 
 import { useAuth } from "../../../src/contexts/AuthContext";
 import { deleteTrip, fetchTripById } from "../../../src/services/firebase/trips";
-
-type TripDoc = {
-  title?: string;
-  location?: string | null;
-  target?: number;
-  saved?: number;
-  imageUrl?: string;
-  ownerId?: string;
-  memberIds?: string[];
-};
+import type { Trip } from "../../../src/types/domain";
 
 const FALLBACK_IMAGE =
   "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=60";
@@ -48,7 +39,7 @@ export default function TripDetails() {
   const theme = useTheme();
 
   const [loading, setLoading] = useState(true);
-  const [trip, setTrip] = useState<TripDoc | null>(null);
+  const [trip, setTrip] = useState<Trip | null>(null);
   const [imgFailed, setImgFailed] = useState(false);
 
   const isWide = width >= 980;

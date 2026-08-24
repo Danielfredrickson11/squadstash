@@ -27,21 +27,11 @@ import {
 } from "firebase/firestore";
 import type { DocumentData, Unsubscribe } from "firebase/firestore";
 import { db } from "../../../firebase";
-
-export type BucketRecord = {
-  id: string;
-  name?: string;
-  target: number;
-  balance: number;
-  color?: string | null;
-  createdAt?: unknown;
-  ownerId: string;
-  memberIds: string[];
-};
+import type { Bucket, CreateBucketInput } from "../../types/domain";
 
 export function subscribeToUserBuckets(
   uid: string,
-  onChange: (buckets: BucketRecord[]) => void,
+  onChange: (buckets: Bucket[]) => void,
   onError?: (error: unknown) => void
 ): Unsubscribe {
   const qRef = query(
@@ -53,7 +43,7 @@ export function subscribeToUserBuckets(
   return onSnapshot(
     qRef,
     (snap) => {
-      const next: BucketRecord[] = [];
+      const next: Bucket[] = [];
       snap.forEach((docSnap) => {
         const d = docSnap.data() as DocumentData;
         next.push({
@@ -73,13 +63,7 @@ export function subscribeToUserBuckets(
   );
 }
 
-export async function createBucket(input: {
-  name: string;
-  target: number;
-  balance: number;
-  color: string | null;
-  ownerId: string;
-}): Promise<string> {
+export async function createBucket(input: CreateBucketInput): Promise<string> {
   const { name, target, balance, color, ownerId } = input;
 
   const ref = await addDoc(collection(db, "buckets"), {
