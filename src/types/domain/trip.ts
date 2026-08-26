@@ -27,6 +27,20 @@ export type Trip = {
   startDate?: PersistedTimestamp | null;
   endDate?: PersistedTimestamp | null;
   currency?: string;
+
+  // Frozen Milestone 2B additive field. A neutral, resource-level
+  // starting balance (integer minor units) representing money the
+  // Trip's shared fund already held before savingsTransactions ledger
+  // tracking began - e.g. a legacy trip.saved of $750 becomes
+  // ledgerOpeningBalanceMinor: 75000 once migrated. It is NEVER
+  // attributable to any specific Trip member, and is therefore excluded
+  // from any per-member savings calculation. Optional for backward
+  // compatibility; newly-created trips under full ledger adoption are
+  // intended to start at 0. Not migrated or read by any runtime code
+  // yet. (bucketType/linkedTripId are Bucket-only concepts and do not
+  // apply to Trip - a Trip is itself the shared fund, not a container
+  // for a separate Bucket.)
+  ledgerOpeningBalanceMinor?: number;
 };
 
 export type CreateTripInput = {
