@@ -111,6 +111,129 @@ service cloud.firestore {
     }
 
     // ---------------------------------------
+    // SAVINGS TRANSACTIONS (Milestone 2B ledger)
+    // ---------------------------------------
+    // Append-only: create only, never update/delete (corrections happen
+    // via a new reversal transaction, never a mutation - see
+    // src/types/domain/savingsTransaction.ts). Access (both read and
+    // create) is based solely on the CURRENT ownerId/memberIds of the
+    // referenced bucket or trip - never on a Bucket's linkedTripId. A
+    // trip_personal Bucket's privacy is governed by that Bucket's own
+    // membership; being the owner of the linked Trip grants no access to
+    // it. Admin-role permissions are deferred until the membership
+    // subcollection infrastructure exists (Milestone 2A design freeze) -
+    // only ownerId/memberIds are consulted here.
+    //
+    // `id` is intentionally not part of the stored/allowed field set:
+    // every existing mapper in this repo (subscribeToUserBuckets,
+    // mapTripDocument, subscribeToPublicUsersByIds) derives `id`/`uid`
+    // from the Firestore document ID itself, never from a stored field
+    // matching SavingsTransactionBase's own `id: string`. The persisted
+    // payload here follows that same convention - `id` is supplied by
+    // the future read-side mapper, not stored.
+    match /savingsTransactions/{transactionId} {
+
+      function validResourceType(t) {
+        return t == 'bucket' || t == 'trip';
+      }
+
+      function parentExists(resourceType, resourceId) {
+        return resourceType == 'bucket'
+          ? exists(/databases/$(database)/documents/buckets/$(resourceId))
+          : exists(/databases/$(database)/documents/trips/$(resourceId));
+      }
+
+      function parentData(resourceType, resourceId) {
+        return resourceType == 'bucket'
+          ? get(/databases/$(database)/documents/buckets/$(resourceId)).data
+          : get(/databases/$(database)/documents/trips/$(resourceId)).data;
+      }
+
+      function isParentMember(resourceType, resourceId, uid) {
+        return uid in parentData(resourceType, resourceId).memberIds;
+      }
+
+      function isParentOwner(resourceType, resourceId, uid) {
+        return parentData(resourceType, resourceId).ownerId == uid;
+      }
+
+      // parent.currency if it exists and is a string, else the legacy
+      // "USD" fallback for resources created before Milestone 2A added
+      // an optional currency field.
+      function parentEffectiveCurrency(resourceType, resourceId) {
+        return ('currency' in parentData(resourceType, resourceId))
+            && (parentData(resourceType, resourceId).currency is string)
+          ? parentData(resourceType, resourceId).currency
+          : 'USD';
+      }
+
+      function canAccessParent(resourceType, resourceId) {
+        return signedIn()
+          && resourceType is string
+          && validResourceType(resourceType)
+          && resourceId is string
+          && parentExists(resourceType, resourceId)
+          && (
+            isParentMember(resourceType, resourceId, request.auth.uid)
+            || isParentOwner(resourceType, resourceId, request.auth.uid)
+          );
+      }
+
+      allow get, list: if resource.data.resourceType is string
+        && resource.data.resourceId is string
+        && canAccessParent(resource.data.resourceType, resource.data.resourceId);
+
+      allow create: if signedIn()
+        && request.resource.data.resourceType is string
+        && validResourceType(request.resource.data.resourceType)
+        && request.resource.data.resourceId is string
+        && parentExists(request.resource.data.resourceType, request.resource.data.resourceId)
+        && request.resource.data.memberUid is string
+        && isParentMember(request.resource.data.resourceType, request.resource.data.resourceId, request.resource.data.memberUid)
+        && request.resource.data.recordedBy is string
+        && request.resource.data.recordedBy == request.auth.uid
+        && (
+          request.auth.uid == request.resource.data.memberUid
+          || isParentOwner(request.resource.data.resourceType, request.resource.data.resourceId, request.auth.uid)
+        )
+        && request.resource.data.amountMinor is int
+        && request.resource.data.amountMinor > 0
+        && (
+          request.resource.data.type == 'contribution'
+          || request.resource.data.type == 'withdrawal'
+        )
+        && request.resource.data.currency is string
+        && request.resource.data.currency == parentEffectiveCurrency(request.resource.data.resourceType, request.resource.data.resourceId)
+        && request.resource.data.createdAt == request.time
+        && (
+          !('note' in request.resource.data)
+          || request.resource.data.note is string
+        )
+        && (
+          !('occurredAt' in request.resource.data)
+          || request.resource.data.occurredAt is timestamp
+        )
+        && (
+          !('reversalOf' in request.resource.data)
+          || request.resource.data.reversalOf is string
+          || request.resource.data.reversalOf == null
+        )
+        && request.resource.data.keys().hasOnly([
+             'resourceType', 'resourceId', 'memberUid', 'recordedBy',
+             'amountMinor', 'currency', 'note', 'occurredAt', 'createdAt',
+             'reversalOf', 'type'
+           ])
+        && request.resource.data.keys().hasAll([
+             'resourceType', 'resourceId', 'memberUid', 'recordedBy',
+             'amountMinor', 'currency', 'createdAt', 'type'
+           ]);
+
+      // Append-only: no client may ever modify or remove a savings
+      // transaction, including the resource owner.
+      allow update, delete: if false;
+    }
+
+    // ---------------------------------------
     // USERS
     // ---------------------------------------
     match /users/{uid} {
