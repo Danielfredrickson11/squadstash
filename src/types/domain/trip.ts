@@ -28,7 +28,7 @@ export type Trip = {
   endDate?: PersistedTimestamp | null;
   currency?: string;
 
-  // Frozen Milestone 2B additive field. A neutral, resource-level
+  // Frozen Milestone 2B additive fields. A neutral, resource-level
   // starting balance (integer minor units) representing money the
   // Trip's shared fund already held before savingsTransactions ledger
   // tracking began - e.g. a legacy trip.saved of $750 becomes
@@ -36,11 +36,24 @@ export type Trip = {
   // attributable to any specific Trip member, and is therefore excluded
   // from any per-member savings calculation. Optional for backward
   // compatibility; newly-created trips under full ledger adoption are
-  // intended to start at 0. Not migrated or read by any runtime code
-  // yet. (bucketType/linkedTripId are Bucket-only concepts and do not
-  // apply to Trip - a Trip is itself the shared fund, not a container
-  // for a separate Bucket.)
+  // intended to start at 0. Set only by trusted backend operations
+  // (never a client-write input). (bucketType/linkedTripId are
+  // Bucket-only concepts and do not apply to Trip - a Trip is itself the
+  // shared fund, not a container for a separate Bucket.)
   ledgerOpeningBalanceMinor?: number;
+  // ledgerBalanceMinor: the trusted, materialized current shared-fund
+  // savings total in integer minor units - conceptually
+  // ledgerOpeningBalanceMinor + contributions - withdrawals, maintained
+  // only by trusted backend operations so a write never has to re-sum
+  // the full savingsTransactions history. The full opening balance plus
+  // transaction history remains the auditable financial truth; this
+  // field is a cache of that truth, not a second source of it.
+  // Trip.saved stays the separate, dollar-denominated display/
+  // compatibility cache, derived from this field only at the final
+  // boundary (saved = ledgerBalanceMinor / 100) - never the other way
+  // around once ledger tracking has begun. Optional for backward
+  // compatibility; never a client-write input.
+  ledgerBalanceMinor?: number;
 };
 
 export type CreateTripInput = {

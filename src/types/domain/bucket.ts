@@ -59,9 +59,22 @@ export type Bucket = {
   // member (we don't know who historically contributed it), and is
   // therefore excluded from any per-member savings calculation. Optional
   // for backward compatibility; newly-created buckets under full ledger
-  // adoption are intended to start at 0. Not migrated or read by any
-  // runtime code yet.
+  // adoption are intended to start at 0. Set only by trusted backend
+  // operations (never a client-write input).
   ledgerOpeningBalanceMinor?: number;
+  // ledgerBalanceMinor: the trusted, materialized current savings total
+  // in integer minor units - conceptually
+  // ledgerOpeningBalanceMinor + contributions - withdrawals, maintained
+  // only by trusted backend operations so that a write never has to
+  // re-sum the full savingsTransactions history. The full opening
+  // balance plus transaction history remains the auditable financial
+  // truth; this field is a cache of that truth, not a second source of
+  // it. Bucket.balance stays the separate, dollar-denominated display/
+  // compatibility cache, derived from this field only at the final
+  // boundary (balance = ledgerBalanceMinor / 100) - never the other way
+  // around once ledger tracking has begun. Optional for backward
+  // compatibility; never a client-write input.
+  ledgerBalanceMinor?: number;
 };
 
 export type CreateBucketInput = {

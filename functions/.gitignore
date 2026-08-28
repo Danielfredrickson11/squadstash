@@ -2,6 +2,10 @@
 lib/**/*.js
 lib/**/*.js.map
 
+# Compiled test output (functions/test -> lib-test, separate from the
+# production build above so `npm run build`'s lib/ output is unaffected)
+lib-test/
+
 # TypeScript v1 declaration files
 typings/
 
