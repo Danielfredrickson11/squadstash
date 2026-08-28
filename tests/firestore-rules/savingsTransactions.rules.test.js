@@ -2,10 +2,15 @@
 // (Milestone 2B ledger). Run against the local Firestore emulator using
 // the real firestore.rules file (never weakened to make a test pass).
 //
+// As of Checkpoint 4B, client CREATE/UPDATE/DELETE are all permanently
+// closed - the trusted recordSavingsTransaction Cloud Function (Admin
+// SDK, which bypasses these rules) is the sole write path. Read fixtures
+// below are seeded exclusively via the rules-disabled admin context,
+// never via a client create the rules now intentionally deny.
+//
 // Reuses the existing buckets/trips helpers to seed parent resources -
 // no shared helper file is modified; this file stays self-contained per
-// Checkpoint 2's scope (firestore.rules, firestore.indexes.json, and
-// this test file only).
+// this checkpoint's scope (firestore.rules and this test file only).
 const { assertFails, assertSucceeds } = require('@firebase/rules-unit-testing');
 const { serverTimestamp, Timestamp } = require('firebase/firestore');
 const { createTestEnv } = require('./helpers/testEnv');
@@ -64,17 +69,18 @@ function transactionsCollection(context) {
   return context.firestore().collection('savingsTransactions');
 }
 
+// Seeds a transaction document bypassing security rules entirely - the
+// only way to seed one now that client create is closed.
 async function seedTransaction(id, data) {
   await testEnv.withSecurityRulesDisabled(async (context) => {
     await context.firestore().collection('savingsTransactions').doc(id).set(data);
   });
 }
 
-// Valid payload shape a client would send when creating a transaction -
-// createdAt is deliberately a real serverTimestamp() sentinel, matching
-// how the future write service is expected to call it (see
-// src/types/domain/savingsTransaction.ts's CreateSavingsTransactionInput
-// doc comment: createdAt is always server-generated).
+// Shape a real recordSavingsTransaction call would persist (see
+// functions/src/callables/recordSavingsTransaction.ts) - used only to
+// seed read fixtures and to construct otherwise-perfectly-valid create
+// attempts that must still be denied.
 function validContribution(overrides = {}) {
   return {
     resourceType: 'bucket',
@@ -85,6 +91,7 @@ function validContribution(overrides = {}) {
     currency: 'USD',
     type: 'contribution',
     createdAt: serverTimestamp(),
+    reversalOf: null,
     ...overrides,
   };
 }
@@ -107,12 +114,12 @@ describe('firestore.rules: savingsTransactions - reads', () => {
     await seedTrip(testEnv, TRIP_ID, validTripData());
   });
 
-  it('1. unauthenticated user cannot get a bucket transaction', async () => {
+  it('unauthenticated user cannot get a bucket transaction', async () => {
     await seedTransaction('txn-1', validContribution());
     await assertFails(transactionDoc(asUnauthenticated(), 'txn-1').get());
   });
 
-  it('2. unauthenticated user cannot query bucket transactions', async () => {
+  it('unauthenticated user cannot query bucket transactions', async () => {
     await seedTransaction('txn-1', validContribution());
     await assertFails(
       transactionsCollection(asUnauthenticated())
@@ -122,17 +129,37 @@ describe('firestore.rules: savingsTransactions - reads', () => {
     );
   });
 
-  it('3. bucket member can get a bucket transaction', async () => {
+  it('1. bucket owner can get an existing transaction', async () => {
+    await seedTransaction('txn-1', validContribution());
+    await assertSucceeds(transactionDoc(asOwner(), 'txn-1').get());
+  });
+
+  it('2. bucket member can get an existing transaction', async () => {
     await seedTransaction('txn-1', validContribution());
     await assertSucceeds(transactionDoc(asMember(), 'txn-1').get());
   });
 
-  it('4. unrelated user cannot get a bucket transaction', async () => {
+  it('3. bucket nonmember cannot get', async () => {
     await seedTransaction('txn-1', validContribution());
     await assertFails(transactionDoc(asOutsider(), 'txn-1').get());
   });
 
-  it('5. bucket member can perform the resource-scoped history query', async () => {
+  it('4. trip owner can get', async () => {
+    await seedTransaction('txn-trip-1', validTripContribution());
+    await assertSucceeds(transactionDoc(asOwner(), 'txn-trip-1').get());
+  });
+
+  it('5. trip member can get', async () => {
+    await seedTransaction('txn-trip-1', validTripContribution());
+    await assertSucceeds(transactionDoc(asMember(), 'txn-trip-1').get());
+  });
+
+  it('6. trip nonmember cannot get', async () => {
+    await seedTransaction('txn-trip-1', validTripContribution());
+    await assertFails(transactionDoc(asOutsider(), 'txn-trip-1').get());
+  });
+
+  it('7. authorized resource-scoped list query succeeds', async () => {
     await seedTransaction('txn-1', validContribution());
     await seedTransaction('txn-2', validWithdrawal({ amountMinor: 200 }));
 
@@ -146,7 +173,7 @@ describe('firestore.rules: savingsTransactions - reads', () => {
     expect(snap.docs.map((d) => d.id).sort()).toEqual(['txn-1', 'txn-2']);
   });
 
-  it('6. unrelated user cannot perform that bucket history query', async () => {
+  it('8. unauthorized resource-scoped list query fails', async () => {
     await seedTransaction('txn-1', validContribution());
     await assertFails(
       transactionsCollection(asOutsider())
@@ -157,19 +184,8 @@ describe('firestore.rules: savingsTransactions - reads', () => {
     );
   });
 
-  it('7. trip member can get a trip transaction', async () => {
+  it('also succeeds for an authorized trip-scoped list query (parity with bucket)', async () => {
     await seedTransaction('txn-trip-1', validTripContribution());
-    await assertSucceeds(transactionDoc(asMember(), 'txn-trip-1').get());
-  });
-
-  it('8. unrelated user cannot get a trip transaction', async () => {
-    await seedTransaction('txn-trip-1', validTripContribution());
-    await assertFails(transactionDoc(asOutsider(), 'txn-trip-1').get());
-  });
-
-  it('9. trip member can perform the trip-scoped history query', async () => {
-    await seedTransaction('txn-trip-1', validTripContribution());
-
     const snap = await assertSucceeds(
       transactionsCollection(asMember())
         .where('resourceType', '==', 'trip')
@@ -180,7 +196,7 @@ describe('firestore.rules: savingsTransactions - reads', () => {
     expect(snap.docs.map((d) => d.id)).toEqual(['txn-trip-1']);
   });
 
-  it('10. unrelated user cannot perform that trip history query', async () => {
+  it('also fails for an unauthorized trip-scoped list query (parity with bucket)', async () => {
     await seedTransaction('txn-trip-1', validTripContribution());
     await assertFails(
       transactionsCollection(asOutsider())
@@ -191,7 +207,33 @@ describe('firestore.rules: savingsTransactions - reads', () => {
     );
   });
 
-  it('11. trip owner does not gain access to a trip_personal bucket merely via linkedTripId', async () => {
+  it('9. malformed resourceType get fails', async () => {
+    // Seeded only with security rules disabled - this shape could never
+    // pass a real create, but proves the read path independently denies
+    // it rather than falling through parentExists()/parentData()'s
+    // bucket-vs-else ternary and accidentally treating it as a Trip.
+    await seedTransaction(
+      'txn-malformed-1',
+      validContribution({ resourceType: 'expense', resourceId: TRIP_ID })
+    );
+    await assertFails(transactionDoc(asOwner(), 'txn-malformed-1').get());
+    await assertFails(transactionDoc(asMember(), 'txn-malformed-1').get());
+  });
+
+  it('10. malformed resourceType query fails', async () => {
+    await seedTransaction(
+      'txn-malformed-1',
+      validContribution({ resourceType: 'expense', resourceId: TRIP_ID })
+    );
+    await assertFails(
+      transactionsCollection(asMember())
+        .where('resourceType', '==', 'expense')
+        .where('resourceId', '==', TRIP_ID)
+        .get()
+    );
+  });
+
+  it('11. trip ownership does not grant access to another user\'s trip_personal Bucket transaction merely via linkedTripId', async () => {
     // MEMBER_UID's own trip_personal fund for OWNER_UID's trip - OWNER_UID
     // is not in this bucket's ownerId/memberIds at all.
     await seedBucket(
@@ -215,264 +257,84 @@ describe('firestore.rules: savingsTransactions - reads', () => {
     // Sanity: the bucket's actual owner can still read it.
     await assertSucceeds(transactionDoc(asMember(), 'txn-personal-1').get());
   });
-
-  it('44. a malformed transaction with an invalid resourceType cannot be read, even if resourceId matches a real Trip', async () => {
-    // Seeded only with security rules disabled - this shape could never
-    // pass the create rule (validResourceType rejects it there too), but
-    // proves the read path independently denies it rather than falling
-    // through parentExists()/parentData()'s bucket-vs-else ternary and
-    // accidentally treating it as a Trip reference.
-    await seedTransaction(
-      'txn-malformed-1',
-      validContribution({ resourceType: 'expense', resourceId: TRIP_ID })
-    );
-
-    await assertFails(transactionDoc(asOwner(), 'txn-malformed-1').get());
-    await assertFails(transactionDoc(asMember(), 'txn-malformed-1').get());
-  });
-
-  it('45. a resource-scoped query for the invalid resourceType cannot expose the malformed transaction', async () => {
-    await seedTransaction(
-      'txn-malformed-1',
-      validContribution({ resourceType: 'expense', resourceId: TRIP_ID })
-    );
-
-    await assertFails(
-      transactionsCollection(asMember())
-        .where('resourceType', '==', 'expense')
-        .where('resourceId', '==', TRIP_ID)
-        .get()
-    );
-  });
 });
 
-describe('firestore.rules: savingsTransactions - create (self)', () => {
+describe('firestore.rules: savingsTransactions - direct client create is denied', () => {
   beforeEach(async () => {
     await seedBucket(testEnv, BUCKET_ID, validBucketData());
     await seedTrip(testEnv, TRIP_ID, validTripData());
   });
 
-  it('12. bucket member can record their own contribution', async () => {
-    await assertSucceeds(
+  it('12. bucket owner cannot directly create a contribution', async () => {
+    await assertFails(
+      transactionDoc(asOwner(), 'txn-1').set(
+        validContribution({ memberUid: OWNER_UID, recordedBy: OWNER_UID })
+      )
+    );
+  });
+
+  it('13. bucket member cannot directly create their own contribution', async () => {
+    await assertFails(
       transactionDoc(asMember(), 'txn-1').set(validContribution())
     );
   });
 
-  it('13. bucket member can record their own withdrawal', async () => {
-    await assertSucceeds(
-      transactionDoc(asMember(), 'txn-1').set(validWithdrawal())
+  it('14. trip owner cannot directly create a contribution', async () => {
+    await assertFails(
+      transactionDoc(asOwner(), 'txn-1').set(
+        validTripContribution({ memberUid: OWNER_UID, recordedBy: OWNER_UID })
+      )
     );
   });
 
-  it('14. trip member can record their own contribution', async () => {
-    await assertSucceeds(
+  it('15. trip member cannot directly create their own contribution', async () => {
+    await assertFails(
       transactionDoc(asMember(), 'txn-1').set(validTripContribution())
     );
   });
 
-  it('15. trip member can record their own withdrawal', async () => {
-    await assertSucceeds(
-      transactionDoc(asMember(), 'txn-1').set(
-        validTripContribution({ type: 'withdrawal' })
-      )
+  it('16. direct withdrawal create is denied', async () => {
+    await assertFails(
+      transactionDoc(asMember(), 'txn-1').set(validWithdrawal())
     );
   });
-});
 
-describe('firestore.rules: savingsTransactions - create (owner on behalf)', () => {
-  beforeEach(async () => {
-    await seedBucket(testEnv, BUCKET_ID, validBucketData());
-    await seedTrip(testEnv, TRIP_ID, validTripData());
-  });
-
-  it('16. bucket owner can record for another current bucket member', async () => {
-    await assertSucceeds(
+  it('17. owner-on-behalf direct create is denied', async () => {
+    await assertFails(
       transactionDoc(asOwner(), 'txn-1').set(
         validContribution({ memberUid: MEMBER_UID, recordedBy: OWNER_UID })
       )
     );
   });
 
-  it('17. trip owner can record for another current trip member', async () => {
-    await assertSucceeds(
-      transactionDoc(asOwner(), 'txn-1').set(
-        validTripContribution({ memberUid: MEMBER_UID, recordedBy: OWNER_UID })
+  it('18. unauthenticated direct create is denied', async () => {
+    await assertFails(
+      transactionDoc(asUnauthenticated(), 'txn-1').set(validContribution())
+    );
+  });
+
+  it('IMPORTANT SECURITY ASSERTION: a perfectly well-formed self-contribution from a legitimate current member is still denied', async () => {
+    // This payload satisfies every shape/permission rule the create
+    // clause ever validated (Checkpoint 2/2-fix): correct resourceType/
+    // resourceId, memberUid == recordedBy == the authenticated member's
+    // own uid, a positive integer amountMinor, matching currency, a
+    // valid type, a real serverTimestamp() createdAt, reversalOf: null,
+    // no missing/extra fields. It is denied purely because create is
+    // now unconditionally closed - proving a client cannot bypass the
+    // trusted recordSavingsTransaction Function's atomic parent-cache/
+    // ledgerBalanceMinor maintenance, non-negative-withdrawal
+    // enforcement, idempotency, or legacy-initialization checks merely
+    // by constructing an otherwise-valid document by hand.
+    const perfectlyValidPayload = validContribution();
+    await assertFails(
+      transactionDoc(asMember(), 'txn-perfectly-valid').set(
+        perfectlyValidPayload
       )
     );
   });
 });
 
-describe('firestore.rules: savingsTransactions - create denials', () => {
-  beforeEach(async () => {
-    await seedBucket(testEnv, BUCKET_ID, validBucketData());
-    await seedTrip(testEnv, TRIP_ID, validTripData());
-  });
-
-  it('18. ordinary member cannot record for another member', async () => {
-    // MEMBER_UID (non-owner) tries to record on behalf of OWNER_UID.
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ memberUid: OWNER_UID, recordedBy: MEMBER_UID })
-      )
-    );
-  });
-
-  it('19. nonmember cannot create a transaction for the resource', async () => {
-    await assertFails(
-      transactionDoc(asOutsider(), 'txn-1').set(
-        validContribution({ memberUid: OUTSIDER_UID, recordedBy: OUTSIDER_UID })
-      )
-    );
-  });
-
-  it('20. owner cannot record for a UID that is not a current member', async () => {
-    await assertFails(
-      transactionDoc(asOwner(), 'txn-1').set(
-        validContribution({ memberUid: OUTSIDER_UID, recordedBy: OWNER_UID })
-      )
-    );
-  });
-
-  it('21. recordedBy spoof is denied', async () => {
-    // MEMBER_UID is authenticated but claims recordedBy = OWNER_UID.
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ memberUid: MEMBER_UID, recordedBy: OWNER_UID })
-      )
-    );
-  });
-
-  it('22. invalid resourceType is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ resourceType: 'expense' })
-      )
-    );
-  });
-
-  it('23. nonexistent parent resource is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ resourceId: 'does-not-exist' })
-      )
-    );
-  });
-
-  it('24. invalid transaction type is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ type: 'deposit' })
-      )
-    );
-  });
-
-  it('25. amountMinor = 0 is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ amountMinor: 0 })
-      )
-    );
-  });
-
-  it('26. negative amountMinor is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ amountMinor: -500 })
-      )
-    );
-  });
-
-  it('27. fractional amountMinor is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ amountMinor: 12.34 })
-      )
-    );
-  });
-
-  it('28. currency mismatch is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ currency: 'EUR' })
-      )
-    );
-  });
-
-  it('29. explicit non-USD parent currency accepts a matching transaction currency', async () => {
-    await seedBucket(
-      testEnv,
-      'eur-bucket',
-      validBucketData({
-        ownerId: OWNER_UID,
-        memberIds: [OWNER_UID, MEMBER_UID],
-        currency: 'EUR',
-      })
-    );
-    await assertSucceeds(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ resourceId: 'eur-bucket', currency: 'EUR' })
-      )
-    );
-  });
-
-  it("30. legacy parent with no currency field accepts USD", async () => {
-    // validBucketData() has no `currency` key at all - simulates a
-    // pre-Milestone-2A legacy document.
-    await assertSucceeds(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ currency: 'USD' })
-      )
-    );
-  });
-
-  it('31. legacy parent with no currency field rejects non-USD', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ currency: 'EUR' })
-      )
-    );
-  });
-
-  it('32. missing a required field is denied', async () => {
-    const payload = validContribution();
-    delete payload.amountMinor;
-    await assertFails(transactionDoc(asMember(), 'txn-1').set(payload));
-  });
-
-  it('33. unknown extra field is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ extraField: 'not allowed' })
-      )
-    );
-  });
-
-  it('34. invalid note type is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ note: 12345 })
-      )
-    );
-  });
-
-  it('35. invalid occurredAt type is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ occurredAt: 'yesterday' })
-      )
-    );
-  });
-
-  it('36. invalid reversalOf type is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ reversalOf: 12345 })
-      )
-    );
-  });
-});
-
-describe('firestore.rules: savingsTransactions - append-only', () => {
+describe('firestore.rules: savingsTransactions - append-only (update/delete remain denied)', () => {
   beforeEach(async () => {
     await seedBucket(testEnv, BUCKET_ID, validBucketData());
     await seedTransaction('txn-1', {
@@ -481,51 +343,17 @@ describe('firestore.rules: savingsTransactions - append-only', () => {
     });
   });
 
-  it('37. owner cannot update an existing transaction', async () => {
+  it('19. update remains denied', async () => {
     await assertFails(
       transactionDoc(asOwner(), 'txn-1').update({ amountMinor: 999 })
     );
-  });
-
-  it('38. member cannot update an existing transaction', async () => {
     await assertFails(
       transactionDoc(asMember(), 'txn-1').update({ amountMinor: 999 })
     );
   });
 
-  it('39. owner cannot delete an existing transaction', async () => {
+  it('20. delete remains denied', async () => {
     await assertFails(transactionDoc(asOwner(), 'txn-1').delete());
-  });
-
-  it('40. member cannot delete an existing transaction', async () => {
     await assertFails(transactionDoc(asMember(), 'txn-1').delete());
-  });
-});
-
-describe('firestore.rules: savingsTransactions - createdAt / id', () => {
-  beforeEach(async () => {
-    await seedBucket(testEnv, BUCKET_ID, validBucketData());
-  });
-
-  it('41. a non-server createdAt value is denied', async () => {
-    await assertFails(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ createdAt: Timestamp.now() })
-      )
-    );
-  });
-
-  it('42. a real serverTimestamp() createdAt is accepted', async () => {
-    await assertSucceeds(
-      transactionDoc(asMember(), 'txn-1').set(
-        validContribution({ createdAt: serverTimestamp() })
-      )
-    );
-  });
-
-  it('43. a stored id field is not required - the canonical payload (no id key) is accepted', async () => {
-    const payload = validContribution();
-    expect('id' in payload).toBe(false);
-    await assertSucceeds(transactionDoc(asMember(), 'txn-1').set(payload));
   });
 });
