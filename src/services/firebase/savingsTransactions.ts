@@ -1,13 +1,22 @@
-// Read-only Firestore access for the savingsTransactions ledger
-// (Milestone 2B). Resource-scoped only - no global or member-filtered
-// query, matching the exact query shape firestore.rules authorizes (see
-// Checkpoint 2's rules tests: resourceType == ..., resourceId == ...,
-// orderBy createdAt desc). Write paths (recording a contribution/
-// withdrawal, reversals) are a separate future checkpoint; this file
-// only turns Firestore documents into canonical SavingsTransaction[]
-// values. No balance calculation happens here - that is
-// src/domain/savingsBalance.ts's job, deliberately kept separate and not
-// imported from this file.
+// Firestore access for the savingsTransactions ledger (Milestone 2B).
+// Reads are direct Firestore queries, resource-scoped only - no global or
+// member-filtered query, matching the exact query shape firestore.rules
+// authorizes (see Checkpoint 2's rules tests: resourceType == ...,
+// resourceId == ..., orderBy createdAt desc) - and turn documents into
+// canonical SavingsTransaction[] values.
+//
+// Writes (Checkpoint 4B/4C) go exclusively through the trusted
+// recordSavingsTransaction Cloud Function via httpsCallable: Firestore
+// rules unconditionally deny client create/update/delete on this
+// collection, so no addDoc/setDoc/updateDoc/runTransaction/writeBatch
+// call could ever succeed here even if one were written. Reversals are a
+// separate future checkpoint.
+//
+// No balance calculation happens here - that is src/domain/
+// savingsBalance.ts's job for locally-derived balances, and the trusted
+// balanceMinor returned by the callable for the authoritative one; this
+// file never imports savingsBalance.ts or recomputes a balance itself.
+import { httpsCallable } from "firebase/functions";
 import {
   collection,
   getDocs,
@@ -17,12 +26,13 @@ import {
   where,
 } from "firebase/firestore";
 import type { DocumentData, Unsubscribe } from "firebase/firestore";
-import { db } from "../../../firebase";
+import { db, functions } from "../../../firebase";
 import type {
   CurrencyCode,
   PersistedTimestamp,
   ResourceType,
   SavingsTransaction,
+  SavingsTransactionType,
 } from "../../types/domain";
 
 // Builds a SavingsTransaction field-by-field from a raw Firestore
@@ -119,4 +129,127 @@ export function subscribeToSavingsTransactionsForResource(
     },
     onError
   );
+}
+
+// ---------------------------------------
+// WRITE PATH (Milestone 2B Checkpoint 4C)
+// ---------------------------------------
+
+// Deliberately narrower than CreateSavingsTransactionInput: recordedBy,
+// createdAt and reversalOf are trusted/backend-managed values the
+// recordSavingsTransaction Cloud Function itself resolves (recordedBy
+// from the authenticated caller, createdAt server-side, reversalOf held
+// back for a later reversal checkpoint) and must never be accepted from
+// or sent by this client wrapper. clientRequestId is required, not
+// optional - it is the idempotency key a retried submit must reuse
+// exactly, and generating a fresh one per call here would defeat that;
+// its lifecycle (create once per submit attempt, retain across retries)
+// belongs to the future UI/action checkpoint that calls this function.
+export type RecordSavingsTransactionInput = {
+  resourceType: ResourceType;
+  resourceId: string;
+  memberUid: string;
+  type: SavingsTransactionType;
+  amountMinor: number;
+  currency: CurrencyCode;
+  note?: string;
+  occurredAt?: Date;
+  clientRequestId: string;
+};
+
+// The literal shape sent over the wire - identical to
+// RecordSavingsTransactionInput except occurredAt is serialized to an
+// ISO string at this boundary (the callable's persisted representation
+// converts it back to a Timestamp on the backend; this function never
+// touches an already-persisted Firestore Timestamp).
+type RecordSavingsTransactionRequest = {
+  resourceType: ResourceType;
+  resourceId: string;
+  memberUid: string;
+  type: SavingsTransactionType;
+  amountMinor: number;
+  currency: CurrencyCode;
+  note?: string;
+  occurredAt?: string;
+  clientRequestId: string;
+};
+
+export type RecordSavingsTransactionResult = {
+  transactionId: string;
+  balanceMinor: number;
+};
+
+// Validates the callable's response field-by-field rather than trusting
+// a whole-object cast - a malformed/unexpected shape must fail visibly,
+// never silently coerce via String(...)/Number(...)/||/?? defaulting,
+// since balanceMinor is authoritative financial data.
+function parseRecordSavingsTransactionResponse(
+  data: unknown
+): RecordSavingsTransactionResult {
+  if (typeof data !== "object" || data === null) {
+    throw new Error(
+      "recordSavingsTransaction: invalid response (expected an object)."
+    );
+  }
+
+  const { transactionId, balanceMinor } = data as Record<string, unknown>;
+
+  if (typeof transactionId !== "string" || transactionId.length === 0) {
+    throw new Error(
+      "recordSavingsTransaction: invalid response (transactionId must be a non-empty string)."
+    );
+  }
+  if (
+    typeof balanceMinor !== "number" ||
+    !Number.isSafeInteger(balanceMinor) ||
+    balanceMinor < 0
+  ) {
+    throw new Error(
+      "recordSavingsTransaction: invalid response (balanceMinor must be a non-negative safe integer)."
+    );
+  }
+
+  return { transactionId, balanceMinor };
+}
+
+// The sole write path for savingsTransactions: invokes the trusted
+// recordSavingsTransaction Cloud Function via httpsCallable. Firestore
+// rules deny direct client create/update/delete on this collection
+// unconditionally (Checkpoint 4B), so no addDoc/setDoc/updateDoc/
+// runTransaction/writeBatch call is used or would succeed here. Callable
+// errors (HttpsError/FirebaseError) are not caught or wrapped - they
+// propagate to the caller unchanged, matching lookupUserByEmail's
+// existing convention.
+export async function recordSavingsTransaction(
+  input: RecordSavingsTransactionInput
+): Promise<RecordSavingsTransactionResult> {
+  const payload: RecordSavingsTransactionRequest = {
+    resourceType: input.resourceType,
+    resourceId: input.resourceId,
+    memberUid: input.memberUid,
+    type: input.type,
+    amountMinor: input.amountMinor,
+    currency: input.currency,
+    clientRequestId: input.clientRequestId,
+  };
+
+  if (input.note !== undefined) {
+    payload.note = input.note;
+  }
+
+  if (input.occurredAt !== undefined) {
+    if (Number.isNaN(input.occurredAt.getTime())) {
+      throw new Error(
+        "recordSavingsTransaction: occurredAt is an invalid Date."
+      );
+    }
+    payload.occurredAt = input.occurredAt.toISOString();
+  }
+
+  const callable = httpsCallable<RecordSavingsTransactionRequest, unknown>(
+    functions,
+    "recordSavingsTransaction"
+  );
+  const res = await callable(payload);
+  return parseRecordSavingsTransactionResponse(res.data);
 }
