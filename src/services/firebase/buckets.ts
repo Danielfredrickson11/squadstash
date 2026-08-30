@@ -6,11 +6,21 @@
 // error-handling behavior, since those differ between the two screens
 // today. See Milestone 1D checkpoint 4A notes for the comparison.
 //
-// createBucket / updateBucket / deleteBucket / updateBucketBalance
-// (checkpoint 4B) are thin wrappers around the writes previously inline
-// in app/(tabs)/buckets.tsx. Ownership/permission decisions and payload
-// construction stay in the screen - these only execute what the screen
-// has already decided to write.
+// createBucket / updateBucket / deleteBucket are thin wrappers around the
+// writes previously inline in app/(tabs)/buckets.tsx. Ownership/
+// permission decisions and payload construction stay in the screen -
+// these only execute what the screen has already decided to write.
+//
+// Existing Bucket balance changes (after creation) now go through the
+// trusted recordSavingsTransaction Cloud Function (see
+// src/services/firebase/savingsTransactions.ts), not this file:
+// updateBucketBalance was removed (Milestone 2B Checkpoint 4D), and
+// updateBucket()'s input type (Checkpoint 4D hardening) cannot accept
+// balance/ledgerBalanceMinor/ledgerOpeningBalanceMinor or any other
+// financial cache field - see UpdateBucketInput below. createBucket's
+// legacy Starting Balance behavior is the one deliberate exception: it is
+// temporarily unchanged and intentionally deferred to the upcoming
+// starting-balance checkpoint, not an oversight.
 import {
   addDoc,
   arrayRemove,
@@ -81,12 +91,26 @@ export async function createBucket(input: CreateBucketInput): Promise<string> {
   return ref.id;
 }
 
+// The only fields the current updateBucket() caller (buckets.tsx's
+// onSaveEdit) legitimately needs to change: ordinary bucket metadata,
+// never a financial cache field. Deliberately NOT Partial<Bucket> or a
+// generic Record<string, unknown> - those would compile-allow balance,
+// ledgerBalanceMinor, ledgerOpeningBalanceMinor, ownerId, memberIds, etc.
+// to be passed through this ordinary metadata-edit path. target stays
+// optional since the screen only includes it for the bucket owner.
+export type UpdateBucketInput = {
+  name: string;
+  color: string | null;
+  lastUpdatedBy: string;
+  target?: number;
+};
+
 // Accepts the exact payload the screen has already decided to send (e.g.
-// the owner vs. non-owner field branching in buckets.tsx) and performs
+// the owner vs. non-owner target branching in buckets.tsx) and performs
 // the write. Makes no ownership or permission decisions itself.
 export async function updateBucket(
   bucketId: string,
-  payload: Record<string, unknown>
+  payload: UpdateBucketInput
 ): Promise<void> {
   await updateDoc(doc(db, "buckets", bucketId), {
     ...payload,
@@ -96,18 +120,6 @@ export async function updateBucket(
 
 export async function deleteBucket(bucketId: string): Promise<void> {
   await deleteDoc(doc(db, "buckets", bucketId));
-}
-
-export async function updateBucketBalance(
-  bucketId: string,
-  balance: number,
-  updatedBy: string
-): Promise<void> {
-  await updateDoc(doc(db, "buckets", bucketId), {
-    balance,
-    lastUpdatedAt: serverTimestamp(),
-    lastUpdatedBy: updatedBy,
-  });
 }
 
 export async function addBucketMember(

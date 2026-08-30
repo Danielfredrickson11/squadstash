@@ -31,12 +31,16 @@ import {
   removeBucketMember,
   subscribeToUserBuckets,
   updateBucket,
-  updateBucketBalance,
 } from "../../src/services/firebase/buckets";
+import type { UpdateBucketInput } from "../../src/services/firebase/buckets";
 import { lookupUserByEmail } from "../../src/services/firebase/functions";
+import {
+  generateSavingsClientRequestId,
+  recordSavingsTransaction,
+} from "../../src/services/firebase/savingsTransactions";
 import { subscribeToPublicUsersByIds } from "../../src/services/firebase/users";
-import type { Bucket, PublicProfile } from "../../src/types/domain";
-import { formatCurrency } from "../../utils/format";
+import type { Bucket, PublicProfile, SavingsTransactionType } from "../../src/types/domain";
+import { formatCurrency, parseDollarsToMinorUnits } from "../../utils/format";
 
 const COLORS = [
   "#2563EB",
@@ -79,6 +83,64 @@ function permissionAwareErrorMessage(e: unknown): string {
   return isPermissionDeniedError(e)
     ? "You do not have permission to change one or more of these bucket fields."
     : "We could not save your changes. Please try again.";
+}
+
+// Never surfaces raw HttpsError/FirebaseError technical text - maps the
+// httpsCallable client SDK's "functions/<code>" error codes (see
+// functions/src/callables/recordSavingsTransaction.ts for the exact
+// codes this callable can throw) to plain user-facing copy.
+function savingsErrorMessage(e: unknown): string {
+  const code = (e as { code?: string } | null | undefined)?.code;
+  switch (code) {
+    case "functions/failed-precondition":
+      return "That amount isn't allowed right now - it may take the balance below zero, or the bucket's ledger needs attention. Please check the amount and try again.";
+    case "functions/permission-denied":
+      return "You do not have permission to record this transaction.";
+    case "functions/already-exists":
+      return "That request could not be completed. Please try again.";
+    default:
+      return "We couldn't record that. Please try again.";
+  }
+}
+
+// One in-flight/retryable savings write, keyed by the facts that make it
+// a single logical request (not just its clientRequestId, since the id
+// itself is only meaningful in relation to what it was generated for).
+// A retry of the exact same facts must reuse the same id; any different
+// facts are a new logical request and need a new one (see
+// resolveClientRequestId).
+type PendingSavingsRequest = {
+  clientRequestId: string;
+  resourceId: string;
+  memberUid: string;
+  type: SavingsTransactionType;
+  amountMinor: number;
+};
+
+// Returns the clientRequestId to use for this submission: reuses the
+// previous attempt's id if the retained pending request has the exact
+// same logical facts (a retry of a failed submit), otherwise generates a
+// fresh id and replaces the pending record (a genuinely new submission).
+// Does not itself clear the ref on success/cancel - callers own that, so
+// this stays a pure "resolve what id to send" step.
+function resolveClientRequestId(
+  pendingRef: React.MutableRefObject<PendingSavingsRequest | null>,
+  facts: Omit<PendingSavingsRequest, "clientRequestId">
+): string {
+  const pending = pendingRef.current;
+  if (
+    pending &&
+    pending.resourceId === facts.resourceId &&
+    pending.memberUid === facts.memberUid &&
+    pending.type === facts.type &&
+    pending.amountMinor === facts.amountMinor
+  ) {
+    return pending.clientRequestId;
+  }
+
+  const clientRequestId = generateSavingsClientRequestId();
+  pendingRef.current = { ...facts, clientRequestId };
+  return clientRequestId;
 }
 
 // React Native's Alert.alert() is not reliably implemented on React
@@ -157,9 +219,39 @@ export default function BucketsScreen() {
   const [color, setColor] = useState<string | null>(COLORS[0]);
   const [submitting, setSubmitting] = useState(false);
 
-  // Tracks which bucket's quick-add is currently in flight, so buttons on
-  // other buckets stay interactive and this always resets on success/failure.
+  // Identifies which bucket's quick-add is visibly loading (its button
+  // shows the spinner) and always resets to null on success/failure.
+  // While ANY quick-add is in flight (quickAddSubmittingId !== null),
+  // money-action controls are disabled across every bucket card, not just
+  // the submitting one - quickAddSubmittingId alone is only the visible
+  // loading/disabled state; quickAddInFlightRef (below) is what actually
+  // prevents a second quickAdd() from starting concurrently.
   const [quickAddSubmittingId, setQuickAddSubmittingId] = useState<string | null>(null);
+  // Retains the clientRequestId (plus the logical request facts it was
+  // generated for) across a failed quick-add attempt, so a retry of the
+  // exact same tap reuses the same idempotency key instead of creating a
+  // second logical transaction. A ref, not state, since it must not
+  // trigger a re-render and must survive across a submit/retry cycle.
+  const quickAddPendingRef = useRef<PendingSavingsRequest | null>(null);
+  // Synchronous serialization guard: a second quickAdd() call (on any
+  // bucket) that starts before React has re-rendered quickAddSubmittingId
+  // would otherwise race past the state-based disabled checks below and
+  // overwrite the single shared quickAddPendingRef mid-flight. A plain
+  // ref (checked/set synchronously, before any await) closes that gap;
+  // quickAddSubmittingId remains solely responsible for the visible
+  // loading/disabled UI.
+  const quickAddInFlightRef = useRef(false);
+
+  // Contribute/Withdraw custom-amount dialog
+  const [moneyDialogVisible, setMoneyDialogVisible] = useState(false);
+  const [moneyDialogBucket, setMoneyDialogBucket] = useState<Bucket | null>(null);
+  const [moneyDialogType, setMoneyDialogType] = useState<SavingsTransactionType>("contribution");
+  const [moneyDialogAmount, setMoneyDialogAmount] = useState("");
+  const [moneyDialogError, setMoneyDialogError] = useState<string | null>(null);
+  const [moneyDialogSubmitting, setMoneyDialogSubmitting] = useState(false);
+  // Same idempotency-retry role as quickAddPendingRef, scoped to the
+  // custom dialog's own submissions.
+  const customPendingRef = useRef<PendingSavingsRequest | null>(null);
 
   // Edit/Delete state
   const [menuAnchor, setMenuAnchor] = useState<string | null>(null);
@@ -306,26 +398,26 @@ export default function BucketsScreen() {
     if (!user || !editing) return;
 
     const t = Number(editing.target);
-    const b = Number(editing.balance);
     if (!Number.isFinite(t) || t <= 0) return;
-    if (!Number.isFinite(b) || b < 0) return;
 
     const editingOwner = isBucketOwner(editing);
 
     setSubmitting(true);
     try {
-      const payload: Record<string, unknown> = {
+      const payload: UpdateBucketInput = {
         name: String(editing.name ?? "").trim(),
         color: editing.color ?? null,
         lastUpdatedBy: user.uid,
       };
 
-      // Only the bucket owner may change target/balance. Never send these
-      // fields from a non-owner save - Firestore rules would reject them
-      // anyway, but this keeps the request itself honest and minimal.
+      // Only the bucket owner may change target. Never send this field
+      // from a non-owner save - Firestore rules would reject it anyway,
+      // but this keeps the request itself honest and minimal. balance is
+      // never sent from here at all - it is no longer an editable field;
+      // it only ever changes through a trusted recordSavingsTransaction
+      // contribution/withdrawal (see quickAdd/onSubmitMoneyDialog).
       if (editingOwner) {
         payload.target = t;
-        payload.balance = b;
       }
 
       await updateBucket(editing.id, payload);
@@ -368,21 +460,116 @@ export default function BucketsScreen() {
     }
   };
 
-  const quickAdd = async (bucket: Bucket, amount: number) => {
+  // amountMinor is a hardcoded integer minor-unit amount (5000 = $50.00,
+  // 10000 = $100.00) - never computed via bucket.balance + amount, and
+  // never floating-point dollar arithmetic. The trusted
+  // recordSavingsTransaction Cloud Function is the only thing that
+  // updates ledgerBalanceMinor and the Bucket.balance compatibility
+  // cache; this only records the transaction and lets the existing
+  // subscribeToUserBuckets listener pick up the resulting balance.
+  const quickAdd = async (bucket: Bucket, amountMinor: number) => {
     if (!user) return;
-    // UI already hides quick-add for non-owners; Firestore rules remain
-    // the authoritative check regardless.
-    if (!isBucketOwner(bucket)) return;
+    // Serializes quick-add operations across ALL buckets, checked/set
+    // synchronously before any await so a second tap (on this bucket or
+    // another) cannot start while quickAddPendingRef still belongs to an
+    // unresolved request. See buttons' disabled props below for the
+    // matching visible state (quickAddSubmittingId !== null).
+    if (quickAddInFlightRef.current) return;
+    quickAddInFlightRef.current = true;
 
-    const nextBalance = (Number(bucket.balance) || 0) + amount;
+    const facts = {
+      resourceId: bucket.id,
+      memberUid: user.uid,
+      type: "contribution" as SavingsTransactionType,
+      amountMinor,
+    };
+    const clientRequestId = resolveClientRequestId(quickAddPendingRef, facts);
+
     setQuickAddSubmittingId(bucket.id);
     try {
-      await updateBucketBalance(bucket.id, nextBalance, user.uid);
+      await recordSavingsTransaction({
+        resourceType: "bucket",
+        resourceId: bucket.id,
+        memberUid: user.uid,
+        type: "contribution",
+        amountMinor,
+        currency: bucket.currency ?? "USD",
+        clientRequestId,
+      });
+      // Success clears the pending record - a later quick-add is a new
+      // logical request and must get a new id.
+      quickAddPendingRef.current = null;
     } catch (e) {
       console.error("Failed to quick add:", e);
-      notifyError("Couldn't update balance", permissionAwareErrorMessage(e));
+      // Deliberately NOT cleared here - retrying this exact tap should
+      // reuse the same clientRequestId (see resolveClientRequestId).
+      notifyError("Couldn't record contribution", savingsErrorMessage(e));
     } finally {
       setQuickAddSubmittingId(null);
+      quickAddInFlightRef.current = false;
+    }
+  };
+
+  const openMoneyDialog = (bucket: Bucket, type: SavingsTransactionType) => {
+    setMoneyDialogBucket(bucket);
+    setMoneyDialogType(type);
+    setMoneyDialogAmount("");
+    setMoneyDialogError(null);
+    setMoneyDialogVisible(true);
+  };
+
+  // Used for both a genuine cancel and a successful submit - either way
+  // this dialog session is over, so the retained pending record (if any)
+  // is cleared: a deliberate abandon should not force a later, unrelated
+  // submission to reuse a stale id, and a success has nothing left to
+  // retry.
+  const closeMoneyDialog = () => {
+    setMoneyDialogVisible(false);
+    setMoneyDialogBucket(null);
+    setMoneyDialogAmount("");
+    setMoneyDialogError(null);
+    customPendingRef.current = null;
+  };
+
+  const onSubmitMoneyDialog = async () => {
+    if (!user || !moneyDialogBucket) return;
+
+    const amountMinor = parseDollarsToMinorUnits(moneyDialogAmount);
+    if (amountMinor === null) {
+      setMoneyDialogError(
+        "Enter a valid amount greater than 0, with at most 2 decimal places."
+      );
+      return;
+    }
+
+    const facts = {
+      resourceId: moneyDialogBucket.id,
+      memberUid: user.uid,
+      type: moneyDialogType,
+      amountMinor,
+    };
+    const clientRequestId = resolveClientRequestId(customPendingRef, facts);
+
+    setMoneyDialogSubmitting(true);
+    setMoneyDialogError(null);
+    try {
+      await recordSavingsTransaction({
+        resourceType: "bucket",
+        resourceId: moneyDialogBucket.id,
+        memberUid: user.uid,
+        type: moneyDialogType,
+        amountMinor,
+        currency: moneyDialogBucket.currency ?? "USD",
+        clientRequestId,
+      });
+      closeMoneyDialog();
+    } catch (e) {
+      console.error("Failed to record savings transaction:", e);
+      // Deliberately NOT cleared here - retrying reuses the same
+      // clientRequestId via resolveClientRequestId.
+      setMoneyDialogError(savingsErrorMessage(e));
+    } finally {
+      setMoneyDialogSubmitting(false);
     }
   };
 
@@ -603,30 +790,61 @@ export default function BucketsScreen() {
             </Text>
           </View>
 
-          {isOwner ? (
-            <View style={styles.quickRow}>
-              <Button
-                mode="outlined"
-                onPress={() => quickAdd(item, 50)}
-                style={styles.quickBtn}
-                compact
-                loading={quickAddSubmittingId === item.id}
-                disabled={quickAddSubmittingId === item.id}
-              >
-                + {formatCurrency(50)}
-              </Button>
-              <Button
-                mode="outlined"
-                onPress={() => quickAdd(item, 100)}
-                style={styles.quickBtn}
-                compact
-                loading={quickAddSubmittingId === item.id}
-                disabled={quickAddSubmittingId === item.id}
-              >
-                + {formatCurrency(100)}
-              </Button>
-            </View>
-          ) : null}
+          {/* Every current member of this bucket may record their own
+              contribution/withdrawal - this list is already scoped to
+              buckets the signed-in user is a member of
+              (subscribeToUserBuckets queries memberIds array-contains
+              uid), so no additional owner check is needed here. The
+              trusted recordSavingsTransaction callable is the
+              authoritative permission check regardless.
+
+              Quick-add is serialized across ALL buckets (not just this
+              one): disabled is keyed off quickAddSubmittingId !== null so
+              a second bucket's quick-add cannot start - and race - while
+              another bucket's request is still in flight (see quickAdd's
+              quickAddInFlightRef). loading stays scoped to the bucket
+              actually submitting. */}
+          <View style={styles.quickRow}>
+            <Button
+              mode="outlined"
+              onPress={() => quickAdd(item, 5000)}
+              style={styles.quickBtn}
+              compact
+              loading={quickAddSubmittingId === item.id}
+              disabled={quickAddSubmittingId !== null}
+            >
+              + {formatCurrency(50)}
+            </Button>
+            <Button
+              mode="outlined"
+              onPress={() => quickAdd(item, 10000)}
+              style={styles.quickBtn}
+              compact
+              loading={quickAddSubmittingId === item.id}
+              disabled={quickAddSubmittingId !== null}
+            >
+              + {formatCurrency(100)}
+            </Button>
+          </View>
+
+          <View style={styles.moneyActionsRow}>
+            <Button
+              mode="text"
+              compact
+              onPress={() => openMoneyDialog(item, "contribution")}
+              disabled={quickAddSubmittingId !== null}
+            >
+              Custom Amount
+            </Button>
+            <Button
+              mode="text"
+              compact
+              onPress={() => openMoneyDialog(item, "withdrawal")}
+              disabled={quickAddSubmittingId !== null}
+            >
+              Withdraw
+            </Button>
+          </View>
         </Card.Content>
       </Card>
     );
@@ -854,18 +1072,17 @@ export default function BucketsScreen() {
               disabled={!editingIsOwner}
               style={{ marginBottom: 12 }}
             />
-            <TextInput
-              label="Balance"
-              value={editing?.balance?.toString() ?? ""}
-              onChangeText={(v) => setEditing((p) => (p ? { ...p, balance: Number(v) || 0 } : p))}
-              keyboardType="numeric"
-              disabled={!editingIsOwner}
-              style={{ marginBottom: 16 }}
-            />
+            <Text style={{ marginBottom: 4, opacity: 0.7 }}>Current Balance</Text>
+            <Text style={{ marginBottom: 4, fontSize: 16, fontWeight: "800" }}>
+              {formatCurrency(editing?.balance ?? 0)}
+            </Text>
+            <Text style={{ marginBottom: 16, opacity: 0.6, fontSize: 12 }}>
+              Use Contribute or Withdraw to change savings.
+            </Text>
 
             {!editingIsOwner ? (
               <Text style={{ marginBottom: 12, opacity: 0.7, fontSize: 12 }}>
-                Only the bucket owner can change the target and balance.
+                Only the bucket owner can change the target.
               </Text>
             ) : null}
 
@@ -892,6 +1109,72 @@ export default function BucketsScreen() {
             <Button onPress={closeEdit}>Cancel</Button>
             <Button mode="contained" onPress={onSaveEdit} loading={submitting}>
               Save
+            </Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
+
+      {/* Contribute / Withdraw Dialog */}
+      <Portal>
+        <Dialog visible={moneyDialogVisible} onDismiss={closeMoneyDialog}>
+          <Dialog.Title>
+            {moneyDialogType === "contribution" ? "Add Money" : "Withdraw Money"}
+          </Dialog.Title>
+          <Dialog.Content>
+            <Text style={{ marginBottom: 12, opacity: 0.7 }}>
+              Bucket:{" "}
+              <Text style={{ fontWeight: "800" }}>
+                {moneyDialogBucket?.name || "Untitled"}
+              </Text>
+            </Text>
+
+            <View style={styles.typeToggleRow}>
+              <Chip
+                selected={moneyDialogType === "contribution"}
+                onPress={() => {
+                  setMoneyDialogType("contribution");
+                  if (moneyDialogError) setMoneyDialogError(null);
+                }}
+              >
+                Contribution
+              </Chip>
+              <Chip
+                selected={moneyDialogType === "withdrawal"}
+                onPress={() => {
+                  setMoneyDialogType("withdrawal");
+                  if (moneyDialogError) setMoneyDialogError(null);
+                }}
+              >
+                Withdrawal
+              </Chip>
+            </View>
+
+            <TextInput
+              label="Amount"
+              value={moneyDialogAmount}
+              onChangeText={(v) => {
+                setMoneyDialogAmount(v);
+                if (moneyDialogError) setMoneyDialogError(null);
+              }}
+              keyboardType="numeric"
+              style={{ marginTop: 12, marginBottom: 8 }}
+            />
+
+            {moneyDialogError ? (
+              <Text style={{ color: "#B91C1C", marginBottom: 8 }}>{moneyDialogError}</Text>
+            ) : null}
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={closeMoneyDialog} disabled={moneyDialogSubmitting}>
+              Cancel
+            </Button>
+            <Button
+              mode="contained"
+              onPress={onSubmitMoneyDialog}
+              loading={moneyDialogSubmitting}
+              disabled={moneyDialogSubmitting}
+            >
+              {moneyDialogType === "contribution" ? "Add" : "Withdraw"}
             </Button>
           </Dialog.Actions>
         </Dialog>
@@ -1019,6 +1302,12 @@ const styles = StyleSheet.create({
 
   quickRow: { flexDirection: "row", gap: 10 },
   quickBtn: { flex: 1, borderRadius: 12 },
+  moneyActionsRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginTop: 4,
+  },
+  typeToggleRow: { flexDirection: "row", gap: 8 },
 
   emptyContainer: { flexGrow: 1, justifyContent: "center" },
 

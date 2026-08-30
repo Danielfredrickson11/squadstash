@@ -19,6 +19,7 @@
 import { httpsCallable } from "firebase/functions";
 import {
   collection,
+  doc,
   getDocs,
   onSnapshot,
   orderBy,
@@ -132,8 +133,24 @@ export function subscribeToSavingsTransactionsForResource(
 }
 
 // ---------------------------------------
-// WRITE PATH (Milestone 2B Checkpoint 4C)
+// WRITE PATH (Milestone 2B Checkpoint 4C/4D)
 // ---------------------------------------
+
+// Generates a clientRequestId locally, with no network call and no
+// document actually created - it only reads the id off a Firestore
+// DocumentReference built by the client SDK's own auto-id generator,
+// the same mechanism every addDoc() call in this app already relies on
+// internally. Its alphabet (A-Za-z0-9) is a strict subset of the
+// backend's accepted clientRequestId characters
+// (CLIENT_REQUEST_ID_PATTERN in recordSavingsTransaction.ts) and its
+// length is well under the 128-character limit, so no extra validation
+// is needed. Deliberately not crypto.randomUUID(): that is not
+// guaranteed available on every current Expo/React Native target, and no
+// new dependency (e.g. expo-crypto, react-native-get-random-values) may
+// be added solely for this.
+export function generateSavingsClientRequestId(): string {
+  return doc(collection(db, "savingsTransactions")).id;
+}
 
 // Deliberately narrower than CreateSavingsTransactionInput: recordedBy,
 // createdAt and reversalOf are trusted/backend-managed values the
