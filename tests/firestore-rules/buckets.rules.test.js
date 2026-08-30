@@ -2,6 +2,7 @@
 // run against the local Firestore emulator using the real firestore.rules
 // file (never weakened to make a test pass - see helpers/buckets.js).
 const { assertFails, assertSucceeds } = require('@firebase/rules-unit-testing');
+const { deleteField } = require('firebase/firestore');
 const { createTestEnv } = require('./helpers/testEnv');
 const {
   OWNER_UID,
@@ -139,6 +140,15 @@ describe('firestore.rules: buckets - create', () => {
       )
     );
   });
+
+  // Milestone 2B Checkpoint 4E: create is intentionally NOT locked down
+  // in this checkpoint - a nonzero Starting Balance must keep working
+  // exactly as before, distinct from the update-path lockdown below.
+  it('create: a nonzero Starting Balance still succeeds (4E does not change create)', async () => {
+    await assertSucceeds(
+      bucketDoc(asOwner(), 'new-bucket').set(validBucketData({ balance: 500 }))
+    );
+  });
 });
 
 describe('firestore.rules: buckets - owner updates', () => {
@@ -154,8 +164,73 @@ describe('firestore.rules: buckets - owner updates', () => {
     await assertSucceeds(bucketDoc(asOwner(), BUCKET_ID).update({ target: 250 }));
   });
 
-  it('owner: can update balance', async () => {
-    await assertSucceeds(bucketDoc(asOwner(), BUCKET_ID).update({ balance: 50 }));
+  // Milestone 2B Checkpoint 4E: existing-Bucket balance is now
+  // backend-managed only (see recordSavingsTransaction) - the owner can
+  // no longer mutate it via a direct client update.
+  it('owner: cannot directly change balance', async () => {
+    await assertFails(bucketDoc(asOwner(), BUCKET_ID).update({ balance: 50 }));
+  });
+
+  it('owner: cannot delete balance', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ balance: deleteField() })
+    );
+  });
+
+  it('owner: cannot add ledgerBalanceMinor when absent', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerBalanceMinor: 5000 })
+    );
+  });
+
+  it('owner: cannot change ledgerBalanceMinor when already present', async () => {
+    await seedBucket(
+      testEnv,
+      BUCKET_ID,
+      validBucketData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerBalanceMinor: 9999 })
+    );
+  });
+
+  it('owner: cannot delete ledgerBalanceMinor when present', async () => {
+    await seedBucket(
+      testEnv,
+      BUCKET_ID,
+      validBucketData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerBalanceMinor: deleteField() })
+    );
+  });
+
+  it('owner: cannot add ledgerOpeningBalanceMinor when absent', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerOpeningBalanceMinor: 5000 })
+    );
+  });
+
+  it('owner: cannot change ledgerOpeningBalanceMinor when already present', async () => {
+    await seedBucket(
+      testEnv,
+      BUCKET_ID,
+      validBucketData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerOpeningBalanceMinor: 9999 })
+    );
+  });
+
+  it('owner: cannot delete ledgerOpeningBalanceMinor when present', async () => {
+    await seedBucket(
+      testEnv,
+      BUCKET_ID,
+      validBucketData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerOpeningBalanceMinor: deleteField() })
+    );
   });
 
   it('owner: can update color', async () => {
@@ -222,6 +297,18 @@ describe('firestore.rules: buckets - non-owner member updates', () => {
 
   it('member: cannot change balance', async () => {
     await assertFails(bucketDoc(asMember(), BUCKET_ID).update({ balance: 999 }));
+  });
+
+  it('member: cannot add/change ledgerBalanceMinor', async () => {
+    await assertFails(
+      bucketDoc(asMember(), BUCKET_ID).update({ ledgerBalanceMinor: 5000 })
+    );
+  });
+
+  it('member: cannot add/change ledgerOpeningBalanceMinor', async () => {
+    await assertFails(
+      bucketDoc(asMember(), BUCKET_ID).update({ ledgerOpeningBalanceMinor: 5000 })
+    );
   });
 
   it('member: cannot change ownerId', async () => {
