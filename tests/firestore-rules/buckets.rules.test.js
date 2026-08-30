@@ -2,7 +2,7 @@
 // run against the local Firestore emulator using the real firestore.rules
 // file (never weakened to make a test pass - see helpers/buckets.js).
 const { assertFails, assertSucceeds } = require('@firebase/rules-unit-testing');
-const { deleteField } = require('firebase/firestore');
+const { deleteField, serverTimestamp } = require('firebase/firestore');
 const { createTestEnv } = require('./helpers/testEnv');
 const {
   OWNER_UID,
@@ -141,12 +141,71 @@ describe('firestore.rules: buckets - create', () => {
     );
   });
 
-  // Milestone 2B Checkpoint 4E: create is intentionally NOT locked down
-  // in this checkpoint - a nonzero Starting Balance must keep working
-  // exactly as before, distinct from the update-path lockdown below.
-  it('create: a nonzero Starting Balance still succeeds (4E does not change create)', async () => {
+  // Milestone 2B Checkpoint 4F narrows create's arbitrary-field exposure
+  // (see the new tests below) but deliberately does NOT change Starting
+  // Balance semantics - a nonzero Starting Balance must keep working
+  // exactly as before.
+  it('create: a nonzero Starting Balance still succeeds', async () => {
     await assertSucceeds(
       bucketDoc(asOwner(), 'new-bucket').set(validBucketData({ balance: 500 }))
+    );
+  });
+
+  it('create: a zero Starting Balance still succeeds', async () => {
+    await assertSucceeds(
+      bucketDoc(asOwner(), 'new-bucket').set(validBucketData({ balance: 0 }))
+    );
+  });
+
+  it('create: a negative Starting Balance is rejected', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), 'new-bucket').set(validBucketData({ balance: -50 }))
+    );
+  });
+
+  // Milestone 2B Checkpoint 4F: proves the new keys().hasOnly(...)
+  // allowlist does not accidentally block the REAL document shape the
+  // createBucket service actually writes (see src/services/firebase/
+  // buckets.ts) - the existing validBucketData() fixture only covers a
+  // 6-field subset, which is why this test extends it locally rather
+  // than changing the shared helper for every other test in this file.
+  it('create: the real nine-field createBucket service shape succeeds', async () => {
+    await assertSucceeds(
+      bucketDoc(asOwner(), 'new-bucket').set({
+        ...validBucketData(),
+        createdAt: serverTimestamp(),
+        lastUpdatedAt: serverTimestamp(),
+        lastUpdatedBy: OWNER_UID,
+      })
+    );
+  });
+
+  it('create: an arbitrary extra field is rejected', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), 'new-bucket').set(
+        validBucketData({ notes: 'hi' })
+      )
+    );
+  });
+
+  // Milestone 2B Checkpoint 4F: the whole point of this checkpoint - a
+  // client must never be able to inject either trusted ledger field, not
+  // even at create time. The eventual canonical initialization of these
+  // fields belongs solely to a future trusted create callable (Admin
+  // SDK), never to a direct client write.
+  it('create: ledgerBalanceMinor cannot be injected', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), 'new-bucket').set(
+        validBucketData({ ledgerBalanceMinor: 999999 })
+      )
+    );
+  });
+
+  it('create: ledgerOpeningBalanceMinor cannot be injected', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), 'new-bucket').set(
+        validBucketData({ ledgerOpeningBalanceMinor: 999999 })
+      )
     );
   });
 });

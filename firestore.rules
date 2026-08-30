@@ -22,13 +22,32 @@ service cloud.firestore {
     match /buckets/{bucketId} {
       allow list, get: if isBucketMember() || isBucketOwner();
 
+      // Milestone 2B Checkpoint 4F: closes the arbitrary-field create gap
+      // as a narrow security bridge ahead of a trusted create callable
+      // (a later checkpoint). keys().hasOnly(...) permits exactly the
+      // fields the current createBucket service legitimately writes -
+      // critically, ledgerOpeningBalanceMinor and ledgerBalanceMinor are
+      // NOT in this list, so a client can never inject them at create
+      // time either, matching their update-time lockdown (Checkpoint
+      // 4E). balance remains the legacy Starting Balance dollar amount;
+      // it does not initialize the ledger fields here - the existing
+      // recordSavingsTransaction legacy-initialization path continues to
+      // convert it into a neutral opening balance on the Bucket's first
+      // trusted transaction. currency/bucketType/linkedTripId/
+      // targetDate/imageUrl/archivedAt are deliberately excluded too -
+      // none are written by any current legitimate path.
       allow create: if signedIn()
         && request.resource.data.ownerId == request.auth.uid
         && request.resource.data.memberIds is list
         && request.auth.uid in request.resource.data.memberIds
         && request.resource.data.name is string
         && request.resource.data.target is number
-        && request.resource.data.balance is number;
+        && request.resource.data.balance is number
+        && request.resource.data.balance >= 0
+        && request.resource.data.keys().hasOnly([
+          'ownerId', 'memberIds', 'name', 'target', 'balance', 'color',
+          'createdAt', 'lastUpdatedAt', 'lastUpdatedBy'
+        ]);
 
       // SEC-001 fix: field-level allowlists for update, for both owner and
       // non-owner members. ownerId, memberIds and target remain
