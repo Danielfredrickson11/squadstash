@@ -81,8 +81,12 @@ describe('firestore.rules: buckets - authentication and reads', () => {
 });
 
 describe('firestore.rules: buckets - create', () => {
-  it('authenticated user: can create a valid bucket (ownerId = uid, ownerId in memberIds, valid types)', async () => {
-    await assertSucceeds(
+  // Milestone 2B Checkpoint 4G-3: direct client Bucket creation is now
+  // permanently closed - the trusted createBucket Cloud Function is the
+  // sole creation path. Even an otherwise-perfectly-valid payload
+  // (ownerId = uid, ownerId in memberIds, valid types) is denied.
+  it('authenticated user: cannot directly create a bucket', async () => {
+    await assertFails(
       bucketDoc(asOwner(), 'new-bucket').set(validBucketData())
     );
   });
@@ -141,18 +145,19 @@ describe('firestore.rules: buckets - create', () => {
     );
   });
 
-  // Milestone 2B Checkpoint 4F narrows create's arbitrary-field exposure
-  // (see the new tests below) but deliberately does NOT change Starting
-  // Balance semantics - a nonzero Starting Balance must keep working
-  // exactly as before.
-  it('create: a nonzero Starting Balance still succeeds', async () => {
-    await assertSucceeds(
+  // Milestone 2B Checkpoint 4G-3: Starting Balance is no longer a direct
+  // client create input at all - it must go through the trusted
+  // createBucket callable as startingBalanceMinor, which atomically
+  // initializes balance/ledgerOpeningBalanceMinor/ledgerBalanceMinor
+  // together.
+  it('create: nonzero Starting Balance direct create is denied', async () => {
+    await assertFails(
       bucketDoc(asOwner(), 'new-bucket').set(validBucketData({ balance: 500 }))
     );
   });
 
-  it('create: a zero Starting Balance still succeeds', async () => {
-    await assertSucceeds(
+  it('create: zero Starting Balance direct create is denied', async () => {
+    await assertFails(
       bucketDoc(asOwner(), 'new-bucket').set(validBucketData({ balance: 0 }))
     );
   });
@@ -163,14 +168,13 @@ describe('firestore.rules: buckets - create', () => {
     );
   });
 
-  // Milestone 2B Checkpoint 4F: proves the new keys().hasOnly(...)
-  // allowlist does not accidentally block the REAL document shape the
-  // createBucket service actually writes (see src/services/firebase/
-  // buckets.ts) - the existing validBucketData() fixture only covers a
-  // 6-field subset, which is why this test extends it locally rather
-  // than changing the shared helper for every other test in this file.
-  it('create: the real nine-field createBucket service shape succeeds', async () => {
-    await assertSucceeds(
+  // Milestone 2B Checkpoint 4G-3: this was the exact nine-field shape the
+  // OLD direct-write createBucket service used to send (see git history
+  // of src/services/firebase/buckets.ts) - now that service invokes the
+  // trusted callable instead, and this shape is denied unconditionally
+  // regardless of how faithfully it reconstructs the former write.
+  it('create: former nine-field client service shape is denied', async () => {
+    await assertFails(
       bucketDoc(asOwner(), 'new-bucket').set({
         ...validBucketData(),
         createdAt: serverTimestamp(),
