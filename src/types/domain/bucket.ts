@@ -77,10 +77,17 @@ export type Bucket = {
   ledgerBalanceMinor?: number;
 };
 
+// Input for the trusted createBucket Cloud Function (Milestone 2B
+// Checkpoint 4G-2). ownerId/memberIds/balance/ledger fields/currency/
+// bucketType are all backend-derived - none may be sent from here, and
+// none appear in this type (see functions/src/callables/createBucket.ts).
+// startingBalanceMinor is integer minor units, not dollars, matching
+// RecordSavingsTransactionInput's amountMinor convention - deliberately
+// distinct from `target`, which stays dollar-number for this checkpoint.
 export type CreateBucketInput = {
   name: string;
   target: number;
-  balance: number;
+  startingBalanceMinor: number;
   color: string | null;
-  ownerId: string;
+  clientRequestId: string;
 };

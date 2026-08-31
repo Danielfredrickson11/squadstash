@@ -84,4 +84,34 @@ describe('parseDollarsToMinorUnits', () => {
   it('rejects an amount whose minor-unit result exceeds Number.MAX_SAFE_INTEGER', () => {
     expect(parseDollarsToMinorUnits('100000000000000000')).toBeNull();
   });
+
+  describe('with allowZero: true (Starting Balance)', () => {
+    it('accepts "0" as 0', () => {
+      expect(parseDollarsToMinorUnits('0', { allowZero: true })).toBe(0);
+    });
+
+    it('accepts "0.00" as 0', () => {
+      expect(parseDollarsToMinorUnits('0.00', { allowZero: true })).toBe(0);
+    });
+
+    it('still parses a whole dollar amount', () => {
+      expect(parseDollarsToMinorUnits('12', { allowZero: true })).toBe(1200);
+    });
+
+    it('still parses one decimal place', () => {
+      expect(parseDollarsToMinorUnits('12.3', { allowZero: true })).toBe(1230);
+    });
+
+    it('still parses two decimal places', () => {
+      expect(parseDollarsToMinorUnits('12.34', { allowZero: true })).toBe(1234);
+    });
+
+    it('still rejects a negative amount', () => {
+      expect(parseDollarsToMinorUnits('-1', { allowZero: true })).toBeNull();
+    });
+
+    it('still rejects more than two decimal places', () => {
+      expect(parseDollarsToMinorUnits('12.345', { allowZero: true })).toBeNull();
+    });
+  });
 });

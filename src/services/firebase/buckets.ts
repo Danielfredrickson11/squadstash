@@ -17,12 +17,17 @@
 // updateBucketBalance was removed (Milestone 2B Checkpoint 4D), and
 // updateBucket()'s input type (Checkpoint 4D hardening) cannot accept
 // balance/ledgerBalanceMinor/ledgerOpeningBalanceMinor or any other
-// financial cache field - see UpdateBucketInput below. createBucket's
-// legacy Starting Balance behavior is the one deliberate exception: it is
-// temporarily unchanged and intentionally deferred to the upcoming
-// starting-balance checkpoint, not an oversight.
+// financial cache field - see UpdateBucketInput below.
+//
+// createBucket (Milestone 2B Checkpoint 4G-2) no longer writes directly
+// to Firestore either: it invokes the trusted createBucket Cloud
+// Function (see functions/src/callables/createBucket.ts), which derives
+// ownerId/memberIds and backend-manages balance/ledgerOpeningBalanceMinor/
+// ledgerBalanceMinor/currency/bucketType - none of those are client
+// inputs any more. Firestore rules still permit a hardened legacy direct
+// create (Checkpoint 4F) temporarily, but no app code exercises that path
+// after this checkpoint; closing it is a separate future checkpoint.
 import {
-  addDoc,
   arrayRemove,
   arrayUnion,
   collection,
@@ -36,7 +41,8 @@ import {
   where,
 } from "firebase/firestore";
 import type { DocumentData, Unsubscribe } from "firebase/firestore";
-import { db } from "../../../firebase";
+import { httpsCallable } from "firebase/functions";
+import { db, functions } from "../../../firebase";
 import type { Bucket, CreateBucketInput } from "../../types/domain";
 
 export function subscribeToUserBuckets(
@@ -73,22 +79,80 @@ export function subscribeToUserBuckets(
   );
 }
 
-export async function createBucket(input: CreateBucketInput): Promise<string> {
-  const { name, target, balance, color, ownerId } = input;
+// Generates a clientRequestId locally, with no network call and no
+// document actually created - reads the id off a Firestore
+// DocumentReference built by the client SDK's own auto-id generator, the
+// same mechanism generateSavingsClientRequestId (savingsTransactions.ts)
+// already relies on for the identical reason. Kept as its own small,
+// domain-file-owned helper rather than a shared cross-domain utility,
+// matching that existing precedent for a one-line body.
+export function generateBucketClientRequestId(): string {
+  return doc(collection(db, "buckets")).id;
+}
 
-  const ref = await addDoc(collection(db, "buckets"), {
-    name,
-    target,
-    balance,
-    color,
-    createdAt: serverTimestamp(),
-    ownerId,
-    memberIds: [ownerId],
-    lastUpdatedAt: serverTimestamp(),
-    lastUpdatedBy: ownerId,
-  });
+export type CreateBucketResult = {
+  bucketId: string;
+  ledgerBalanceMinor: number;
+};
 
-  return ref.id;
+// Validates the callable's response field-by-field rather than trusting
+// a whole-object cast, matching parseRecordSavingsTransactionResponse's
+// convention exactly - a malformed/unexpected shape must fail visibly.
+function parseCreateBucketResponse(
+  data: unknown,
+  clientRequestId: string
+): CreateBucketResult {
+  if (typeof data !== "object" || data === null) {
+    throw new Error(
+      "createBucket: invalid response (expected an object)."
+    );
+  }
+
+  const { bucketId, ledgerBalanceMinor } = data as Record<string, unknown>;
+
+  if (typeof bucketId !== "string" || bucketId.length === 0) {
+    throw new Error(
+      "createBucket: invalid response (bucketId must be a non-empty string)."
+    );
+  }
+  // The trusted backend deterministically uses clientRequestId as the
+  // Bucket document id - a mismatch here means the response cannot be
+  // trusted to describe the Bucket this call actually asked for, and
+  // must never be silently accepted.
+  if (bucketId !== clientRequestId) {
+    throw new Error(
+      "createBucket: invalid response (bucketId did not match the request's clientRequestId)."
+    );
+  }
+  if (
+    typeof ledgerBalanceMinor !== "number" ||
+    !Number.isSafeInteger(ledgerBalanceMinor) ||
+    ledgerBalanceMinor < 0
+  ) {
+    throw new Error(
+      "createBucket: invalid response (ledgerBalanceMinor must be a non-negative safe integer)."
+    );
+  }
+
+  return { bucketId, ledgerBalanceMinor };
+}
+
+// Invokes the trusted createBucket Cloud Function via httpsCallable - no
+// direct Firestore write occurs here. Firestore rules still permit a
+// hardened legacy direct create (Checkpoint 4F) temporarily, but this
+// function no longer uses it. Callable errors (HttpsError/FirebaseError)
+// are not caught or wrapped - they propagate to the caller unchanged,
+// matching lookupUserByEmail/recordSavingsTransaction's existing
+// convention.
+export async function createBucket(
+  input: CreateBucketInput
+): Promise<CreateBucketResult> {
+  const callable = httpsCallable<CreateBucketInput, unknown>(
+    functions,
+    "createBucket"
+  );
+  const res = await callable(input);
+  return parseCreateBucketResponse(res.data, input.clientRequestId);
 }
 
 // The only fields the current updateBucket() caller (buckets.tsx's

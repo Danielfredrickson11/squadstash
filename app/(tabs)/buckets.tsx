@@ -28,6 +28,7 @@ import {
   addBucketMember,
   createBucket,
   deleteBucket,
+  generateBucketClientRequestId,
   removeBucketMember,
   subscribeToUserBuckets,
   updateBucket,
@@ -75,6 +76,12 @@ function isValidInviteEmail(email: string) {
 
 function isPermissionDeniedError(e: unknown): boolean {
   return (e as { code?: string } | null | undefined)?.code === "permission-denied";
+}
+
+// Extracts a Firebase callable error's "functions/<code>" string, if
+// present, without repeating the unsafe cast at every call site.
+function firebaseErrorCode(e: unknown): string | undefined {
+  return (e as { code?: string } | null | undefined)?.code;
 }
 
 // Never surfaces raw Firebase error details to the user - only a coarse
@@ -139,6 +146,69 @@ function resolveClientRequestId(
   }
 
   const clientRequestId = generateSavingsClientRequestId();
+  pendingRef.current = { ...facts, clientRequestId };
+  return clientRequestId;
+}
+
+// Never surfaces raw HttpsError/FirebaseError technical text - maps the
+// httpsCallable client SDK's "functions/<code>" error codes (see
+// functions/src/callables/createBucket.ts for the exact codes this
+// callable can throw) to plain user-facing copy.
+function createBucketErrorMessage(e: unknown): string {
+  const code = firebaseErrorCode(e);
+  switch (code) {
+    case "functions/unauthenticated":
+      return "You must be signed in to create a bucket.";
+    case "functions/invalid-argument":
+      return "Check the name, target, and starting balance, then try again.";
+    case "functions/already-exists":
+      return "That request could not be completed. Please try again.";
+    case "functions/failed-precondition":
+      return "We couldn't create that bucket right now. Please try again.";
+    case "functions/unavailable":
+    case "functions/deadline-exceeded":
+      return "We couldn't reach the server, so we can't confirm this went through - it's safe to try again.";
+    default:
+      return "We couldn't create that bucket. Please try again.";
+  }
+}
+
+// One in-flight/retryable Bucket creation request, keyed by the exact
+// facts the trusted backend's creationRequest marker stores (not just
+// clientRequestId, for the same reason PendingSavingsRequest isn't keyed
+// on id alone - see resolveClientRequestId). name MUST be the already-
+// trimmed value: the backend stores/compares the trimmed name, so " Fund "
+// and "Fund" must resolve to the same pending logical request.
+type PendingCreateBucketRequest = {
+  clientRequestId: string;
+  name: string;
+  target: number;
+  startingBalanceMinor: number;
+  color: string | null;
+};
+
+// Returns the clientRequestId to use for this create submission: reuses
+// the previous attempt's id if the retained pending request has the
+// exact same normalized facts (a retry of a failed submit), otherwise
+// generates a fresh id and replaces the pending record (a genuinely new
+// submission - e.g. the user edited the form after a failure). Mirrors
+// resolveClientRequestId's exact shape/contract for savings requests.
+function resolveCreateBucketClientRequestId(
+  pendingRef: React.MutableRefObject<PendingCreateBucketRequest | null>,
+  facts: Omit<PendingCreateBucketRequest, "clientRequestId">
+): string {
+  const pending = pendingRef.current;
+  if (
+    pending &&
+    pending.name === facts.name &&
+    pending.target === facts.target &&
+    pending.startingBalanceMinor === facts.startingBalanceMinor &&
+    pending.color === facts.color
+  ) {
+    return pending.clientRequestId;
+  }
+
+  const clientRequestId = generateBucketClientRequestId();
   pendingRef.current = { ...facts, clientRequestId };
   return clientRequestId;
 }
@@ -218,6 +288,21 @@ export default function BucketsScreen() {
   const [balance, setBalance] = useState("");
   const [color, setColor] = useState<string | null>(COLORS[0]);
   const [submitting, setSubmitting] = useState(false);
+  // Retains the clientRequestId (plus the normalized creation facts it
+  // was generated for) so a retry of the exact same submit reuses the
+  // same idempotency key instead of creating a second logical Bucket.
+  // Retained across a failed/ambiguous outcome and while a request is
+  // still in flight (see createInFlightRef) - cleared only after a
+  // validated successful response, or when the user explicitly abandons
+  // the attempt via cancelCreate AFTER no request is in flight (see
+  // cancelCreate/closeCreate below).
+  const createPendingRef = useRef<PendingCreateBucketRequest | null>(null);
+  // Synchronous serialization guard mirroring quickAddInFlightRef: the
+  // submitting state alone can't prevent a second tap from racing past
+  // it before React re-renders. Checked/set synchronously before any
+  // await; submitting remains solely responsible for the visible
+  // loading/disabled UI.
+  const createInFlightRef = useRef(false);
 
   // Identifies which bucket's quick-add is visibly loading (its button
   // shows the spinner) and always resets to null on success/failure.
@@ -345,36 +430,122 @@ export default function BucketsScreen() {
 
   // Create dialog helpers
   const openCreate = () => setCreateVisible(true);
+  // The unconditional internal reset - always clears the form AND the
+  // pending request ref, with no guard of its own. onAddBucket's success
+  // path calls this directly while createInFlightRef.current is still
+  // true (it only flips back to false in onAddBucket's outer finally,
+  // which runs after this), so closeCreate must never itself refuse to
+  // run while a request is in flight - that would block normal
+  // successful creation from closing/resetting the dialog. User-
+  // initiated cancellation goes through cancelCreate (below) instead,
+  // which is what actually decides whether abandoning is currently safe.
   const closeCreate = () => {
     setCreateVisible(false);
     setName("");
     setTarget("");
     setBalance("");
     setColor(COLORS[0]);
+    createPendingRef.current = null;
+  };
+
+  // The user-facing cancel/dismiss path - Cancel button, backdrop tap,
+  // hardware back, or any other Dialog dismissal. Ignored outright while
+  // a create request is still unresolved (createInFlightRef.current):
+  // the server may have already succeeded, so clearing the pending
+  // request id here would let a later resubmission generate a fresh id
+  // and create a duplicate Bucket, defeating the whole point of the
+  // idempotency key. Once no request is in flight (idle, or a failed/
+  // ambiguous attempt has already returned), cancelling is a genuine,
+  // explicit abandonment of that logical attempt, so it's safe to reset
+  // via closeCreate. Checked via the synchronous ref, not submitting
+  // state, so the small interval before a re-render lands is still safe.
+  const cancelCreate = () => {
+    if (createInFlightRef.current) return;
+    closeCreate();
   };
 
   const onAddBucket = async () => {
     if (!user) return;
+    // Serializes create submissions, checked/set synchronously before any
+    // await so a double tap cannot start a second competing call - see
+    // createInFlightRef's declaration.
+    if (createInFlightRef.current) return;
+    createInFlightRef.current = true;
 
-    const t = Number(target);
-    const b = balance ? Number(balance) : 0;
-    if (!Number.isFinite(t) || t <= 0) return;
-    if (!Number.isFinite(b) || b < 0) return;
-
-    setSubmitting(true);
     try {
-      await createBucket({
-        name: name.trim(),
+      // name MUST be trimmed here, not just for display: the trusted
+      // backend stores/compares the trimmed value, so this exact
+      // normalized string is what resolveCreateBucketClientRequestId's
+      // fact-comparison (and, on the server, creationRequest replay
+      // matching) must use too.
+      const normalizedName = name.trim();
+      const t = Number(target);
+      // Deterministic integer-minor-unit parsing, not Number(balanceText)
+      // - an empty field preserves today's "blank means zero" convenience
+      // by resolving to "0" before parsing, and allowZero:true lets an
+      // explicit $0 Starting Balance through (unlike contribution/
+      // withdrawal parsing elsewhere in this file, which must keep
+      // rejecting zero).
+      const startingBalanceMinor = parseDollarsToMinorUnits(
+        balance.trim() === "" ? "0" : balance,
+        { allowZero: true }
+      );
+
+      if (
+        normalizedName.length === 0 ||
+        !Number.isFinite(t) ||
+        t <= 0 ||
+        startingBalanceMinor === null
+      ) {
+        return;
+      }
+
+      const facts = {
+        name: normalizedName,
         target: t,
-        balance: b,
+        startingBalanceMinor,
         color: color ?? null,
-        ownerId: user.uid,
-      });
-      closeCreate();
-    } catch (e) {
-      console.error("Failed to add bucket:", e);
+      };
+      const clientRequestId = resolveCreateBucketClientRequestId(
+        createPendingRef,
+        facts
+      );
+
+      setSubmitting(true);
+      try {
+        await createBucket({ ...facts, clientRequestId });
+        // closeCreate() clears createPendingRef as part of its reset - a
+        // later create is a new logical request and must get a new id.
+        closeCreate();
+      } catch (e) {
+        console.error("Failed to add bucket:", e);
+        // already-exists is the one outcome that is NOT ambiguous: the
+        // backend has definitively told us this clientRequestId already
+        // identifies a conflicting request (different facts, or a
+        // legacy/direct-created document at that id - see
+        // createBucketCore's replay check), so retrying with the SAME id
+        // can only ever fail the same way again. Clearing the pending
+        // record here (without closing/resetting the form) means the
+        // next Save press generates a fresh id and retries the same
+        // facts as a genuinely new request.
+        //
+        // Every other failure (unavailable, deadline-exceeded, a locally
+        // malformed response, or any other/unknown error) is deliberately
+        // left retaining the pending id - the server may have actually
+        // completed the create, so retrying this exact submit must reuse
+        // the same clientRequestId (see resolveCreateBucketClientRequestId).
+        // If the user instead edits the form, the next submit's facts
+        // naturally won't match this pending record and a fresh id is
+        // generated automatically regardless of which branch ran here.
+        if (firebaseErrorCode(e) === "functions/already-exists") {
+          createPendingRef.current = null;
+        }
+        notifyError("Couldn't create bucket", createBucketErrorMessage(e));
+      } finally {
+        setSubmitting(false);
+      }
     } finally {
-      setSubmitting(false);
+      createInFlightRef.current = false;
     }
   };
 
@@ -1001,7 +1172,7 @@ export default function BucketsScreen() {
 
       {/* Create Dialog */}
       <Portal>
-        <Dialog visible={createVisible} onDismiss={closeCreate}>
+        <Dialog visible={createVisible} onDismiss={cancelCreate}>
           <Dialog.Title>New Bucket</Dialog.Title>
           <Dialog.Content>
             <TextInput
@@ -1045,7 +1216,7 @@ export default function BucketsScreen() {
             </View>
           </Dialog.Content>
           <Dialog.Actions>
-            <Button onPress={closeCreate}>Cancel</Button>
+            <Button onPress={cancelCreate} disabled={submitting}>Cancel</Button>
             <Button mode="contained" onPress={onAddBucket} disabled={!canCreate} loading={submitting}>
               Save
             </Button>
