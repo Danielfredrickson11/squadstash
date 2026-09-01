@@ -98,12 +98,21 @@ service cloud.firestore {
         );
 
       // SEC-001 fix: field-level allowlists for update, for both owner and
-      // non-owner members. ownerId, memberIds, target and saved remain
-      // owner-controlled only. These fields remain prototype/planning
-      // numbers, NOT real-money balances - no ledger exists yet (see
-      // Milestone 1 audit, SEC-001).
-      // Note: no current screen calls update() on trips; this is
-      // defense-in-depth hardening with no observed UI impact.
+      // non-owner members. ownerId, memberIds and target remain
+      // owner-controlled only.
+      //
+      // Milestone 2B Checkpoint 4H: saved, ledgerBalanceMinor, and
+      // ledgerOpeningBalanceMinor are existing-Trip financial state,
+      // backend-managed only - mirrors the Bucket balance lockdown
+      // (Checkpoint 4E) exactly. None of the three appears in either
+      // allowlist below, so affectedKeys().hasOnly(...) rejects any
+      // client attempt to add, change, or delete them (uniformly, since a
+      // deleted field is also an affected key). The trusted
+      // recordSavingsTransaction Cloud Function (Admin SDK, which
+      // bypasses these rules) is the only path that updates them. Trip
+      // creation is unaffected - saved's create-time exposure is a
+      // separate, deliberately deferred gap (see the "allow create"
+      // clause above), tracked for a dedicated follow-up checkpoint.
       allow update: if (isTripMember() || isTripOwner())
         && request.resource.data.ownerId == resource.data.ownerId
         && (resource.data.ownerId in request.resource.data.memberIds)
@@ -115,7 +124,7 @@ service cloud.firestore {
         && (
           isTripOwner()
             ? request.resource.data.diff(resource.data).affectedKeys()
-                .hasOnly(['title', 'location', 'target', 'saved', 'imageUrl', 'memberIds', 'lastUpdatedAt', 'lastUpdatedBy'])
+                .hasOnly(['title', 'location', 'target', 'imageUrl', 'memberIds', 'lastUpdatedAt', 'lastUpdatedBy'])
             : request.resource.data.diff(resource.data).affectedKeys()
                 .hasOnly(['title', 'location', 'imageUrl', 'lastUpdatedAt', 'lastUpdatedBy'])
         );

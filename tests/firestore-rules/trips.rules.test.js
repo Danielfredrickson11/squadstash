@@ -2,6 +2,7 @@
 // run against the local Firestore emulator using the real firestore.rules
 // file (never weakened to make a test pass - see helpers/trips.js).
 const { assertFails, assertSucceeds } = require('@firebase/rules-unit-testing');
+const { deleteField } = require('firebase/firestore');
 const { createTestEnv } = require('./helpers/testEnv');
 const {
   OWNER_UID,
@@ -199,8 +200,74 @@ describe('firestore.rules: trips - owner updates', () => {
     await assertSucceeds(tripDoc(asOwner(), TRIP_ID).update({ target: 2000 }));
   });
 
-  it('owner: can update saved', async () => {
-    await assertSucceeds(tripDoc(asOwner(), TRIP_ID).update({ saved: 250 }));
+  // Milestone 2B Checkpoint 4H: existing-Trip saved is now backend-managed
+  // only (see recordSavingsTransaction) - the owner can no longer mutate
+  // it via a direct client update. Mirrors the Bucket balance lockdown
+  // (Checkpoint 4E) exactly.
+  it('owner: cannot directly change saved', async () => {
+    await assertFails(tripDoc(asOwner(), TRIP_ID).update({ saved: 250 }));
+  });
+
+  it('owner: cannot delete saved', async () => {
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update({ saved: deleteField() })
+    );
+  });
+
+  it('owner: cannot add ledgerBalanceMinor when absent', async () => {
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update({ ledgerBalanceMinor: 5000 })
+    );
+  });
+
+  it('owner: cannot change ledgerBalanceMinor when already present', async () => {
+    await seedTrip(
+      testEnv,
+      TRIP_ID,
+      validTripData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update({ ledgerBalanceMinor: 9999 })
+    );
+  });
+
+  it('owner: cannot delete ledgerBalanceMinor when present', async () => {
+    await seedTrip(
+      testEnv,
+      TRIP_ID,
+      validTripData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update({ ledgerBalanceMinor: deleteField() })
+    );
+  });
+
+  it('owner: cannot add ledgerOpeningBalanceMinor when absent', async () => {
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update({ ledgerOpeningBalanceMinor: 5000 })
+    );
+  });
+
+  it('owner: cannot change ledgerOpeningBalanceMinor when already present', async () => {
+    await seedTrip(
+      testEnv,
+      TRIP_ID,
+      validTripData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update({ ledgerOpeningBalanceMinor: 9999 })
+    );
+  });
+
+  it('owner: cannot delete ledgerOpeningBalanceMinor when present', async () => {
+    await seedTrip(
+      testEnv,
+      TRIP_ID,
+      validTripData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update({ ledgerOpeningBalanceMinor: deleteField() })
+    );
   });
 
   it('owner: can update imageUrl', async () => {
@@ -283,6 +350,18 @@ describe('firestore.rules: trips - non-owner member updates', () => {
 
   it('member: cannot change saved', async () => {
     await assertFails(tripDoc(asMember(), TRIP_ID).update({ saved: 9999 }));
+  });
+
+  it('member: cannot add/change ledgerBalanceMinor', async () => {
+    await assertFails(
+      tripDoc(asMember(), TRIP_ID).update({ ledgerBalanceMinor: 5000 })
+    );
+  });
+
+  it('member: cannot add/change ledgerOpeningBalanceMinor', async () => {
+    await assertFails(
+      tripDoc(asMember(), TRIP_ID).update({ ledgerOpeningBalanceMinor: 5000 })
+    );
   });
 
   it('member: cannot change ownerId', async () => {
