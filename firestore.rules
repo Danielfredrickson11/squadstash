@@ -82,7 +82,26 @@ service cloud.firestore {
       allow list, get: if isTripMember() || isTripOwner();
 
       // Create requires: ownerId, memberIds includes owner, title string,
-      // target number, saved number, imageUrl string. location may be string or null.
+      // target number, saved number, imageUrl string. location may be
+      // string or null.
+      //
+      // Milestone 2B Checkpoint 4I: Trip creation remains a direct client
+      // write for now (unlike Bucket, which moved to a trusted callable
+      // in Checkpoint 4G), so this rule alone is what prevents a client
+      // from injecting or forging Trip financial state. saved == 0 is
+      // required - Trip has no Starting Balance product concept, so a
+      // freshly-created Trip must always report a neutral zero shared
+      // fund; the first trusted recordSavingsTransaction call legacy-
+      // initializes the ledger from that 0 exactly like a new $0-Starting-
+      // Balance Bucket already does. keys().hasOnly(...) permits exactly
+      // the fields the current createTrip service legitimately writes -
+      // critically, ledgerOpeningBalanceMinor, ledgerBalanceMinor, and
+      // currency are NOT in this list. Without this, a client could set
+      // both ledger fields at create time and have the trusted backend
+      // treat them as already-initialized truth (bypassing legacy
+      // initialization and seeding forged financial state), or set only
+      // one and permanently break the Trip via the backend's partial-
+      // ledger failed-precondition guard - see recordSavingsTransaction.ts.
       allow create: if signedIn()
         && request.resource.data.ownerId == request.auth.uid
         && request.resource.data.memberIds is list
@@ -90,12 +109,17 @@ service cloud.firestore {
         && request.resource.data.title is string
         && request.resource.data.target is number
         && request.resource.data.saved is number
+        && request.resource.data.saved == 0
         && request.resource.data.imageUrl is string
         && (
           !(request.resource.data.keys().hasAny(['location']))
           || request.resource.data.location is string
           || request.resource.data.location == null
-        );
+        )
+        && request.resource.data.keys().hasOnly([
+          'ownerId', 'memberIds', 'title', 'location', 'target', 'saved',
+          'imageUrl', 'createdAt', 'lastUpdatedAt', 'lastUpdatedBy'
+        ]);
 
       // SEC-001 fix: field-level allowlists for update, for both owner and
       // non-owner members. ownerId, memberIds and target remain

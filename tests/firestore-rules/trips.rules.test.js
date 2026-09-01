@@ -181,6 +181,62 @@ describe('firestore.rules: trips - create', () => {
       tripDoc(asOwner(), 'new-trip').set(validTripData({ location: 123 }))
     );
   });
+
+  // Milestone 2B Checkpoint 4I: Trip has no Starting Balance concept - a
+  // freshly-created Trip must always report a neutral saved: 0. The
+  // existing "valid trip create" test above already proves saved: 0
+  // succeeds via validTripData()'s default, so no separate zero-saved
+  // success test is added here.
+  it('create: a nonzero saved is rejected', async () => {
+    await assertFails(
+      tripDoc(asOwner(), 'new-trip').set(validTripData({ saved: 500 }))
+    );
+  });
+
+  it('create: a negative saved is rejected', async () => {
+    await assertFails(
+      tripDoc(asOwner(), 'new-trip').set(validTripData({ saved: -50 }))
+    );
+  });
+
+  // Milestone 2B Checkpoint 4I: a client must never be able to inject
+  // either trusted ledger field, not even at create time - the trusted
+  // recordSavingsTransaction backend would otherwise treat a client-
+  // forged pair of ledger fields as already-initialized truth, or
+  // permanently break the Trip via its partial-ledger guard if only one
+  // is present (see firestore.rules's create comment for the full
+  // reasoning).
+  it('create: ledgerBalanceMinor cannot be injected', async () => {
+    await assertFails(
+      tripDoc(asOwner(), 'new-trip').set(
+        validTripData({ ledgerBalanceMinor: 999999 })
+      )
+    );
+  });
+
+  it('create: ledgerOpeningBalanceMinor cannot be injected', async () => {
+    await assertFails(
+      tripDoc(asOwner(), 'new-trip').set(
+        validTripData({ ledgerOpeningBalanceMinor: 999999 })
+      )
+    );
+  });
+
+  it('create: currency cannot be injected', async () => {
+    await assertFails(
+      tripDoc(asOwner(), 'new-trip').set(
+        validTripData({ currency: 'EUR' })
+      )
+    );
+  });
+
+  it('create: an arbitrary extra field is rejected', async () => {
+    await assertFails(
+      tripDoc(asOwner(), 'new-trip').set(
+        validTripData({ notes: 'hi' })
+      )
+    );
+  });
 });
 
 describe('firestore.rules: trips - owner updates', () => {
