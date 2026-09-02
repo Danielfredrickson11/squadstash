@@ -22,19 +22,33 @@ service cloud.firestore {
     match /buckets/{bucketId} {
       allow list, get: if isBucketMember() || isBucketOwner();
 
-      allow create: if signedIn()
-        && request.resource.data.ownerId == request.auth.uid
-        && request.resource.data.memberIds is list
-        && request.auth.uid in request.resource.data.memberIds
-        && request.resource.data.name is string
-        && request.resource.data.target is number
-        && request.resource.data.balance is number;
+      // Milestone 2B Checkpoint 4G-3: direct client Bucket creation is
+      // now permanently closed. The trusted createBucket Cloud Function
+      // (Admin SDK, which bypasses these rules entirely) is the sole
+      // creation path - it derives ownerId/memberIds from the
+      // authenticated caller and atomically writes the canonical
+      // balance/ledgerOpeningBalanceMinor/ledgerBalanceMinor/currency/
+      // bucketType/creationRequest state, none of which a client-facing
+      // rule could ever safely express or enforce on its own (see the
+      // Checkpoint 4G-1/4G-3 preflights). No exception exists for any
+      // role - this follows the exact same security model already used
+      // to close direct savingsTransactions writes (Checkpoint 4B).
+      allow create: if false;
 
       // SEC-001 fix: field-level allowlists for update, for both owner and
-      // non-owner members. ownerId, memberIds, balance and target remain
-      // owner-controlled only. These fields remain prototype/planning
-      // numbers, NOT real-money balances - no ledger exists yet (see
-      // Milestone 1 audit, SEC-001).
+      // non-owner members. ownerId, memberIds and target remain
+      // owner-controlled only.
+      //
+      // Milestone 2B Checkpoint 4E: balance, ledgerBalanceMinor, and
+      // ledgerOpeningBalanceMinor are existing-Bucket financial state,
+      // backend-managed only - none of the three appears in either
+      // allowlist below, so affectedKeys().hasOnly(...) rejects any
+      // client attempt to add, change, or delete them (uniformly, since a
+      // deleted field is also an affected key). The trusted
+      // recordSavingsTransaction Cloud Function (Admin SDK, which
+      // bypasses these rules) is the only path that updates them. Bucket
+      // creation is unaffected - see the "allow create" clause above,
+      // intentionally deferred to the starting-balance checkpoint.
       allow update: if (isBucketMember() || isBucketOwner())
         && request.resource.data.ownerId == resource.data.ownerId
         && (resource.data.ownerId in request.resource.data.memberIds)
@@ -45,7 +59,7 @@ service cloud.firestore {
         && (
           isBucketOwner()
             ? request.resource.data.diff(resource.data).affectedKeys()
-                .hasOnly(['name', 'target', 'balance', 'color', 'memberIds', 'lastUpdatedAt', 'lastUpdatedBy'])
+                .hasOnly(['name', 'target', 'color', 'memberIds', 'lastUpdatedAt', 'lastUpdatedBy'])
             : request.resource.data.diff(resource.data).affectedKeys()
                 .hasOnly(['name', 'color', 'lastUpdatedAt', 'lastUpdatedBy'])
         );
@@ -68,7 +82,26 @@ service cloud.firestore {
       allow list, get: if isTripMember() || isTripOwner();
 
       // Create requires: ownerId, memberIds includes owner, title string,
-      // target number, saved number, imageUrl string. location may be string or null.
+      // target number, saved number, imageUrl string. location may be
+      // string or null.
+      //
+      // Milestone 2B Checkpoint 4I: Trip creation remains a direct client
+      // write for now (unlike Bucket, which moved to a trusted callable
+      // in Checkpoint 4G), so this rule alone is what prevents a client
+      // from injecting or forging Trip financial state. saved == 0 is
+      // required - Trip has no Starting Balance product concept, so a
+      // freshly-created Trip must always report a neutral zero shared
+      // fund; the first trusted recordSavingsTransaction call legacy-
+      // initializes the ledger from that 0 exactly like a new $0-Starting-
+      // Balance Bucket already does. keys().hasOnly(...) permits exactly
+      // the fields the current createTrip service legitimately writes -
+      // critically, ledgerOpeningBalanceMinor, ledgerBalanceMinor, and
+      // currency are NOT in this list. Without this, a client could set
+      // both ledger fields at create time and have the trusted backend
+      // treat them as already-initialized truth (bypassing legacy
+      // initialization and seeding forged financial state), or set only
+      // one and permanently break the Trip via the backend's partial-
+      // ledger failed-precondition guard - see recordSavingsTransaction.ts.
       allow create: if signedIn()
         && request.resource.data.ownerId == request.auth.uid
         && request.resource.data.memberIds is list
@@ -76,20 +109,34 @@ service cloud.firestore {
         && request.resource.data.title is string
         && request.resource.data.target is number
         && request.resource.data.saved is number
+        && request.resource.data.saved == 0
         && request.resource.data.imageUrl is string
         && (
           !(request.resource.data.keys().hasAny(['location']))
           || request.resource.data.location is string
           || request.resource.data.location == null
-        );
+        )
+        && request.resource.data.keys().hasOnly([
+          'ownerId', 'memberIds', 'title', 'location', 'target', 'saved',
+          'imageUrl', 'createdAt', 'lastUpdatedAt', 'lastUpdatedBy'
+        ]);
 
       // SEC-001 fix: field-level allowlists for update, for both owner and
-      // non-owner members. ownerId, memberIds, target and saved remain
-      // owner-controlled only. These fields remain prototype/planning
-      // numbers, NOT real-money balances - no ledger exists yet (see
-      // Milestone 1 audit, SEC-001).
-      // Note: no current screen calls update() on trips; this is
-      // defense-in-depth hardening with no observed UI impact.
+      // non-owner members. ownerId, memberIds and target remain
+      // owner-controlled only.
+      //
+      // Milestone 2B Checkpoint 4H: saved, ledgerBalanceMinor, and
+      // ledgerOpeningBalanceMinor are existing-Trip financial state,
+      // backend-managed only - mirrors the Bucket balance lockdown
+      // (Checkpoint 4E) exactly. None of the three appears in either
+      // allowlist below, so affectedKeys().hasOnly(...) rejects any
+      // client attempt to add, change, or delete them (uniformly, since a
+      // deleted field is also an affected key). The trusted
+      // recordSavingsTransaction Cloud Function (Admin SDK, which
+      // bypasses these rules) is the only path that updates them. Trip
+      // creation is unaffected - saved's create-time exposure is a
+      // separate, deliberately deferred gap (see the "allow create"
+      // clause above), tracked for a dedicated follow-up checkpoint.
       allow update: if (isTripMember() || isTripOwner())
         && request.resource.data.ownerId == resource.data.ownerId
         && (resource.data.ownerId in request.resource.data.memberIds)
@@ -101,13 +148,90 @@ service cloud.firestore {
         && (
           isTripOwner()
             ? request.resource.data.diff(resource.data).affectedKeys()
-                .hasOnly(['title', 'location', 'target', 'saved', 'imageUrl', 'memberIds', 'lastUpdatedAt', 'lastUpdatedBy'])
+                .hasOnly(['title', 'location', 'target', 'imageUrl', 'memberIds', 'lastUpdatedAt', 'lastUpdatedBy'])
             : request.resource.data.diff(resource.data).affectedKeys()
                 .hasOnly(['title', 'location', 'imageUrl', 'lastUpdatedAt', 'lastUpdatedBy'])
         );
 
       // Delete: only owner
       allow delete: if isTripOwner();
+    }
+
+    // ---------------------------------------
+    // SAVINGS TRANSACTIONS (Milestone 2B ledger)
+    // ---------------------------------------
+    // Append-only, and (as of Checkpoint 4B) client-write-closed
+    // entirely: reads remain authorized here, but every create/update/
+    // delete is unconditionally denied for every client. The trusted
+    // recordSavingsTransaction Cloud Function (Admin SDK, which bypasses
+    // these rules) is the sole write path - see the "allow create"
+    // clause below for why. Read access is based solely on the CURRENT
+    // ownerId/memberIds of the referenced bucket or trip - never on a
+    // Bucket's linkedTripId. A trip_personal Bucket's privacy is
+    // governed by that Bucket's own membership; being the owner of the
+    // linked Trip grants no access to it. Admin-role permissions are
+    // deferred until the membership subcollection infrastructure exists
+    // (Milestone 2A design freeze) - only ownerId/memberIds are
+    // consulted here.
+    match /savingsTransactions/{transactionId} {
+
+      function validResourceType(t) {
+        return t == 'bucket' || t == 'trip';
+      }
+
+      function parentExists(resourceType, resourceId) {
+        return resourceType == 'bucket'
+          ? exists(/databases/$(database)/documents/buckets/$(resourceId))
+          : exists(/databases/$(database)/documents/trips/$(resourceId));
+      }
+
+      function parentData(resourceType, resourceId) {
+        return resourceType == 'bucket'
+          ? get(/databases/$(database)/documents/buckets/$(resourceId)).data
+          : get(/databases/$(database)/documents/trips/$(resourceId)).data;
+      }
+
+      function isParentMember(resourceType, resourceId, uid) {
+        return uid in parentData(resourceType, resourceId).memberIds;
+      }
+
+      function isParentOwner(resourceType, resourceId, uid) {
+        return parentData(resourceType, resourceId).ownerId == uid;
+      }
+
+      function canAccessParent(resourceType, resourceId) {
+        return signedIn()
+          && resourceType is string
+          && validResourceType(resourceType)
+          && resourceId is string
+          && parentExists(resourceType, resourceId)
+          && (
+            isParentMember(resourceType, resourceId, request.auth.uid)
+            || isParentOwner(resourceType, resourceId, request.auth.uid)
+          );
+      }
+
+      allow get, list: if resource.data.resourceType is string
+        && resource.data.resourceId is string
+        && canAccessParent(resource.data.resourceType, resource.data.resourceId);
+
+      // Milestone 2B Checkpoint 4B: client create is now permanently
+      // closed. The trusted recordSavingsTransaction Cloud Function
+      // (Admin SDK, which bypasses these rules entirely) is the sole
+      // write path - it atomically maintains ledgerBalanceMinor and the
+      // balance/saved compatibility cache, enforces non-negative
+      // withdrawals, performs legacy-opening-balance initialization, and
+      // enforces idempotency, none of which these client-facing rules
+      // could ever fully guarantee on their own (see the Checkpoint 4
+      // architecture preflight). No exception exists for self,
+      // owner-on-behalf, or any other role - a client can never bypass
+      // the Function by constructing an otherwise-perfectly-valid
+      // document.
+      allow create: if false;
+
+      // Append-only: no client may ever modify or remove a savings
+      // transaction, including the resource owner.
+      allow update, delete: if false;
     }
 
     // ---------------------------------------

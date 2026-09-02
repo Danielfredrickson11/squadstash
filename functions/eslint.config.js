@@ -25,8 +25,20 @@ module.exports = [
     // into the lint run (and fail TS-project parsing, since it isn't
     // covered by tsconfig.json's "include": ["src"]). eslint.config.js is
     // config/tooling, not application source, so it's excluded from
-    // self-linting the same way .eslintrc.js always was.
-    ignores: ["lib/**", "generated/**", ".eslintrc.js", "eslint.config.js"],
+    // self-linting the same way .eslintrc.js always was. test/** and
+    // lib-test/** (Milestone 2B Checkpoint 4A) are excluded for the same
+    // reason .eslintrc.js is: they aren't covered by tsconfig.json's
+    // "include": ["src"] either, so the TS-project-aware block below
+    // would fail to parse them - test files are tooling, not application
+    // source, same category as the entries above.
+    ignores: [
+      "lib/**",
+      "generated/**",
+      ".eslintrc.js",
+      "eslint.config.js",
+      "test/**",
+      "lib-test/**",
+    ],
   },
   ...compat.env({ es6: true, node: true }),
   js.configs.recommended,

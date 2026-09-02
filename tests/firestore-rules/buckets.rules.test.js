@@ -2,6 +2,7 @@
 // run against the local Firestore emulator using the real firestore.rules
 // file (never weakened to make a test pass - see helpers/buckets.js).
 const { assertFails, assertSucceeds } = require('@firebase/rules-unit-testing');
+const { deleteField, serverTimestamp } = require('firebase/firestore');
 const { createTestEnv } = require('./helpers/testEnv');
 const {
   OWNER_UID,
@@ -80,8 +81,12 @@ describe('firestore.rules: buckets - authentication and reads', () => {
 });
 
 describe('firestore.rules: buckets - create', () => {
-  it('authenticated user: can create a valid bucket (ownerId = uid, ownerId in memberIds, valid types)', async () => {
-    await assertSucceeds(
+  // Milestone 2B Checkpoint 4G-3: direct client Bucket creation is now
+  // permanently closed - the trusted createBucket Cloud Function is the
+  // sole creation path. Even an otherwise-perfectly-valid payload
+  // (ownerId = uid, ownerId in memberIds, valid types) is denied.
+  it('authenticated user: cannot directly create a bucket', async () => {
+    await assertFails(
       bucketDoc(asOwner(), 'new-bucket').set(validBucketData())
     );
   });
@@ -139,6 +144,74 @@ describe('firestore.rules: buckets - create', () => {
       )
     );
   });
+
+  // Milestone 2B Checkpoint 4G-3: Starting Balance is no longer a direct
+  // client create input at all - it must go through the trusted
+  // createBucket callable as startingBalanceMinor, which atomically
+  // initializes balance/ledgerOpeningBalanceMinor/ledgerBalanceMinor
+  // together.
+  it('create: nonzero Starting Balance direct create is denied', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), 'new-bucket').set(validBucketData({ balance: 500 }))
+    );
+  });
+
+  it('create: zero Starting Balance direct create is denied', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), 'new-bucket').set(validBucketData({ balance: 0 }))
+    );
+  });
+
+  it('create: a negative Starting Balance is rejected', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), 'new-bucket').set(validBucketData({ balance: -50 }))
+    );
+  });
+
+  // Milestone 2B Checkpoint 4G-3: this was the exact nine-field shape the
+  // OLD direct-write createBucket service used to send (see git history
+  // of src/services/firebase/buckets.ts) - now that service invokes the
+  // trusted callable instead, and this shape is denied unconditionally
+  // regardless of how faithfully it reconstructs the former write.
+  it('create: former nine-field client service shape is denied', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), 'new-bucket').set({
+        ...validBucketData(),
+        createdAt: serverTimestamp(),
+        lastUpdatedAt: serverTimestamp(),
+        lastUpdatedBy: OWNER_UID,
+      })
+    );
+  });
+
+  it('create: an arbitrary extra field is rejected', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), 'new-bucket').set(
+        validBucketData({ notes: 'hi' })
+      )
+    );
+  });
+
+  // Milestone 2B Checkpoint 4F: the whole point of this checkpoint - a
+  // client must never be able to inject either trusted ledger field, not
+  // even at create time. The eventual canonical initialization of these
+  // fields belongs solely to a future trusted create callable (Admin
+  // SDK), never to a direct client write.
+  it('create: ledgerBalanceMinor cannot be injected', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), 'new-bucket').set(
+        validBucketData({ ledgerBalanceMinor: 999999 })
+      )
+    );
+  });
+
+  it('create: ledgerOpeningBalanceMinor cannot be injected', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), 'new-bucket').set(
+        validBucketData({ ledgerOpeningBalanceMinor: 999999 })
+      )
+    );
+  });
 });
 
 describe('firestore.rules: buckets - owner updates', () => {
@@ -154,8 +227,73 @@ describe('firestore.rules: buckets - owner updates', () => {
     await assertSucceeds(bucketDoc(asOwner(), BUCKET_ID).update({ target: 250 }));
   });
 
-  it('owner: can update balance', async () => {
-    await assertSucceeds(bucketDoc(asOwner(), BUCKET_ID).update({ balance: 50 }));
+  // Milestone 2B Checkpoint 4E: existing-Bucket balance is now
+  // backend-managed only (see recordSavingsTransaction) - the owner can
+  // no longer mutate it via a direct client update.
+  it('owner: cannot directly change balance', async () => {
+    await assertFails(bucketDoc(asOwner(), BUCKET_ID).update({ balance: 50 }));
+  });
+
+  it('owner: cannot delete balance', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ balance: deleteField() })
+    );
+  });
+
+  it('owner: cannot add ledgerBalanceMinor when absent', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerBalanceMinor: 5000 })
+    );
+  });
+
+  it('owner: cannot change ledgerBalanceMinor when already present', async () => {
+    await seedBucket(
+      testEnv,
+      BUCKET_ID,
+      validBucketData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerBalanceMinor: 9999 })
+    );
+  });
+
+  it('owner: cannot delete ledgerBalanceMinor when present', async () => {
+    await seedBucket(
+      testEnv,
+      BUCKET_ID,
+      validBucketData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerBalanceMinor: deleteField() })
+    );
+  });
+
+  it('owner: cannot add ledgerOpeningBalanceMinor when absent', async () => {
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerOpeningBalanceMinor: 5000 })
+    );
+  });
+
+  it('owner: cannot change ledgerOpeningBalanceMinor when already present', async () => {
+    await seedBucket(
+      testEnv,
+      BUCKET_ID,
+      validBucketData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerOpeningBalanceMinor: 9999 })
+    );
+  });
+
+  it('owner: cannot delete ledgerOpeningBalanceMinor when present', async () => {
+    await seedBucket(
+      testEnv,
+      BUCKET_ID,
+      validBucketData({ ledgerBalanceMinor: 5000, ledgerOpeningBalanceMinor: 5000 })
+    );
+    await assertFails(
+      bucketDoc(asOwner(), BUCKET_ID).update({ ledgerOpeningBalanceMinor: deleteField() })
+    );
   });
 
   it('owner: can update color', async () => {
@@ -222,6 +360,18 @@ describe('firestore.rules: buckets - non-owner member updates', () => {
 
   it('member: cannot change balance', async () => {
     await assertFails(bucketDoc(asMember(), BUCKET_ID).update({ balance: 999 }));
+  });
+
+  it('member: cannot add/change ledgerBalanceMinor', async () => {
+    await assertFails(
+      bucketDoc(asMember(), BUCKET_ID).update({ ledgerBalanceMinor: 5000 })
+    );
+  });
+
+  it('member: cannot add/change ledgerOpeningBalanceMinor', async () => {
+    await assertFails(
+      bucketDoc(asMember(), BUCKET_ID).update({ ledgerOpeningBalanceMinor: 5000 })
+    );
   });
 
   it('member: cannot change ownerId', async () => {
