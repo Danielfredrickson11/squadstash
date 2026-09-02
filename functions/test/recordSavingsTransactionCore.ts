@@ -145,17 +145,35 @@ describe("recordSavingsTransactionCore - self-recorded success", () => {
     );
     assert.equal(result.balanceMinor, 9600);
   });
-});
 
-describe("recordSavingsTransactionCore - permission", () => {
-  it("4. owner can record on behalf of a current member", async () => {
+  it("owner can record for themselves", async () => {
     await seedBucket();
     const result = await recordSavingsTransactionCore(
       db,
       OWNER_UID,
-      baseRequest({ memberUid: MEMBER_UID })
+      baseRequest({ memberUid: OWNER_UID })
     );
     assert.equal(result.balanceMinor, 10500);
+  });
+});
+
+describe("recordSavingsTransactionCore - permission", () => {
+  // Milestone 2C Checkpoint 2C-1: owner-on-behalf recording is
+  // intentionally disabled until trusted, accepted membership exists -
+  // see the security note on recordSavingsTransaction. A Bucket owner can
+  // unilaterally add another uid to memberIds with no acceptance step, so
+  // membership alone is not (yet) a trustworthy basis for attributing a
+  // transaction to someone other than the caller.
+  it("4. owner attempting to record for another current member is rejected", async () => {
+    await seedBucket();
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(
+        db,
+        OWNER_UID,
+        baseRequest({ memberUid: MEMBER_UID })
+      ),
+      "permission-denied"
+    );
   });
 
   it("5. ordinary member cannot record for another member", async () => {
@@ -539,11 +557,11 @@ describe("recordSavingsTransactionCore - ambiguous/partial ledger state", () => 
 });
 
 describe("recordSavingsTransactionCore - persisted transaction shape", () => {
-  it("records recordedBy, reversalOf, createdAt, and no stored id field", async () => {
+  it("records memberUid, recordedBy, reversalOf, createdAt, and no stored id field for a valid self write", async () => {
     await seedBucket();
     const result = await recordSavingsTransactionCore(
       db,
-      OWNER_UID,
+      MEMBER_UID,
       baseRequest({ memberUid: MEMBER_UID })
     );
 
@@ -553,7 +571,8 @@ describe("recordSavingsTransactionCore - persisted transaction shape", () => {
       .get();
     const data = snap.data()!;
 
-    assert.equal(data.recordedBy, OWNER_UID);
+    assert.equal(data.memberUid, MEMBER_UID);
+    assert.equal(data.recordedBy, MEMBER_UID);
     assert.equal(data.reversalOf, null);
     assert.ok(data.createdAt, "createdAt should be populated");
     assert.equal("id" in data, false);
