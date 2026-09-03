@@ -39,8 +39,17 @@ const MAX_NOTE_LENGTH = 500;
  *
  * Security:
  * - Requires caller to be signed in
- * - Caller may record only their own activity (memberUid == auth uid), or
- *   the resource owner may record on behalf of another current member
+ * - Caller may record only their own activity (memberUid must equal the
+ *   authenticated uid); memberUid must also still be a current member of
+ *   the resource
+ * - Owner-on-behalf recording (an owner recording for another member) is
+ *   intentionally NOT permitted right now (Milestone 2C Checkpoint 2C-1).
+ *   A Bucket owner can unilaterally add another registered uid to
+ *   memberIds with no acceptance step, and no trusted Membership/
+ *   Invitation-acceptance record exists yet to distinguish that from
+ *   independently-accepted membership - so financial attribution stays
+ *   self-only until a future group-sharing milestone adds trusted,
+ *   accepted membership.
  * - This is the sole trusted write path for savingsTransactions; direct
  *   client creation is expected to be locked down separately (see
  *   Milestone 2B Checkpoint 4B)
@@ -152,13 +161,13 @@ export async function recordSavingsTransactionCore(
       );
     }
 
-    const isSelf = authUid === input.memberUid;
-    const isOwnerOnBehalf = authUid === parentData.ownerId;
-    if (!isSelf && !isOwnerOnBehalf) {
+    // Self-only for now (Milestone 2C Checkpoint 2C-1): owner-on-behalf
+    // recording is intentionally deferred until trusted, accepted
+    // membership exists - see the security note in the file header.
+    if (authUid !== input.memberUid) {
       throw new HttpsError(
         "permission-denied",
-        "Only the member themself or the resource owner may record " +
-          "this transaction."
+        "You may only record a savings transaction for yourself."
       );
     }
 
