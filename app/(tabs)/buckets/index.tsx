@@ -1,3 +1,4 @@
+import { useRouter } from "expo-router";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
@@ -18,9 +19,9 @@ import {
   useTheme,
 } from "react-native-paper";
 
-import { AvatarCircle, initialsFromName, shortUid } from "../../components/buckets/AvatarCircle";
-import { BucketCard } from "../../components/buckets/BucketCard";
-import { useAuth } from "../../src/contexts/AuthContext";
+import { AvatarCircle, initialsFromName, shortUid } from "../../../components/buckets/AvatarCircle";
+import { BucketCard } from "../../../components/buckets/BucketCard";
+import { useAuth } from "../../../src/contexts/AuthContext";
 import {
   addBucketMember,
   createBucket,
@@ -29,16 +30,16 @@ import {
   removeBucketMember,
   subscribeToUserBuckets,
   updateBucket,
-} from "../../src/services/firebase/buckets";
-import type { UpdateBucketInput } from "../../src/services/firebase/buckets";
-import { lookupUserByEmail } from "../../src/services/firebase/functions";
+} from "../../../src/services/firebase/buckets";
+import type { UpdateBucketInput } from "../../../src/services/firebase/buckets";
+import { lookupUserByEmail } from "../../../src/services/firebase/functions";
 import {
   generateSavingsClientRequestId,
   recordSavingsTransaction,
-} from "../../src/services/firebase/savingsTransactions";
-import { subscribeToPublicUsersByIds } from "../../src/services/firebase/users";
-import type { Bucket, PublicProfile, SavingsTransactionType } from "../../src/types/domain";
-import { formatCurrency, parseDollarsToMinorUnits } from "../../utils/format";
+} from "../../../src/services/firebase/savingsTransactions";
+import { subscribeToPublicUsersByIds } from "../../../src/services/firebase/users";
+import type { Bucket, PublicProfile, SavingsTransactionType } from "../../../src/types/domain";
+import { formatCurrency, parseDollarsToMinorUnits } from "../../../utils/format";
 
 const COLORS = [
   "#2563EB",
@@ -213,6 +214,7 @@ export default function BucketsScreen() {
   const { user, loading } = useAuth();
   const { width } = useWindowDimensions();
   const theme = useTheme();
+  const router = useRouter();
 
   // Ownership here is a UI affordance only (hide/disable actions that are
   // guaranteed to fail). Firestore rules remain the authoritative
@@ -825,6 +827,17 @@ export default function BucketsScreen() {
     return membersSubmitting;
   }, [inviteEmail, currentIsOwner, user?.email, membersSubmitting]);
 
+  // Navigates to the dedicated Bucket detail screen (Milestone 3
+  // Checkpoint 3B). A plain presentation callback, not Expo Router
+  // dropped directly into BucketCard, so the card stays presentation-
+  // focused - see components/buckets/BucketCard.tsx's onOpenBucket prop.
+  const openBucketDetail = (bucket: Bucket) => {
+    router.push({
+      pathname: "/(tabs)/buckets/[bucketId]",
+      params: { bucketId: bucket.id },
+    });
+  };
+
   // Presentation lives in BucketCard (components/buckets/BucketCard.tsx)
   // - this closure only supplies the per-item state slices and the
   // existing screen-owned handlers (quickAdd/openMoneyDialog/etc. still
@@ -838,6 +851,7 @@ export default function BucketsScreen() {
         isMenuOpen={menuAnchor === item.id}
         quickAddSubmittingId={quickAddSubmittingId}
         avatarForUid={avatarForUid}
+        onOpenBucket={openBucketDetail}
         onOpenMembers={openMembers}
         onOpenMenu={openMenu}
         onCloseMenu={closeMenu}

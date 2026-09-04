@@ -10,7 +10,7 @@
 // components.
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import React from "react";
-import { Text as RNText, StyleSheet, View } from "react-native";
+import { Pressable, Text as RNText, StyleSheet, View } from "react-native";
 import {
   Button,
   Card,
@@ -35,6 +35,7 @@ export type BucketCardProps = {
   isMenuOpen: boolean;
   quickAddSubmittingId: string | null;
   avatarForUid: (uid: string) => { label: string; photoURL: string };
+  onOpenBucket: (bucket: Bucket) => void;
   onOpenMembers: (bucket: Bucket) => void;
   onOpenMenu: (bucketId: string) => void;
   onCloseMenu: () => void;
@@ -52,6 +53,7 @@ export function BucketCard({
   isMenuOpen,
   quickAddSubmittingId,
   avatarForUid,
+  onOpenBucket,
   onOpenMembers,
   onOpenMenu,
   onCloseMenu,
@@ -156,41 +158,53 @@ export function BucketCard({
           </View>
         </View>
 
-        <View style={styles.nameWrap}>
-          <RNText
-            style={[styles.bucketNameText, { color: theme.colors.onSurface }]}
-            numberOfLines={1}
-          >
-            {displayName}
-          </RNText>
-        </View>
+        {/* Only the identity/financial-summary block is tappable to open
+            the Bucket detail screen (Milestone 3 Checkpoint 3B) - the
+            avatar/menu row above and the money-action rows below are
+            deliberately kept as separate siblings, outside this
+            Pressable, so tapping them can never also trigger navigation
+            (no event-bubbling ambiguity to manage, on any platform). */}
+        <Pressable
+          onPress={() => onOpenBucket(bucket)}
+          accessibilityRole="button"
+          accessibilityLabel={`Open ${displayName} details`}
+        >
+          <View style={styles.nameWrap}>
+            <RNText
+              style={[styles.bucketNameText, { color: theme.colors.onSurface }]}
+              numberOfLines={1}
+            >
+              {displayName}
+            </RNText>
+          </View>
 
-        <View style={styles.amountRow}>
-          <Text style={styles.bigAmount}>{formatCurrency(bucket.balance)}</Text>
-          <Text style={[styles.ofAmount, { color: theme.colors.onSurfaceVariant }]}>
-            {" "}
-            / {formatCurrency(bucket.target)}
-          </Text>
-        </View>
+          <View style={styles.amountRow}>
+            <Text style={styles.bigAmount}>{formatCurrency(bucket.balance)}</Text>
+            <Text style={[styles.ofAmount, { color: theme.colors.onSurfaceVariant }]}>
+              {" "}
+              / {formatCurrency(bucket.target)}
+            </Text>
+          </View>
 
-        <ProgressBar
-          progress={pct}
-          style={[styles.progress, { backgroundColor: theme.colors.surfaceVariant }]}
-          color={accent}
-        />
+          <ProgressBar
+            progress={pct}
+            style={[styles.progress, { backgroundColor: theme.colors.surfaceVariant }]}
+            color={accent}
+          />
 
-        <View style={styles.completedRow}>
-          <Text style={[styles.muted, { color: theme.colors.onSurfaceVariant }]}>
-            {Math.round(pct * 100)}% Completed
-          </Text>
-        </View>
+          <View style={styles.completedRow}>
+            <Text style={[styles.muted, { color: theme.colors.onSurfaceVariant }]}>
+              {Math.round(pct * 100)}% Completed
+            </Text>
+          </View>
 
-        <View style={styles.memberMetaRow}>
-          <Text style={[styles.muted, { color: theme.colors.onSurfaceVariant }]}>
-            Members: {bucket.memberIds?.length ?? 0}
-            {isOwner ? " • You’re owner" : ""}
-          </Text>
-        </View>
+          <View style={styles.memberMetaRow}>
+            <Text style={[styles.muted, { color: theme.colors.onSurfaceVariant }]}>
+              Members: {bucket.memberIds?.length ?? 0}
+              {isOwner ? " • You’re owner" : ""}
+            </Text>
+          </View>
+        </Pressable>
 
         {/* Every current member of this bucket may record their own
             contribution/withdrawal - the list this card renders from is

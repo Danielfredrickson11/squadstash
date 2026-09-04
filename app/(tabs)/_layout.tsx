@@ -93,6 +93,9 @@ export default function TabLayout() {
         }}
       />
 
+      {/* Hide the nested Bucket detail route from the tab bar */}
+      <Tabs.Screen name="buckets/[bucketId]" options={{ href: null }} />
+
       <Tabs.Screen
         name="trips"
         options={{
