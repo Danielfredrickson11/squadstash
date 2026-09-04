@@ -1,11 +1,8 @@
-import { MaterialCommunityIcons } from "@expo/vector-icons";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   FlatList,
-  Image,
   Platform,
-  Text as RNText,
   StyleSheet,
   View,
   useWindowDimensions,
@@ -15,14 +12,14 @@ import {
   Card,
   Chip,
   Dialog,
-  IconButton,
-  Menu,
   Portal,
-  ProgressBar,
   Text,
   TextInput,
+  useTheme,
 } from "react-native-paper";
 
+import { AvatarCircle, initialsFromName, shortUid } from "../../components/buckets/AvatarCircle";
+import { BucketCard } from "../../components/buckets/BucketCard";
 import { useAuth } from "../../src/contexts/AuthContext";
 import {
   addBucketMember,
@@ -53,21 +50,6 @@ const COLORS = [
   "#EC4899",
   "#0EA5E9",
 ];
-
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(n, max));
-}
-
-function initialsFromName(name?: string) {
-  const s = (name ?? "").trim();
-  if (!s) return "?";
-  const parts = s.split(/\s+/).slice(0, 2);
-  return parts.map((p) => (p?.[0] ?? "").toUpperCase()).join("");
-}
-
-function shortUid(uid: string) {
-  return `${uid.slice(0, 6)}…${uid.slice(-4)}`;
-}
 
 function isValidInviteEmail(email: string) {
   const e = email.trim().toLowerCase();
@@ -227,41 +209,10 @@ function notifyError(title: string, message: string) {
   Alert.alert(title, message);
 }
 
-function AvatarCircle(props: {
-  index: number;
-  label: string;
-  photoURL?: string;
-  size?: number;
-}) {
-  const { index, label, photoURL, size = 26 } = props;
-
-  return (
-    <View
-      style={[
-        styles.avatar,
-        {
-          width: size,
-          height: size,
-          borderRadius: 999,
-          marginLeft: index === 0 ? 0 : -10,
-        },
-      ]}
-    >
-      {photoURL ? (
-        <Image
-          source={{ uri: photoURL }}
-          style={{ width: size - 2, height: size - 2, borderRadius: 999 }}
-        />
-      ) : (
-        <RNText style={styles.avatarText}>{label}</RNText>
-      )}
-    </View>
-  );
-}
-
 export default function BucketsScreen() {
   const { user, loading } = useAuth();
   const { width } = useWindowDimensions();
+  const theme = useTheme();
 
   // Ownership here is a UI affordance only (hide/disable actions that are
   // guaranteed to fail). Firestore rules remain the authoritative
@@ -874,164 +825,43 @@ export default function BucketsScreen() {
     return membersSubmitting;
   }, [inviteEmail, currentIsOwner, user?.email, membersSubmitting]);
 
+  // Presentation lives in BucketCard (components/buckets/BucketCard.tsx)
+  // - this closure only supplies the per-item state slices and the
+  // existing screen-owned handlers (quickAdd/openMoneyDialog/etc. still
+  // perform every actual Firebase read/write; the card only invokes
+  // them).
   const renderItem = ({ item }: { item: Bucket }) => {
-    const accent = item.color ?? COLORS[0];
-    const pct = item.target > 0 ? clamp(item.balance / item.target, 0, 1) : 0;
-
-    const isMenuOpen = menuAnchor === item.id;
-    const isOwner = isBucketOwner(item);
-    const displayName = item.name?.trim() ? item.name.trim() : "Untitled";
-
-    const memberIds = item.memberIds ?? [];
-    const topMembers = memberIds.slice(0, 3);
-    const extraCount = Math.max(0, memberIds.length - topMembers.length);
-
     return (
-      <Card style={styles.card} mode="elevated">
-        <Card.Content>
-          <View style={styles.cardTopRow}>
-            <View style={[styles.iconBubble, { backgroundColor: `${accent}22` }]}>
-              <MaterialCommunityIcons name="bullseye-arrow" size={20} color={accent} />
-            </View>
-
-            <View style={styles.memberCluster}>
-              <Button
-                compact
-                mode="text"
-                onPress={() => openMembers(item)}
-                style={{ paddingHorizontal: 0 }}
-                contentStyle={{ flexDirection: "row" }}
-              >
-                <View style={styles.avatarStack}>
-                  {topMembers.map((uid, idx) => {
-                    const a = avatarForUid(uid);
-                    return (
-                      <AvatarCircle
-                        key={uid}
-                        index={idx}
-                        label={a.label}
-                        photoURL={a.photoURL}
-                      />
-                    );
-                  })}
-
-                  {extraCount > 0 ? (
-                    <View style={[styles.morePill, { marginLeft: -10 }]}>
-                      <RNText style={styles.morePillText}>+{extraCount}</RNText>
-                    </View>
-                  ) : null}
-                </View>
-              </Button>
-
-              <Menu
-                visible={isMenuOpen}
-                onDismiss={closeMenu}
-                anchor={
-                  <IconButton icon="dots-horizontal" size={20} onPress={() => openMenu(item.id)} />
-                }
-              >
-                <Menu.Item title="Members" onPress={() => openMembers(item)} />
-                <Menu.Item title="Edit" onPress={() => startEdit(item)} />
-                <Menu.Item title="Delete" onPress={() => startDelete(item)} disabled={!isOwner} />
-              </Menu>
-            </View>
-          </View>
-
-          <View style={styles.nameWrap}>
-            <RNText style={styles.bucketNameText} numberOfLines={1}>
-              {displayName}
-            </RNText>
-          </View>
-
-          <View style={styles.amountRow}>
-            <Text style={styles.bigAmount}>{formatCurrency(item.balance)}</Text>
-            <Text style={styles.ofAmount}> / {formatCurrency(item.target)}</Text>
-          </View>
-
-          <ProgressBar progress={pct} style={styles.progress} color={accent} />
-
-          <View style={styles.completedRow}>
-            <Text style={styles.muted}>{Math.round(pct * 100)}% Completed</Text>
-          </View>
-
-          <View style={styles.memberMetaRow}>
-            <Text style={styles.muted}>
-              Members: {item.memberIds?.length ?? 0}
-              {isOwner ? " • You’re owner" : ""}
-            </Text>
-          </View>
-
-          {/* Every current member of this bucket may record their own
-              contribution/withdrawal - this list is already scoped to
-              buckets the signed-in user is a member of
-              (subscribeToUserBuckets queries memberIds array-contains
-              uid), so no additional owner check is needed here. The
-              trusted recordSavingsTransaction callable is the
-              authoritative permission check regardless.
-
-              Quick-add is serialized across ALL buckets (not just this
-              one): disabled is keyed off quickAddSubmittingId !== null so
-              a second bucket's quick-add cannot start - and race - while
-              another bucket's request is still in flight (see quickAdd's
-              quickAddInFlightRef). loading stays scoped to the bucket
-              actually submitting. */}
-          <View style={styles.quickRow}>
-            <Button
-              mode="outlined"
-              onPress={() => quickAdd(item, 5000)}
-              style={styles.quickBtn}
-              compact
-              loading={quickAddSubmittingId === item.id}
-              disabled={quickAddSubmittingId !== null}
-            >
-              + {formatCurrency(50)}
-            </Button>
-            <Button
-              mode="outlined"
-              onPress={() => quickAdd(item, 10000)}
-              style={styles.quickBtn}
-              compact
-              loading={quickAddSubmittingId === item.id}
-              disabled={quickAddSubmittingId !== null}
-            >
-              + {formatCurrency(100)}
-            </Button>
-          </View>
-
-          <View style={styles.moneyActionsRow}>
-            <Button
-              mode="text"
-              compact
-              onPress={() => openMoneyDialog(item, "contribution")}
-              disabled={quickAddSubmittingId !== null}
-            >
-              Custom Amount
-            </Button>
-            <Button
-              mode="text"
-              compact
-              onPress={() => openMoneyDialog(item, "withdrawal")}
-              disabled={quickAddSubmittingId !== null}
-            >
-              Withdraw
-            </Button>
-          </View>
-        </Card.Content>
-      </Card>
+      <BucketCard
+        bucket={item}
+        isOwner={isBucketOwner(item)}
+        isMenuOpen={menuAnchor === item.id}
+        quickAddSubmittingId={quickAddSubmittingId}
+        avatarForUid={avatarForUid}
+        onOpenMembers={openMembers}
+        onOpenMenu={openMenu}
+        onCloseMenu={closeMenu}
+        onEdit={startEdit}
+        onDelete={startDelete}
+        onQuickAdd={quickAdd}
+        onOpenMoneyDialog={openMoneyDialog}
+      />
     );
   };
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
       <View style={styles.headerRow}>
         <View style={{ flex: 1 }}>
           <Text variant="headlineSmall" style={styles.title}>
             Personal Buckets
           </Text>
-          <Text style={styles.subtitle}>Track and manage your savings goals.</Text>
+          <Text style={[styles.subtitle, { color: theme.colors.onSurfaceVariant }]}>
+            Track and manage your savings goals.
+          </Text>
 
           {readError ? (
-            <Text style={{ marginTop: 6, color: "#B91C1C" }}>{readError}</Text>
+            <Text style={{ marginTop: 6, color: theme.colors.error }}>{readError}</Text>
           ) : null}
         </View>
 
@@ -1054,7 +884,9 @@ export default function BucketsScreen() {
               <Text style={{ fontWeight: "700", marginBottom: 6 }}>
                 You don’t have any buckets yet.
               </Text>
-              <Text style={styles.muted}>Create your first goal to start tracking savings.</Text>
+              <Text style={[styles.muted, { color: theme.colors.onSurfaceVariant }]}>
+                Create your first goal to start tracking savings.
+              </Text>
               <View style={{ height: 12 }} />
               <Button mode="contained" icon="plus" onPress={openCreate}>
                 New Goal
@@ -1081,7 +913,7 @@ export default function BucketsScreen() {
                 </Text>
 
                 {membersError ? (
-                  <Text style={{ color: "#B91C1C", marginBottom: 8 }}>{membersError}</Text>
+                  <Text style={{ color: theme.colors.error, marginBottom: 8 }}>{membersError}</Text>
                 ) : null}
 
                 <Button
@@ -1110,7 +942,7 @@ export default function BucketsScreen() {
                 />
 
                 {membersError ? (
-                  <Text style={{ color: "#B91C1C", marginBottom: 8 }}>{membersError}</Text>
+                  <Text style={{ color: theme.colors.error, marginBottom: 8 }}>{membersError}</Text>
                 ) : null}
 
                 <Button
@@ -1137,7 +969,10 @@ export default function BucketsScreen() {
                 const display = nameForUid(uid);
 
                 return (
-                  <View key={uid} style={styles.memberRow}>
+                  <View
+                    key={uid}
+                    style={[styles.memberRow, { borderBottomColor: theme.colors.outline }]}
+                  >
                     <View style={{ flexDirection: "row", alignItems: "center", gap: 10, flex: 1 }}>
                       <AvatarCircle index={0} label={a.label} photoURL={a.photoURL} size={30} />
 
@@ -1332,7 +1167,7 @@ export default function BucketsScreen() {
             />
 
             {moneyDialogError ? (
-              <Text style={{ color: "#B91C1C", marginBottom: 8 }}>{moneyDialogError}</Text>
+              <Text style={{ color: theme.colors.error, marginBottom: 8 }}>{moneyDialogError}</Text>
             ) : null}
           </Dialog.Content>
           <Dialog.Actions>
@@ -1377,7 +1212,7 @@ export default function BucketsScreen() {
 const GAP = 12;
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 16, backgroundColor: "#F6F7FB" },
+  container: { flex: 1, padding: 16 },
 
   headerRow: {
     flexDirection: "row",
@@ -1387,97 +1222,12 @@ const styles = StyleSheet.create({
     marginBottom: 14,
   },
   title: { fontWeight: "900" },
-  subtitle: { opacity: 0.7, marginTop: 2 },
+  subtitle: { marginTop: 2 },
 
   row: { gap: GAP, marginBottom: GAP },
 
-  card: {
-    flex: 1,
-    borderRadius: 16,
-    marginBottom: GAP,
-    backgroundColor: "white",
-  },
+  muted: {},
 
-  cardTopRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 10,
-  },
-  iconBubble: {
-    width: 42,
-    height: 42,
-    borderRadius: 14,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  nameWrap: {
-    minHeight: 26,
-    justifyContent: "center",
-    marginBottom: 8,
-  },
-  bucketNameText: {
-    fontSize: 18,
-    fontWeight: "800",
-    lineHeight: 22,
-    color: "#111827",
-    flexShrink: 1,
-  },
-
-  amountRow: {
-    flexDirection: "row",
-    alignItems: "baseline",
-    gap: 6,
-    marginBottom: 10,
-  },
-  bigAmount: { fontWeight: "900", fontSize: 22 },
-  ofAmount: { opacity: 0.6 },
-
-  progress: {
-    height: 10,
-    borderRadius: 10,
-    backgroundColor: "rgba(0,0,0,0.06)",
-  },
-
-  completedRow: {
-    flexDirection: "row",
-    justifyContent: "flex-end",
-    marginTop: 10,
-    marginBottom: 12,
-  },
-  muted: { opacity: 0.7 },
-
-  memberMetaRow: { marginBottom: 10 },
-
-  memberCluster: { flexDirection: "row", alignItems: "center", gap: 6 },
-  avatarStack: { flexDirection: "row", alignItems: "center" },
-  avatar: {
-    borderWidth: 2,
-    borderColor: "white",
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "#E5E7EB",
-    overflow: "hidden",
-  },
-  avatarText: { fontSize: 11, fontWeight: "800", color: "#111827" },
-  morePill: {
-    height: 26,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    backgroundColor: "#EEF2FF",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  morePillText: { fontSize: 11, fontWeight: "800", color: "#3730A3" },
-
-  quickRow: { flexDirection: "row", gap: 10 },
-  quickBtn: { flex: 1, borderRadius: 12 },
-  moneyActionsRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginTop: 4,
-  },
   typeToggleRow: { flexDirection: "row", gap: 8 },
 
   emptyContainer: { flexGrow: 1, justifyContent: "center" },
@@ -1492,7 +1242,6 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     paddingVertical: 10,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "rgba(0,0,0,0.08)",
     gap: 10,
   },
 });
