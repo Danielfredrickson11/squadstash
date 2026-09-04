@@ -1,0 +1,4 @@
+functions/**/*.ts text eol=lf
+functions/**/*.js text eol=lf
+functions/*.json text eol=lf
+functions/**/*.json text eol=lf
