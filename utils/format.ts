@@ -1,6 +1,36 @@
 export const formatCurrency = (n: number) =>
   new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" }).format(n);
 
+// Duck-typed rather than importing Firestore's Timestamp type - keeps this
+// file dependency-free (matching its existing zero-import convention) and
+// testable with plain Dates, while still accepting a real Firestore
+// Timestamp as-is (Milestone 2A's PersistedTimestamp), since both expose
+// toDate().
+type TimestampLike = Date | { toDate: () => Date };
+
+// Formats a savingsTransactions timestamp (occurredAt or createdAt) for
+// display (Milestone 3 Checkpoint 3C) - never renders a raw Firestore
+// Timestamp object, and never throws on a missing/malformed value; an
+// absent, non-Date-like, or invalid value deterministically falls back to
+// "Unknown date" rather than producing "Invalid Date" or crashing the
+// transaction row that called this.
+export function formatTransactionTimestamp(
+  value: TimestampLike | null | undefined
+): string {
+  if (!value) return "Unknown date";
+
+  const date = value instanceof Date ? value : value.toDate();
+  if (Number.isNaN(date.getTime())) return "Unknown date";
+
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 // Deterministic dollars-string -> integer minor-units parser for the
 // app's two-decimal money inputs. Avoids floating-point arithmetic (e.g.
 // Math.round(Number(input) * 100), which can misround values like 1.005

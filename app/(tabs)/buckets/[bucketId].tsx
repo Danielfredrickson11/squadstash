@@ -1,15 +1,25 @@
 // Dedicated Personal Savings Bucket detail screen (Milestone 3
-// Checkpoint 3B). Establishes the detail-screen architecture only -
-// transaction history (3C), consolidated money actions (3D), and the
-// cohesive visual-polish pass (3F) are deliberately out of scope here.
+// Checkpoint 3B, transaction history added in Checkpoint 3C).
+// Consolidated money actions (3D) and the cohesive visual-polish pass
+// (3F) remain deliberately out of scope here.
 //
-// Live data strategy: reuses subscribeToUserBuckets - the exact same
-// trusted, Rules-authorized live query the Bucket list already uses -
-// rather than introducing a new single-Bucket read/subscription
+// Bucket live data strategy: reuses subscribeToUserBuckets - the exact
+// same trusted, Rules-authorized live query the Bucket list already
+// uses - rather than introducing a new single-Bucket read/subscription
 // service. Filtering the live list client-side for this bucketId means
 // balance/target updates, membership changes, and deletion are all
 // reflected automatically (the bucket simply updates or disappears from
 // the array), with no new Firestore query surface to reason about.
+//
+// Transaction history strategy: reuses
+// subscribeToSavingsTransactionsForResource (src/services/firebase/
+// savingsTransactions.ts) - the existing trusted, resource-scoped,
+// createdAt-descending live query - as its own independent subscription
+// keyed only on the route's bucketId (not the mutable Bucket object), so
+// it neither depends on nor re-subscribes with every Bucket balance
+// update. savingsTransactions remains the sole financial source of
+// truth; nothing here derives history from Bucket.balance or
+// ledgerOpeningBalanceMinor.
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import React, { useEffect, useMemo, useState } from "react";
@@ -22,9 +32,11 @@ import {
 } from "react-native";
 import { Button, ProgressBar, Text, useTheme } from "react-native-paper";
 
+import { TransactionRow } from "../../../components/buckets/TransactionRow";
 import { useAuth } from "../../../src/contexts/AuthContext";
 import { subscribeToUserBuckets } from "../../../src/services/firebase/buckets";
-import type { Bucket } from "../../../src/types/domain";
+import { subscribeToSavingsTransactionsForResource } from "../../../src/services/firebase/savingsTransactions";
+import type { Bucket, SavingsTransaction } from "../../../src/types/domain";
 import { formatCurrency } from "../../../utils/format";
 
 const DEFAULT_ACCENT = "#2563EB";
@@ -75,6 +87,40 @@ export default function BucketDetailScreen() {
     return () => unsub();
   }, [loading, userUid]);
 
+  const [transactions, setTransactions] = useState<SavingsTransaction[]>([]);
+  // Same ready/error distinction as the Bucket subscription above,
+  // scoped to the history section only - a transient history read
+  // failure must never be presented as "no activity yet" (see the
+  // render branches below).
+  const [transactionsReady, setTransactionsReady] = useState(false);
+  const [transactionsError, setTransactionsError] = useState(false);
+
+  useEffect(() => {
+    if (loading) return;
+    if (!userUid) return;
+    if (!bucketId) return;
+
+    setTransactionsReady(false);
+    setTransactionsError(false);
+
+    const unsub = subscribeToSavingsTransactionsForResource(
+      "bucket",
+      bucketId,
+      (next) => {
+        setTransactions(next);
+        setTransactionsReady(true);
+        setTransactionsError(false);
+      },
+      (err) => {
+        console.error("Bucket transaction history snapshot error:", err);
+        setTransactionsReady(true);
+        setTransactionsError(true);
+      }
+    );
+
+    return () => unsub();
+  }, [loading, userUid, bucketId]);
+
   const bucket = useMemo(
     () => buckets.find((b) => b.id === bucketId) ?? null,
     [buckets, bucketId]
@@ -82,12 +128,15 @@ export default function BucketDetailScreen() {
 
   const isOwner = !!user?.uid && !!bucket?.ownerId && user.uid === bucket.ownerId;
 
+  // Deterministic by design (Checkpoint 3C navigation review fix): the
+  // visible Back/Go to Buckets control must always land on the Bucket
+  // list, never on whatever happens to be previously in history (e.g.
+  // another Bucket's detail screen, or an unrelated prior route) - see
+  // the audit note in this file's header. This only affects this
+  // explicit control; hardware/browser back and swipe-back gestures are
+  // untouched and keep their normal history-based behavior.
   const goBackToBuckets = () => {
-    if (router.canGoBack()) {
-      router.back();
-    } else {
-      router.replace("/(tabs)/buckets");
-    }
+    router.replace("/(tabs)/buckets");
   };
 
   if (loading || !user || (!bucketsReady && !bucket)) {
@@ -239,6 +288,50 @@ export default function BucketDetailScreen() {
             </View>
           </View>
 
+          {/* Activity / Savings History - reads savingsTransactions
+              only; never fabricates a row from Bucket.balance or
+              ledgerOpeningBalanceMinor (see the file header comment). */}
+          <View
+            style={[
+              styles.card,
+              { backgroundColor: theme.colors.surface, borderColor: theme.colors.outlineVariant },
+            ]}
+          >
+            <Text style={[styles.cardLabel, { color: theme.colors.onSurfaceVariant }]}>
+              Activity
+            </Text>
+
+            {!transactionsReady ? (
+              <View style={styles.historyLoading}>
+                <ActivityIndicator />
+              </View>
+            ) : transactionsError ? (
+              <View style={styles.historyMessage}>
+                <Text style={{ color: theme.colors.onSurface }}>
+                  We couldn’t load this bucket’s activity right now.
+                </Text>
+                <Text
+                  style={[styles.historyMessageSub, { color: theme.colors.onSurfaceVariant }]}
+                >
+                  Please try again later.
+                </Text>
+              </View>
+            ) : transactions.length === 0 ? (
+              <View style={styles.historyMessage}>
+                <Text style={{ color: theme.colors.onSurface }}>No savings activity yet.</Text>
+                <Text
+                  style={[styles.historyMessageSub, { color: theme.colors.onSurfaceVariant }]}
+                >
+                  Contributions and withdrawals will appear here.
+                </Text>
+              </View>
+            ) : (
+              transactions.map((transaction) => (
+                <TransactionRow key={transaction.id} transaction={transaction} />
+              ))
+            )}
+          </View>
+
           {/* C. Supporting context */}
           <View
             style={[
@@ -355,6 +448,18 @@ const styles = StyleSheet.create({
     marginTop: 12,
   },
   summaryText: { fontSize: 13, fontWeight: "700" },
+
+  historyLoading: {
+    paddingVertical: 20,
+    alignItems: "center",
+  },
+  historyMessage: {
+    paddingVertical: 12,
+  },
+  historyMessageSub: {
+    fontSize: 13,
+    marginTop: 4,
+  },
 
   contextValue: { fontSize: 18, fontWeight: "800", marginBottom: 4 },
   contextSub: { fontSize: 13 },

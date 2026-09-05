@@ -1,5 +1,5 @@
 import FontAwesome from "@expo/vector-icons/FontAwesome";
-import { Redirect, Tabs } from "expo-router";
+import { Redirect, Tabs, usePathname, useRouter } from "expo-router";
 import React from "react";
 import { ActivityIndicator, Platform, View } from "react-native";
 import { useTheme } from "react-native-paper";
@@ -17,6 +17,13 @@ function TabBarIcon(props: {
 export default function TabLayout() {
   const { user, loading } = useAuth();
   const theme = useTheme();
+  const router = useRouter();
+  // usePathname() already strips route groups like "(tabs)" (Expo
+  // Router's own normalization), so the Bucket list itself is exactly
+  // "/buckets" and any nested detail route is "/buckets/<bucketId>" -
+  // checked by prefix below so no bucketId is ever hardcoded.
+  const pathname = usePathname();
+  const isOnBucketDetail = pathname.startsWith("/buckets/");
 
   const headerShown = useClientOnlyValue(false, true);
 
@@ -91,6 +98,24 @@ export default function TabLayout() {
             <TabBarIcon name="pie-chart" color={color} />
           ),
         }}
+        // Checkpoint 3C navigation review fix, scoped to Buckets only:
+        // the nested buckets/_layout.tsx Stack can leave a Bucket detail
+        // screen on top of its own history, and a bare tab press doesn't
+        // reliably reset that nested stack on every platform/Expo Router
+        // version. Only intercept when Buckets is already the focused
+        // tab AND the current route is a nested detail route
+        // ("/buckets/<bucketId>") - already being on the Bucket list
+        // itself ("/buckets") must keep completely normal tab behavior,
+        // and pressing the tab from a DIFFERENT tab is unaffected either
+        // way (isFocused() is false there).
+        listeners={({ navigation }) => ({
+          tabPress: (e) => {
+            if (navigation.isFocused() && isOnBucketDetail) {
+              e.preventDefault();
+              router.replace("/(tabs)/buckets");
+            }
+          },
+        })}
       />
 
       {/* Hide the nested Bucket detail route from the tab bar */}

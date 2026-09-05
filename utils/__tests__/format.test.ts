@@ -1,4 +1,4 @@
-import { formatCurrency, parseDollarsToMinorUnits } from '../format';
+import { formatCurrency, formatTransactionTimestamp, parseDollarsToMinorUnits } from '../format';
 
 // These assertions assume the runtime's default Intl locale resolves to
 // en-US, which is true for this repository's local/dev/CI environments.
@@ -113,5 +113,33 @@ describe('parseDollarsToMinorUnits', () => {
     it('still rejects more than two decimal places', () => {
       expect(parseDollarsToMinorUnits('12.345', { allowZero: true })).toBeNull();
     });
+  });
+});
+
+describe('formatTransactionTimestamp', () => {
+  it('returns "Unknown date" for undefined', () => {
+    expect(formatTransactionTimestamp(undefined)).toBe('Unknown date');
+  });
+
+  it('returns "Unknown date" for null', () => {
+    expect(formatTransactionTimestamp(null)).toBe('Unknown date');
+  });
+
+  it('returns "Unknown date" for an invalid Date', () => {
+    expect(formatTransactionTimestamp(new Date('not-a-date'))).toBe('Unknown date');
+  });
+
+  it('formats a valid Date into a non-empty, human-readable string', () => {
+    const result = formatTransactionTimestamp(new Date('2024-03-15T14:30:00'));
+    expect(result).not.toBe('Unknown date');
+    expect(result).toContain('2024');
+    expect(result).toContain('Mar');
+  });
+
+  it('accepts a Firestore-Timestamp-like value via toDate()', () => {
+    const timestampLike = { toDate: () => new Date('2024-03-15T14:30:00') };
+    const result = formatTransactionTimestamp(timestampLike);
+    expect(result).not.toBe('Unknown date');
+    expect(result).toContain('2024');
   });
 });
