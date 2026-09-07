@@ -32,8 +32,11 @@ import {
 } from "react-native";
 import { Button, ProgressBar, Text, useTheme } from "react-native-paper";
 
+import { GoalReachedBadge } from "../../../components/buckets/GoalReachedBadge";
 import { TransactionRow } from "../../../components/buckets/TransactionRow";
 import { useAuth } from "../../../src/contexts/AuthContext";
+import { clampProgress, isGoalReached, remainingToGoal } from "../../../src/domain/savingsGoal";
+import { useSavingsMoneyAction } from "../../../src/hooks/useSavingsMoneyAction";
 import { subscribeToUserBuckets } from "../../../src/services/firebase/buckets";
 import { subscribeToSavingsTransactionsForResource } from "../../../src/services/firebase/savingsTransactions";
 import type { Bucket, SavingsTransaction } from "../../../src/types/domain";
@@ -47,6 +50,12 @@ export default function BucketDetailScreen() {
   const { bucketId } = useLocalSearchParams<{ bucketId: string }>();
   const { user, loading } = useAuth();
   const theme = useTheme();
+  // The same shared Personal Savings money-action controller the Bucket
+  // list uses (Milestone 3 Checkpoint 3D) - see
+  // src/hooks/useSavingsMoneyAction.tsx. Opening it here launches the
+  // identical sheet/mutation, with the same idempotency/serialization
+  // state, as opening it from the list.
+  const { open: openMoneyAction } = useSavingsMoneyAction();
 
   const [buckets, setBuckets] = useState<Bucket[]>([]);
   // Distinguishes "still loading the first snapshot" from "loaded, and
@@ -213,8 +222,9 @@ export default function BucketDetailScreen() {
 
   const accent = bucket.color ?? DEFAULT_ACCENT;
   const displayName = bucket.name?.trim() ? bucket.name.trim() : "Untitled";
-  const pct = bucket.target > 0 ? Math.max(0, Math.min(bucket.balance / bucket.target, 1)) : 0;
-  const remaining = Math.max(bucket.target - bucket.balance, 0);
+  const pct = clampProgress(bucket.balance, bucket.target);
+  const remaining = remainingToGoal(bucket.balance, bucket.target);
+  const goalReached = isGoalReached(bucket.balance, bucket.target);
   const memberCount = bucket.memberIds?.length ?? 0;
 
   return (
@@ -272,19 +282,64 @@ export default function BucketDetailScreen() {
               </Text>
             </View>
 
-            <ProgressBar
-              progress={pct}
-              style={[styles.progress, { backgroundColor: theme.colors.surfaceVariant }]}
-              color={accent}
-            />
+            {/* Wrapped in a plain View so Paper's third-party ProgressBar
+                participates in this card's layout through a normal RN
+                View boundary before the sibling rows that follow it
+                (Checkpoint 3D progress containment fix). */}
+            <View style={styles.progressContainer}>
+              <ProgressBar
+                progress={pct}
+                style={[styles.progress, { backgroundColor: theme.colors.surfaceVariant }]}
+                color={accent}
+              />
+            </View>
 
-            <View style={styles.summaryRow}>
-              <Text style={[styles.summaryText, { color: theme.colors.onSurfaceVariant }]}>
-                {Math.round(pct * 100)}% complete
-              </Text>
-              <Text style={[styles.summaryText, { color: theme.colors.onSurfaceVariant }]}>
-                {formatCurrency(remaining)} remaining
-              </Text>
+            {/* Checkpoint 3D detail footer fix: one concrete normal-flow
+                child holding the status/remaining and action rows, so
+                the financial card's own natural height is derived from
+                a single, direct child rather than several loose
+                siblings after the progress bar. */}
+            <View style={styles.financialFooter}>
+              <View style={styles.summaryRow}>
+                {goalReached ? (
+                  <GoalReachedBadge />
+                ) : (
+                  <Text
+                    style={[styles.summaryText, { color: theme.colors.onSurfaceVariant }]}
+                    numberOfLines={1}
+                  >
+                    {Math.round(pct * 100)}% complete
+                  </Text>
+                )}
+                <Text
+                  style={[styles.summaryText, styles.remainingText, { color: theme.colors.onSurfaceVariant }]}
+                  numberOfLines={1}
+                >
+                  {formatCurrency(remaining)} remaining
+                </Text>
+              </View>
+
+              {/* Both buttons open the single shared money-action sheet
+                  (Milestone 3 Checkpoint 3D) pre-set to the corresponding
+                  type - the trusted mutation itself lives entirely in
+                  useSavingsMoneyAction(), identical to the Bucket list's
+                  entry points. */}
+              <View style={styles.actionsRow}>
+                <Button
+                  mode="contained-tonal"
+                  onPress={() => openMoneyAction(bucket, "contribution")}
+                  style={styles.actionBtn}
+                >
+                  Add Money
+                </Button>
+                <Button
+                  mode="outlined"
+                  onPress={() => openMoneyAction(bucket, "withdrawal")}
+                  style={styles.actionBtn}
+                >
+                  Withdraw
+                </Button>
+              </View>
             </View>
           </View>
 
@@ -442,12 +497,42 @@ const styles = StyleSheet.create({
 
   progress: { height: 10, borderRadius: 10 },
 
+  // Checkpoint 3D progress containment fix: wraps Paper's ProgressBar in
+  // a plain RN View boundary. Content-driven only - no fixed height.
+  progressContainer: {
+    width: "100%",
+  },
+
+  // Checkpoint 3D detail footer fix: single normal-flow wrapper for the
+  // status/remaining and action rows, owning the vertical spacing below
+  // the progress bar so the two rows inside it don't each need their own
+  // marginTop.
+  financialFooter: {
+    width: "100%",
+    marginTop: 12,
+    gap: 16,
+  },
+
   summaryRow: {
     flexDirection: "row",
     justifyContent: "space-between",
-    marginTop: 12,
+    alignItems: "center",
+    gap: 8,
   },
   summaryText: { fontSize: 13, fontWeight: "700" },
+  // Allows the remaining-amount text to shrink and truncate rather than
+  // force the row wider than the card (Checkpoint 3D goal-layout review)
+  // - a defensive safeguard for long currency strings.
+  remainingText: {
+    flexShrink: 1,
+    textAlign: "right",
+  },
+
+  actionsRow: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  actionBtn: { flex: 1, borderRadius: 12 },
 
   historyLoading: {
     paddingVertical: 20,

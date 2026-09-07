@@ -152,6 +152,15 @@ export function generateSavingsClientRequestId(): string {
   return doc(collection(db, "savingsTransactions")).id;
 }
 
+// Mirrors MAX_NOTE_LENGTH in
+// functions/src/callables/recordSavingsTransaction.ts exactly (Milestone
+// 3 Checkpoint 3D). The two files are compiled as separate TypeScript
+// projects (client vs. Functions) with no shared import path, so this
+// constant must be kept manually in sync with the backend's - the
+// backend remains the authoritative enforcement point regardless; this
+// only lets the client validate/limit input before ever sending it.
+export const MAX_TRANSACTION_NOTE_LENGTH = 500;
+
 // Deliberately narrower than CreateSavingsTransactionInput: recordedBy,
 // createdAt and reversalOf are trusted/backend-managed values the
 // recordSavingsTransaction Cloud Function itself resolves (recordedBy

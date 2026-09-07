@@ -22,6 +22,7 @@ import {
 import { AvatarCircle, initialsFromName, shortUid } from "../../../components/buckets/AvatarCircle";
 import { BucketCard } from "../../../components/buckets/BucketCard";
 import { useAuth } from "../../../src/contexts/AuthContext";
+import { useSavingsMoneyAction } from "../../../src/hooks/useSavingsMoneyAction";
 import {
   addBucketMember,
   createBucket,
@@ -33,12 +34,8 @@ import {
 } from "../../../src/services/firebase/buckets";
 import type { UpdateBucketInput } from "../../../src/services/firebase/buckets";
 import { lookupUserByEmail } from "../../../src/services/firebase/functions";
-import {
-  generateSavingsClientRequestId,
-  recordSavingsTransaction,
-} from "../../../src/services/firebase/savingsTransactions";
 import { subscribeToPublicUsersByIds } from "../../../src/services/firebase/users";
-import type { Bucket, PublicProfile, SavingsTransactionType } from "../../../src/types/domain";
+import type { Bucket, PublicProfile } from "../../../src/types/domain";
 import { formatCurrency, parseDollarsToMinorUnits } from "../../../utils/format";
 
 const COLORS = [
@@ -51,6 +48,11 @@ const COLORS = [
   "#EC4899",
   "#0EA5E9",
 ];
+
+// Matches styles.container's own padding below - used by the cardWidth
+// calculation (Checkpoint 3D goal-layout fix) so per-card widths are
+// computed against the actual available content width.
+const CONTENT_PADDING = 16;
 
 function isValidInviteEmail(email: string) {
   const e = email.trim().toLowerCase();
@@ -73,64 +75,6 @@ function permissionAwareErrorMessage(e: unknown): string {
   return isPermissionDeniedError(e)
     ? "You do not have permission to change one or more of these bucket fields."
     : "We could not save your changes. Please try again.";
-}
-
-// Never surfaces raw HttpsError/FirebaseError technical text - maps the
-// httpsCallable client SDK's "functions/<code>" error codes (see
-// functions/src/callables/recordSavingsTransaction.ts for the exact
-// codes this callable can throw) to plain user-facing copy.
-function savingsErrorMessage(e: unknown): string {
-  const code = (e as { code?: string } | null | undefined)?.code;
-  switch (code) {
-    case "functions/failed-precondition":
-      return "That amount isn't allowed right now - it may take the balance below zero, or the bucket's ledger needs attention. Please check the amount and try again.";
-    case "functions/permission-denied":
-      return "You do not have permission to record this transaction.";
-    case "functions/already-exists":
-      return "That request could not be completed. Please try again.";
-    default:
-      return "We couldn't record that. Please try again.";
-  }
-}
-
-// One in-flight/retryable savings write, keyed by the facts that make it
-// a single logical request (not just its clientRequestId, since the id
-// itself is only meaningful in relation to what it was generated for).
-// A retry of the exact same facts must reuse the same id; any different
-// facts are a new logical request and need a new one (see
-// resolveClientRequestId).
-type PendingSavingsRequest = {
-  clientRequestId: string;
-  resourceId: string;
-  memberUid: string;
-  type: SavingsTransactionType;
-  amountMinor: number;
-};
-
-// Returns the clientRequestId to use for this submission: reuses the
-// previous attempt's id if the retained pending request has the exact
-// same logical facts (a retry of a failed submit), otherwise generates a
-// fresh id and replaces the pending record (a genuinely new submission).
-// Does not itself clear the ref on success/cancel - callers own that, so
-// this stays a pure "resolve what id to send" step.
-function resolveClientRequestId(
-  pendingRef: React.MutableRefObject<PendingSavingsRequest | null>,
-  facts: Omit<PendingSavingsRequest, "clientRequestId">
-): string {
-  const pending = pendingRef.current;
-  if (
-    pending &&
-    pending.resourceId === facts.resourceId &&
-    pending.memberUid === facts.memberUid &&
-    pending.type === facts.type &&
-    pending.amountMinor === facts.amountMinor
-  ) {
-    return pending.clientRequestId;
-  }
-
-  const clientRequestId = generateSavingsClientRequestId();
-  pendingRef.current = { ...facts, clientRequestId };
-  return clientRequestId;
 }
 
 // Never surfaces raw HttpsError/FirebaseError technical text - maps the
@@ -228,6 +172,22 @@ export default function BucketsScreen() {
     return 1;
   }, [width]);
 
+  // Explicit per-card pixel width (Checkpoint 3D goal-layout fix),
+  // mirroring app/(tabs)/trips/index.tsx's proven cardWidth pattern
+  // exactly - replaces the previous flex:1 card sizing, which is only
+  // well-defined for equal-width sharing inside a bounded
+  // columnWrapperStyle row (numColumns > 1). When numColumns is 1,
+  // FlatList renders each card as a direct item in its own vertically
+  // scrolling (effectively unbounded-height) list, where flex-grow has
+  // no natural-content meaning - a known React Native list-item
+  // anti-pattern. CONTENT_PADDING/CARD_GAP mirror this screen's own
+  // container padding (16) and row gap (GAP, below).
+  const cardWidth = useMemo(() => {
+    const available = width - CONTENT_PADDING * 2;
+    const totalGaps = GAP * (numColumns - 1);
+    return Math.floor((available - totalGaps) / numColumns);
+  }, [width, numColumns]);
+
   const [buckets, setBuckets] = useState<Bucket[]>([]);
   const [publicUsers, setPublicUsers] = useState<Record<string, PublicProfile>>({});
 
@@ -257,39 +217,15 @@ export default function BucketsScreen() {
   // loading/disabled UI.
   const createInFlightRef = useRef(false);
 
-  // Identifies which bucket's quick-add is visibly loading (its button
-  // shows the spinner) and always resets to null on success/failure.
-  // While ANY quick-add is in flight (quickAddSubmittingId !== null),
-  // money-action controls are disabled across every bucket card, not just
-  // the submitting one - quickAddSubmittingId alone is only the visible
-  // loading/disabled state; quickAddInFlightRef (below) is what actually
-  // prevents a second quickAdd() from starting concurrently.
-  const [quickAddSubmittingId, setQuickAddSubmittingId] = useState<string | null>(null);
-  // Retains the clientRequestId (plus the logical request facts it was
-  // generated for) across a failed quick-add attempt, so a retry of the
-  // exact same tap reuses the same idempotency key instead of creating a
-  // second logical transaction. A ref, not state, since it must not
-  // trigger a re-render and must survive across a submit/retry cycle.
-  const quickAddPendingRef = useRef<PendingSavingsRequest | null>(null);
-  // Synchronous serialization guard: a second quickAdd() call (on any
-  // bucket) that starts before React has re-rendered quickAddSubmittingId
-  // would otherwise race past the state-based disabled checks below and
-  // overwrite the single shared quickAddPendingRef mid-flight. A plain
-  // ref (checked/set synchronously, before any await) closes that gap;
-  // quickAddSubmittingId remains solely responsible for the visible
-  // loading/disabled UI.
-  const quickAddInFlightRef = useRef(false);
-
-  // Contribute/Withdraw custom-amount dialog
-  const [moneyDialogVisible, setMoneyDialogVisible] = useState(false);
-  const [moneyDialogBucket, setMoneyDialogBucket] = useState<Bucket | null>(null);
-  const [moneyDialogType, setMoneyDialogType] = useState<SavingsTransactionType>("contribution");
-  const [moneyDialogAmount, setMoneyDialogAmount] = useState("");
-  const [moneyDialogError, setMoneyDialogError] = useState<string | null>(null);
-  const [moneyDialogSubmitting, setMoneyDialogSubmitting] = useState(false);
-  // Same idempotency-retry role as quickAddPendingRef, scoped to the
-  // custom dialog's own submissions.
-  const customPendingRef = useRef<PendingSavingsRequest | null>(null);
+  // The shared Personal Savings money-action controller (Milestone 3
+  // Checkpoint 3D) - see src/hooks/useSavingsMoneyAction.tsx for why this
+  // is a single Context-based controller rather than per-screen state:
+  // this screen and the Bucket detail screen both open the SAME
+  // underlying sheet/mutation, with one idempotency/serialization owner
+  // between them. Replaces the pre-3D quickAddSubmittingId/
+  // quickAddPendingRef/quickAddInFlightRef and the entire moneyDialog*
+  // state block that used to live here.
+  const { open: openMoneyAction } = useSavingsMoneyAction();
 
   // Edit/Delete state
   const [menuAnchor, setMenuAnchor] = useState<string | null>(null);
@@ -584,119 +520,6 @@ export default function BucketsScreen() {
     }
   };
 
-  // amountMinor is a hardcoded integer minor-unit amount (5000 = $50.00,
-  // 10000 = $100.00) - never computed via bucket.balance + amount, and
-  // never floating-point dollar arithmetic. The trusted
-  // recordSavingsTransaction Cloud Function is the only thing that
-  // updates ledgerBalanceMinor and the Bucket.balance compatibility
-  // cache; this only records the transaction and lets the existing
-  // subscribeToUserBuckets listener pick up the resulting balance.
-  const quickAdd = async (bucket: Bucket, amountMinor: number) => {
-    if (!user) return;
-    // Serializes quick-add operations across ALL buckets, checked/set
-    // synchronously before any await so a second tap (on this bucket or
-    // another) cannot start while quickAddPendingRef still belongs to an
-    // unresolved request. See buttons' disabled props below for the
-    // matching visible state (quickAddSubmittingId !== null).
-    if (quickAddInFlightRef.current) return;
-    quickAddInFlightRef.current = true;
-
-    const facts = {
-      resourceId: bucket.id,
-      memberUid: user.uid,
-      type: "contribution" as SavingsTransactionType,
-      amountMinor,
-    };
-    const clientRequestId = resolveClientRequestId(quickAddPendingRef, facts);
-
-    setQuickAddSubmittingId(bucket.id);
-    try {
-      await recordSavingsTransaction({
-        resourceType: "bucket",
-        resourceId: bucket.id,
-        memberUid: user.uid,
-        type: "contribution",
-        amountMinor,
-        currency: bucket.currency ?? "USD",
-        clientRequestId,
-      });
-      // Success clears the pending record - a later quick-add is a new
-      // logical request and must get a new id.
-      quickAddPendingRef.current = null;
-    } catch (e) {
-      console.error("Failed to quick add:", e);
-      // Deliberately NOT cleared here - retrying this exact tap should
-      // reuse the same clientRequestId (see resolveClientRequestId).
-      notifyError("Couldn't record contribution", savingsErrorMessage(e));
-    } finally {
-      setQuickAddSubmittingId(null);
-      quickAddInFlightRef.current = false;
-    }
-  };
-
-  const openMoneyDialog = (bucket: Bucket, type: SavingsTransactionType) => {
-    setMoneyDialogBucket(bucket);
-    setMoneyDialogType(type);
-    setMoneyDialogAmount("");
-    setMoneyDialogError(null);
-    setMoneyDialogVisible(true);
-  };
-
-  // Used for both a genuine cancel and a successful submit - either way
-  // this dialog session is over, so the retained pending record (if any)
-  // is cleared: a deliberate abandon should not force a later, unrelated
-  // submission to reuse a stale id, and a success has nothing left to
-  // retry.
-  const closeMoneyDialog = () => {
-    setMoneyDialogVisible(false);
-    setMoneyDialogBucket(null);
-    setMoneyDialogAmount("");
-    setMoneyDialogError(null);
-    customPendingRef.current = null;
-  };
-
-  const onSubmitMoneyDialog = async () => {
-    if (!user || !moneyDialogBucket) return;
-
-    const amountMinor = parseDollarsToMinorUnits(moneyDialogAmount);
-    if (amountMinor === null) {
-      setMoneyDialogError(
-        "Enter a valid amount greater than 0, with at most 2 decimal places."
-      );
-      return;
-    }
-
-    const facts = {
-      resourceId: moneyDialogBucket.id,
-      memberUid: user.uid,
-      type: moneyDialogType,
-      amountMinor,
-    };
-    const clientRequestId = resolveClientRequestId(customPendingRef, facts);
-
-    setMoneyDialogSubmitting(true);
-    setMoneyDialogError(null);
-    try {
-      await recordSavingsTransaction({
-        resourceType: "bucket",
-        resourceId: moneyDialogBucket.id,
-        memberUid: user.uid,
-        type: moneyDialogType,
-        amountMinor,
-        currency: moneyDialogBucket.currency ?? "USD",
-        clientRequestId,
-      });
-      closeMoneyDialog();
-    } catch (e) {
-      console.error("Failed to record savings transaction:", e);
-      // Deliberately NOT cleared here - retrying reuses the same
-      // clientRequestId via resolveClientRequestId.
-      setMoneyDialogError(savingsErrorMessage(e));
-    } finally {
-      setMoneyDialogSubmitting(false);
-    }
-  };
-
   const openMembers = (b: Bucket) => {
     setMembersBucket(b);
     setInviteEmail("");
@@ -849,7 +672,7 @@ export default function BucketsScreen() {
         bucket={item}
         isOwner={isBucketOwner(item)}
         isMenuOpen={menuAnchor === item.id}
-        quickAddSubmittingId={quickAddSubmittingId}
+        cardWidth={cardWidth}
         avatarForUid={avatarForUid}
         onOpenBucket={openBucketDetail}
         onOpenMembers={openMembers}
@@ -857,8 +680,7 @@ export default function BucketsScreen() {
         onCloseMenu={closeMenu}
         onEdit={startEdit}
         onDelete={startDelete}
-        onQuickAdd={quickAdd}
-        onOpenMoneyDialog={openMoneyDialog}
+        onOpenMoneyAction={openMoneyAction}
       />
     );
   };
@@ -1134,71 +956,9 @@ export default function BucketsScreen() {
         </Dialog>
       </Portal>
 
-      {/* Contribute / Withdraw Dialog */}
-      <Portal>
-        <Dialog visible={moneyDialogVisible} onDismiss={closeMoneyDialog}>
-          <Dialog.Title>
-            {moneyDialogType === "contribution" ? "Add Money" : "Withdraw Money"}
-          </Dialog.Title>
-          <Dialog.Content>
-            <Text style={{ marginBottom: 12, opacity: 0.7 }}>
-              Bucket:{" "}
-              <Text style={{ fontWeight: "800" }}>
-                {moneyDialogBucket?.name || "Untitled"}
-              </Text>
-            </Text>
-
-            <View style={styles.typeToggleRow}>
-              <Chip
-                selected={moneyDialogType === "contribution"}
-                onPress={() => {
-                  setMoneyDialogType("contribution");
-                  if (moneyDialogError) setMoneyDialogError(null);
-                }}
-              >
-                Contribution
-              </Chip>
-              <Chip
-                selected={moneyDialogType === "withdrawal"}
-                onPress={() => {
-                  setMoneyDialogType("withdrawal");
-                  if (moneyDialogError) setMoneyDialogError(null);
-                }}
-              >
-                Withdrawal
-              </Chip>
-            </View>
-
-            <TextInput
-              label="Amount"
-              value={moneyDialogAmount}
-              onChangeText={(v) => {
-                setMoneyDialogAmount(v);
-                if (moneyDialogError) setMoneyDialogError(null);
-              }}
-              keyboardType="numeric"
-              style={{ marginTop: 12, marginBottom: 8 }}
-            />
-
-            {moneyDialogError ? (
-              <Text style={{ color: theme.colors.error, marginBottom: 8 }}>{moneyDialogError}</Text>
-            ) : null}
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button onPress={closeMoneyDialog} disabled={moneyDialogSubmitting}>
-              Cancel
-            </Button>
-            <Button
-              mode="contained"
-              onPress={onSubmitMoneyDialog}
-              loading={moneyDialogSubmitting}
-              disabled={moneyDialogSubmitting}
-            >
-              {moneyDialogType === "contribution" ? "Add" : "Withdraw"}
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-      </Portal>
+      {/* The single shared money-action sheet (Milestone 3 Checkpoint
+          3D) is rendered once in app/(tabs)/buckets/_layout.tsx
+          (MoneyActionSheet), not per-screen - see openMoneyAction above. */}
 
       {/* Delete Confirm */}
       <Portal>
@@ -1241,8 +1001,6 @@ const styles = StyleSheet.create({
   row: { gap: GAP, marginBottom: GAP },
 
   muted: {},
-
-  typeToggleRow: { flexDirection: "row", gap: 8 },
 
   emptyContainer: { flexGrow: 1, justifyContent: "center" },
 
