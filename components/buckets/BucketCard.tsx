@@ -253,6 +253,7 @@ export function BucketCard({
             compact
             onPress={() => onOpenMoneyAction(bucket, "contribution")}
             style={styles.moneyBtn}
+            accessibilityLabel={`Add money to ${displayName}`}
           >
             Add Money
           </Button>
@@ -261,6 +262,7 @@ export function BucketCard({
             compact
             onPress={() => onOpenMoneyAction(bucket, "withdrawal")}
             style={styles.moneyBtn}
+            accessibilityLabel={`Withdraw from ${displayName}`}
           >
             Withdraw
           </Button>

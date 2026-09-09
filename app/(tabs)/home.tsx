@@ -1,17 +1,28 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { router } from "expo-router";
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { ScrollView, StyleSheet, View } from "react-native";
+import { ActivityIndicator, ScrollView, StyleSheet, View } from "react-native";
 import { Button, Card, Divider, ProgressBar, Text } from "react-native-paper";
+import { RecentActivityRow } from "../../components/home/RecentActivityRow";
 import { useAuth } from "../../src/contexts/AuthContext";
+import { mergeRecentSavingsTransactions } from "../../src/domain/recentSavingsActivity";
 import { subscribeToUserBuckets } from "../../src/services/firebase/buckets";
+import { subscribeToRecentSavingsTransactionsForResource } from "../../src/services/firebase/savingsTransactions";
+import type { SavingsTransaction } from "../../src/types/domain";
 import { formatCurrency } from "../../utils/format";
 
 type MiniBucket = {
+  id: string;
   name: string;
   balance: number;
   target: number;
 };
+
+// Home's Recent Activity shows only the newest few transactions across
+// all of the user's Personal Savings buckets (Milestone 3 Checkpoint
+// 3E) - never a bucket's full history, which remains Bucket Detail's
+// job via the separate, unbounded subscribeToSavingsTransactionsForResource.
+const RECENT_ACTIVITY_LIMIT = 5;
 
 function StatCard({
   label,
@@ -44,21 +55,34 @@ export default function HomeScreen() {
     user?.displayName || (user?.email ? user.email.split("@")[0] : "Guest");
 
   const [buckets, setBuckets] = useState<MiniBucket[]>([]);
+  // Distinguishes "haven't received the first subscribeToUserBuckets
+  // snapshot yet" from "received one, and it happens to be empty" - the
+  // Recent Activity readiness below (and this state's own honest loading
+  // treatment) depends on that distinction (Checkpoint 3E lifecycle fix).
+  const [bucketsReady, setBucketsReady] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const firstLoad = useRef(true);
 
   useEffect(() => {
+    // A user transition (sign-out/sign-in within the same session) must
+    // never leave the previous user's buckets or derived Recent Activity
+    // state visible while the new subscription spins up.
+    setBuckets([]);
+    setBucketsReady(false);
+
     if (!user) return;
 
     // ✅ shared buckets query (memberIds contains my uid)
     const unsub = subscribeToUserBuckets(user.uid, (next) => {
       const list: MiniBucket[] = next.map((b) => ({
+        id: b.id,
         name: String(b.name ?? "Untitled"),
         balance: b.balance,
         target: b.target,
       }));
 
       setBuckets(list);
+      setBucketsReady(true);
 
       // "Last updated" (skip first render)
       if (!firstLoad.current) setLastUpdated(new Date());
@@ -67,6 +91,81 @@ export default function HomeScreen() {
 
     return () => unsub();
   }, [user]);
+
+  // Stable bucket-id identity (Checkpoint 3E lifecycle fix): changes only
+  // when the actual set of bucket ids changes, not on every balance/name
+  // update subscribeToUserBuckets otherwise re-delivers. The Recent
+  // Activity listener effect below depends on this, not on `buckets`
+  // itself, so an Add Money/Withdraw balance change never tears down and
+  // rebuilds every per-bucket Recent Activity listener.
+  const bucketIdsKey = useMemo(
+    () => JSON.stringify(buckets.map((b) => b.id).sort()),
+    [buckets]
+  );
+  const bucketIds = useMemo<string[]>(() => JSON.parse(bucketIdsKey), [bucketIdsKey]);
+
+  // Bounded fan-out (Milestone 3 Checkpoint 3E): one
+  // subscribeToRecentSavingsTransactionsForResource(..., RECENT_ACTIVITY_LIMIT)
+  // listener per current bucket id, never the full-history subscription
+  // Bucket Detail uses.
+  const [recentByBucket, setRecentByBucket] = useState<Record<string, SavingsTransaction[]>>({});
+  const [recentReadyByBucket, setRecentReadyByBucket] = useState<Record<string, boolean>>({});
+  const [recentErrorByBucket, setRecentErrorByBucket] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    // Cleared unconditionally whenever bucketIds genuinely changes
+    // (membership, not balance) - a removed bucket's entry in any of
+    // these three maps can never survive past this point, even before
+    // its own subscription cleanup below runs.
+    setRecentByBucket({});
+    setRecentReadyByBucket({});
+    setRecentErrorByBucket({});
+
+    if (bucketIds.length === 0) return;
+
+    const unsubs = bucketIds.map((bucketId) =>
+      subscribeToRecentSavingsTransactionsForResource(
+        "bucket",
+        bucketId,
+        RECENT_ACTIVITY_LIMIT,
+        (transactions) => {
+          setRecentByBucket((prev) => ({ ...prev, [bucketId]: transactions }));
+          setRecentReadyByBucket((prev) => ({ ...prev, [bucketId]: true }));
+          setRecentErrorByBucket((prev) => ({ ...prev, [bucketId]: false }));
+        },
+        (err) => {
+          console.error("Home recent activity snapshot error:", err);
+          setRecentReadyByBucket((prev) => ({ ...prev, [bucketId]: true }));
+          setRecentErrorByBucket((prev) => ({ ...prev, [bucketId]: true }));
+        }
+      )
+    );
+
+    return () => unsubs.forEach((unsub) => unsub());
+  }, [bucketIds]);
+
+  const bucketNameById = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const b of buckets) map[b.id] = b.name;
+    return map;
+  }, [buckets]);
+
+  // Both derived from bucketIds only (never Object.values/keys of the
+  // per-bucket maps directly), so a stale key left behind by a future
+  // lifecycle bug still can't reach the UI (Checkpoint 3E lifecycle fix).
+  const recentActivityReady =
+    bucketsReady &&
+    (bucketIds.length === 0 || bucketIds.every((id) => recentReadyByBucket[id]));
+  const recentActivityHasError = bucketIds.some((id) => recentErrorByBucket[id]);
+
+  const recentActivity = useMemo(
+    () =>
+      mergeRecentSavingsTransactions(
+        bucketIds.map((id) => recentByBucket[id] ?? []),
+        RECENT_ACTIVITY_LIMIT
+      ),
+    [bucketIds, recentByBucket]
+  );
 
   const totals = useMemo(() => {
     const totalSaved = buckets.reduce(
@@ -168,14 +267,6 @@ export default function HomeScreen() {
             >
               Trips
             </Button>
-            <Button
-              mode="outlined"
-              icon="format-list-bulleted"
-              onPress={() => router.push("/(tabs)/transactions")}
-              style={styles.actionBtn}
-            >
-              Activity
-            </Button>
           </View>
         </Card.Content>
       </Card>
@@ -240,18 +331,35 @@ export default function HomeScreen() {
         </Card.Content>
       </Card>
 
-      {/* Recent activity placeholder */}
+      {/* Recent activity (Milestone 3 Checkpoint 3E): real
+          savingsTransactions data only, bounded to the newest 5 across
+          all current buckets - see mergeRecentSavingsTransactions and
+          subscribeToRecentSavingsTransactionsForResource. */}
       <Card style={styles.sectionCard}>
         <Card.Content>
           <View style={styles.sectionHeaderRow}>
             <Text style={styles.sectionTitle}>Recent Activity</Text>
-            <Button compact onPress={() => router.push("/(tabs)/transactions")}>
-              View
-            </Button>
           </View>
-          <Text style={styles.muted}>
-            Once we wire up transactions, you’ll see recent deposits + spending here.
-          </Text>
+
+          {!recentActivityReady ? (
+            <View style={styles.activityLoading}>
+              <ActivityIndicator />
+            </View>
+          ) : recentActivityHasError ? (
+            <Text style={styles.muted}>
+              We couldn’t load recent activity right now.
+            </Text>
+          ) : recentActivity.length === 0 ? (
+            <Text style={styles.muted}>No savings activity yet.</Text>
+          ) : (
+            recentActivity.map((transaction) => (
+              <RecentActivityRow
+                key={transaction.id}
+                transaction={transaction}
+                bucketName={bucketNameById[transaction.resourceId] ?? "Untitled"}
+              />
+            ))
+          )}
         </Card.Content>
       </Card>
 
@@ -333,4 +441,9 @@ const styles = StyleSheet.create({
   bucketName: { fontWeight: "800", fontSize: 16 },
   bucketSub: { opacity: 0.7, marginTop: 4 },
   bucketProgress: { height: 8, borderRadius: 8, marginTop: 10 },
+
+  activityLoading: {
+    paddingVertical: 16,
+    alignItems: "center",
+  },
 });

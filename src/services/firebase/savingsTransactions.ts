@@ -21,6 +21,7 @@ import {
   collection,
   doc,
   getDocs,
+  limit,
   onSnapshot,
   orderBy,
   query,
@@ -119,6 +120,36 @@ export function subscribeToSavingsTransactionsForResource(
 ): Unsubscribe {
   return onSnapshot(
     resourceTransactionsQuery(resourceType, resourceId),
+    (snap) => {
+      const next: SavingsTransaction[] = [];
+      snap.forEach((docSnap) => {
+        next.push(
+          mapSavingsTransactionDocument(docSnap.id, docSnap.data() as DocumentData)
+        );
+      });
+      onChange(next);
+    },
+    onError
+  );
+}
+
+// Bounded variant of subscribeToSavingsTransactionsForResource (Milestone
+// 3 Checkpoint 3E), for Home's cross-bucket Recent Activity feed. Uses
+// the exact same resourceType/resourceId/createdAt query shape - and
+// therefore the same already-deployed composite index - plus a
+// Firestore limit() clause, so it requires no new index. Bucket Detail's
+// full-history subscription above is untouched and must stay that way;
+// this exists so Home can fan out one bounded listener per bucket
+// instead of ever subscribing to a bucket's entire transaction history.
+export function subscribeToRecentSavingsTransactionsForResource(
+  resourceType: ResourceType,
+  resourceId: string,
+  limitCount: number,
+  onChange: (transactions: SavingsTransaction[]) => void,
+  onError?: (error: unknown) => void
+): Unsubscribe {
+  return onSnapshot(
+    query(resourceTransactionsQuery(resourceType, resourceId), limit(limitCount)),
     (snap) => {
       const next: SavingsTransaction[] = [];
       snap.forEach((docSnap) => {

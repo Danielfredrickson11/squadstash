@@ -118,9 +118,6 @@ export default function TabLayout() {
         })}
       />
 
-      {/* Hide the nested Bucket detail route from the tab bar */}
-      <Tabs.Screen name="buckets/[bucketId]" options={{ href: null }} />
-
       <Tabs.Screen
         name="trips"
         options={{
@@ -131,15 +128,16 @@ export default function TabLayout() {
         }}
       />
 
-      {/* Hide nested Trips routes from tab bar */}
-      <Tabs.Screen name="trips/create" options={{ href: null }} />
-      <Tabs.Screen name="trips/[tripId]" options={{ href: null }} />
-
+      {/* Milestone 3 Checkpoint 3E: the Transactions surface is an
+          unfinished placeholder (see app/(tabs)/transactions.tsx) - hidden
+          from primary navigation rather than deleted, so the route and its
+          architecture remain available for a future real implementation. */}
       <Tabs.Screen
         name="transactions"
         options={{
           title: "Transactions",
           tabBarIcon: ({ color }) => <TabBarIcon name="list" color={color} />,
+          href: null,
         }}
       />
 
