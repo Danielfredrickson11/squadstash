@@ -56,10 +56,51 @@ after(async () => {
 });
 
 async function clearFirestore(): Promise<void> {
-  for (const name of ["buckets", "savingsTransactions"]) {
+  for (const name of ["buckets", "savingsTransactions", "trips"]) {
     const snap = await db.collection(name).get();
     await Promise.all(snap.docs.map((d) => d.ref.delete()));
   }
+}
+
+// Checkpoint 3F.3B.4 trip_personal fixtures.
+const TRIP_ID = "canada-trip";
+const OTHER_TRIP_ID = "hawaii-trip";
+
+function baseTripData(
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return {
+    ownerId: OWNER_UID,
+    memberIds: [OWNER_UID, OTHER_UID],
+    title: "Canada Trip",
+    location: "Banff, Canada",
+    target: 5000,
+    saved: 0,
+    imageUrl: "https://example.com/canada.jpg",
+    tripStartDate: "2027-06-12",
+    tripEndDate: null,
+    ...overrides,
+  };
+}
+
+async function seedTrip(
+  tripId: string,
+  overrides: Record<string, unknown> = {}
+): Promise<void> {
+  await db.collection("trips").doc(tripId).set(baseTripData(overrides));
+}
+
+function tripPersonalRequest(
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return baseRequest({
+    name: "Canada Trip — My Stash",
+    target: 1000,
+    startingBalanceMinor: 0,
+    bucketType: "trip_personal",
+    linkedTripId: TRIP_ID,
+    ...overrides,
+  });
 }
 
 beforeEach(async () => {
@@ -408,25 +449,29 @@ describe("createBucketCore - ownership and defaults", () => {
     assert.equal(snap.data()!.currency, "USD");
   });
 
-  it("bucketType is backend-set to personal, ignoring any client-supplied value", async () => {
+  it("bucketType defaults to personal when omitted", async () => {
     const clientRequestId = randomUUID();
-    await createBucketCore(
-      db,
-      OWNER_UID,
-      baseRequest({ clientRequestId, bucketType: "trip_personal" })
-    );
+    await createBucketCore(db, OWNER_UID, baseRequest({ clientRequestId }));
     const snap = await db.collection("buckets").doc(clientRequestId).get();
     assert.equal(snap.data()!.bucketType, "personal");
   });
 
-  it("linkedTripId/targetDate/imageUrl/archivedAt are absent, ignoring any client-supplied value", async () => {
+  // Checkpoint 3F.3B.4: previously linkedTripId was silently ignored for
+  // an ordinary create (bucketType always hardcoded to "personal", full
+  // stop). Now that bucketType/linkedTripId are real, validated inputs,
+  // supplying linkedTripId without bucketType: "trip_personal" is an
+  // explicit product/security rule ("PERSONAL: linkedTripId must be
+  // null/absent") and must be REJECTED, not silently dropped - see the
+  // dedicated trip_personal describe block below for that coverage.
+  // targetDate/imageUrl/archivedAt remain simply-unread/ignored fields,
+  // unaffected by this checkpoint.
+  it("targetDate/imageUrl/archivedAt are absent, ignoring any client-supplied value", async () => {
     const clientRequestId = randomUUID();
     await createBucketCore(
       db,
       OWNER_UID,
       baseRequest({
         clientRequestId,
-        linkedTripId: "some-trip",
         targetDate: new Date(),
         imageUrl: "https://example.com/x.jpg",
         archivedAt: new Date(),
@@ -488,6 +533,8 @@ describe("createBucketCore - creationRequest metadata", () => {
       target: 10000,
       startingBalanceMinor: 200000,
       color: "#2563EB",
+      bucketType: "personal",
+      linkedTripId: null,
     });
   });
 });
@@ -1000,5 +1047,327 @@ describe("createBucketCore - legacy coexistence", () => {
     const data = snap.data()!;
     assert.equal(data.ledgerOpeningBalanceMinor, 1234);
     assert.equal(data.ledgerBalanceMinor, 1334);
+  });
+});
+
+// ==========================================================================
+// Checkpoint 3F.3B.4: trip_personal ("My Stash") fund creation
+// ==========================================================================
+describe("createBucketCore - trip_personal: normal personal creation is unaffected", () => {
+  it("an ordinary personal Bucket create (bucketType omitted) still succeeds exactly as before", async () => {
+    const clientRequestId = randomUUID();
+    const result = await createBucketCore(
+      db,
+      OWNER_UID,
+      baseRequest({ clientRequestId })
+    );
+    assert.equal(result.bucketId, clientRequestId);
+
+    const snap = await db.collection("buckets").doc(clientRequestId).get();
+    const data = snap.data()!;
+    assert.equal(data.bucketType, "personal");
+    assert.equal("linkedTripId" in data, false);
+  });
+
+  it("linkedTripId supplied for bucketType: personal is rejected", async () => {
+    await assertRejectsWithCode(
+      createBucketCore(
+        db,
+        OWNER_UID,
+        baseRequest({ bucketType: "personal", linkedTripId: TRIP_ID })
+      ),
+      "invalid-argument"
+    );
+  });
+
+  it("linkedTripId supplied with bucketType omitted (defaults to personal) is rejected", async () => {
+    await assertRejectsWithCode(
+      createBucketCore(db, OWNER_UID, baseRequest({ linkedTripId: TRIP_ID })),
+      "invalid-argument"
+    );
+  });
+
+  it("an invalid bucketType value is rejected", async () => {
+    await assertRejectsWithCode(
+      createBucketCore(db, OWNER_UID, baseRequest({ bucketType: "shared" })),
+      "invalid-argument"
+    );
+  });
+});
+
+describe("createBucketCore - trip_personal: input validation", () => {
+  it("missing linkedTripId is rejected", async () => {
+    await seedTrip(TRIP_ID);
+    await assertRejectsWithCode(
+      createBucketCore(
+        db,
+        OWNER_UID,
+        tripPersonalRequest({ linkedTripId: undefined })
+      ),
+      "invalid-argument"
+    );
+  });
+
+  it("empty-string linkedTripId is rejected", async () => {
+    await assertRejectsWithCode(
+      createBucketCore(db, OWNER_UID, tripPersonalRequest({ linkedTripId: "" })),
+      "invalid-argument"
+    );
+  });
+
+  it("non-string linkedTripId is rejected", async () => {
+    await assertRejectsWithCode(
+      createBucketCore(db, OWNER_UID, tripPersonalRequest({ linkedTripId: 123 })),
+      "invalid-argument"
+    );
+  });
+});
+
+describe("createBucketCore - trip_personal: trip existence and membership", () => {
+  it("a nonexistent linked Trip is rejected with not-found", async () => {
+    await assertRejectsWithCode(
+      createBucketCore(
+        db,
+        OWNER_UID,
+        tripPersonalRequest({ linkedTripId: "does-not-exist" })
+      ),
+      "not-found"
+    );
+  });
+
+  it("a non-member of the Trip is rejected with permission-denied", async () => {
+    await seedTrip(TRIP_ID); // memberIds: [OWNER_UID, OTHER_UID]
+    const OUTSIDER_UID = "outsider-uid";
+    await assertRejectsWithCode(
+      createBucketCore(db, OUTSIDER_UID, tripPersonalRequest()),
+      "permission-denied"
+    );
+  });
+
+  it("the Trip owner (also in memberIds, per real Trip creation) succeeds", async () => {
+    await seedTrip(TRIP_ID);
+    const result = await createBucketCore(db, OWNER_UID, tripPersonalRequest());
+    assert.ok(result.bucketId.length > 0);
+  });
+
+  it("a non-owner Trip member succeeds", async () => {
+    await seedTrip(TRIP_ID);
+    const result = await createBucketCore(
+      db,
+      OTHER_UID,
+      tripPersonalRequest({ clientRequestId: randomUUID() })
+    );
+    assert.ok(result.bucketId.length > 0);
+  });
+
+  it("membership derived solely from the Trip's OWN current memberIds/ownerId - never trusted from client input", async () => {
+    await seedTrip(TRIP_ID);
+    const OUTSIDER_UID = "outsider-uid";
+    // A client cannot forge membership by claiming it in the request -
+    // there is no such input field at all, but this proves the rejection
+    // holds even when the request otherwise looks identical to a valid
+    // member's request.
+    await assertRejectsWithCode(
+      createBucketCore(
+        db,
+        OUTSIDER_UID,
+        tripPersonalRequest({ memberIds: [OUTSIDER_UID] })
+      ),
+      "permission-denied"
+    );
+  });
+});
+
+describe("createBucketCore - trip_personal: resulting document shape", () => {
+  it("ownerId is the authenticated caller, never any client-supplied value", async () => {
+    await seedTrip(TRIP_ID);
+    await createBucketCore(
+      db,
+      OWNER_UID,
+      tripPersonalRequest({ ownerId: OTHER_UID })
+    );
+    const bucketId = `tripfund_${TRIP_ID}_${OWNER_UID}`;
+    const snap = await db.collection("buckets").doc(bucketId).get();
+    assert.equal(snap.data()!.ownerId, OWNER_UID);
+  });
+
+  it("memberIds is exactly [authUid] - self-only, never the Trip's memberIds", async () => {
+    await seedTrip(TRIP_ID); // Trip has TWO members
+    await createBucketCore(db, OWNER_UID, tripPersonalRequest());
+    const bucketId = `tripfund_${TRIP_ID}_${OWNER_UID}`;
+    const snap = await db.collection("buckets").doc(bucketId).get();
+    assert.deepEqual(snap.data()!.memberIds, [OWNER_UID]);
+  });
+
+  it("linkedTripId and bucketType are stored correctly", async () => {
+    await seedTrip(TRIP_ID);
+    await createBucketCore(db, OWNER_UID, tripPersonalRequest());
+    const bucketId = `tripfund_${TRIP_ID}_${OWNER_UID}`;
+    const snap = await db.collection("buckets").doc(bucketId).get();
+    const data = snap.data()!;
+    assert.equal(data.bucketType, "trip_personal");
+    assert.equal(data.linkedTripId, TRIP_ID);
+  });
+
+  it("uses the same trusted ledger opening/balance fields as an ordinary personal Bucket", async () => {
+    await seedTrip(TRIP_ID);
+    const result = await createBucketCore(
+      db,
+      OWNER_UID,
+      tripPersonalRequest({ startingBalanceMinor: 50000 })
+    );
+    assert.equal(result.ledgerBalanceMinor, 50000);
+
+    const bucketId = `tripfund_${TRIP_ID}_${OWNER_UID}`;
+    const snap = await db.collection("buckets").doc(bucketId).get();
+    const data = snap.data()!;
+    assert.equal(data.ledgerOpeningBalanceMinor, 50000);
+    assert.equal(data.ledgerBalanceMinor, 50000);
+    assert.equal(data.balance, 500);
+    assert.equal(data.currency, "USD");
+  });
+
+  it("the deterministic bucket id is tripfund_{tripId}_{uid}, not the clientRequestId", async () => {
+    await seedTrip(TRIP_ID);
+    const clientRequestId = randomUUID();
+    const result = await createBucketCore(
+      db,
+      OWNER_UID,
+      tripPersonalRequest({ clientRequestId })
+    );
+    assert.equal(result.bucketId, `tripfund_${TRIP_ID}_${OWNER_UID}`);
+    assert.notEqual(result.bucketId, clientRequestId);
+  });
+});
+
+describe("createBucketCore - trip_personal: at-most-one-per-(owner,trip) uniqueness", () => {
+  it("a second create for the same (owner, trip) with a DIFFERENT clientRequestId but identical facts replays idempotently to the SAME bucket", async () => {
+    await seedTrip(TRIP_ID);
+    const first = await createBucketCore(db, OWNER_UID, tripPersonalRequest());
+    const second = await createBucketCore(
+      db,
+      OWNER_UID,
+      tripPersonalRequest({ clientRequestId: randomUUID() })
+    );
+
+    assert.equal(first.bucketId, second.bucketId);
+    const snap = await db
+      .collection("buckets")
+      .where("bucketType", "==", "trip_personal")
+      .where("linkedTripId", "==", TRIP_ID)
+      .where("ownerId", "==", OWNER_UID)
+      .get();
+    assert.equal(snap.size, 1);
+  });
+
+  it("replaying the EXACT same creation request (same clientRequestId, same facts) is a true idempotent replay", async () => {
+    await seedTrip(TRIP_ID);
+    const request = tripPersonalRequest();
+    const first = await createBucketCore(db, OWNER_UID, request);
+    const second = await createBucketCore(db, OWNER_UID, request);
+    assert.equal(first.bucketId, second.bucketId);
+    assert.equal(first.ledgerBalanceMinor, second.ledgerBalanceMinor);
+  });
+
+  it("a second create for the same (owner, trip) with DIFFERENT facts (different target) is rejected as already-exists, never overwritten or duplicated", async () => {
+    await seedTrip(TRIP_ID);
+    await createBucketCore(db, OWNER_UID, tripPersonalRequest({ target: 1000 }));
+    await assertRejectsWithCode(
+      createBucketCore(
+        db,
+        OWNER_UID,
+        tripPersonalRequest({ clientRequestId: randomUUID(), target: 2000 })
+      ),
+      "already-exists"
+    );
+
+    // Still exactly one document, with the ORIGINAL target - the failed
+    // second attempt must not have mutated anything.
+    const bucketId = `tripfund_${TRIP_ID}_${OWNER_UID}`;
+    const snap = await db.collection("buckets").doc(bucketId).get();
+    assert.equal(snap.data()!.target, 1000);
+  });
+
+  it("two DIFFERENT members can each create their own fund for the SAME trip without colliding", async () => {
+    await seedTrip(TRIP_ID);
+    const ownerResult = await createBucketCore(db, OWNER_UID, tripPersonalRequest());
+    const memberResult = await createBucketCore(
+      db,
+      OTHER_UID,
+      tripPersonalRequest({ clientRequestId: randomUUID() })
+    );
+    assert.notEqual(ownerResult.bucketId, memberResult.bucketId);
+
+    const snap = await db
+      .collection("buckets")
+      .where("bucketType", "==", "trip_personal")
+      .where("linkedTripId", "==", TRIP_ID)
+      .get();
+    assert.equal(snap.size, 2);
+  });
+
+  it("reusing the same clientRequestId for a DIFFERENT linked Trip creates a separate, valid fund for that trip", async () => {
+    // Document identity for trip_personal is (linkedTripId, ownerUid) -
+    // deliberately NOT clientRequestId (see tripPersonalBucketId's own
+    // comment in src/callables/createBucket.ts) - so reusing the same
+    // clientRequestId value across two genuinely different trips is safe
+    // and correctly produces two independent funds, not a collision or a
+    // rejection. clientRequestId is only ever compared WITHIN a single
+    // deterministic document's own creationRequest identity check.
+    await seedTrip(TRIP_ID);
+    await seedTrip(OTHER_TRIP_ID);
+    const sharedClientRequestId = randomUUID();
+
+    const first = await createBucketCore(
+      db,
+      OWNER_UID,
+      tripPersonalRequest({ clientRequestId: sharedClientRequestId, linkedTripId: TRIP_ID })
+    );
+    const second = await createBucketCore(
+      db,
+      OWNER_UID,
+      tripPersonalRequest({ clientRequestId: sharedClientRequestId, linkedTripId: OTHER_TRIP_ID })
+    );
+
+    assert.notEqual(first.bucketId, second.bucketId);
+    assert.equal(first.bucketId, `tripfund_${TRIP_ID}_${OWNER_UID}`);
+    assert.equal(second.bucketId, `tripfund_${OTHER_TRIP_ID}_${OWNER_UID}`);
+  });
+
+  it("a stored document with a mismatched linkedTripId at the same id is rejected as already-exists (defensive identity check)", async () => {
+    // Simulates a hand-crafted/corrupted document at the deterministic id
+    // whose stored linkedTripId disagrees with the incoming request -
+    // matchesCreationRequest's explicit linkedTripId comparison must
+    // catch this rather than trusting the id alone.
+    await seedTrip(TRIP_ID);
+    const bucketId = `tripfund_${TRIP_ID}_${OWNER_UID}`;
+    await db.collection("buckets").doc(bucketId).set({
+      ownerId: OWNER_UID,
+      memberIds: [OWNER_UID],
+      name: "Canada Trip — My Stash",
+      target: 1000,
+      color: null,
+      balance: 0,
+      ledgerOpeningBalanceMinor: 0,
+      ledgerBalanceMinor: 0,
+      currency: "USD",
+      bucketType: "trip_personal",
+      linkedTripId: OTHER_TRIP_ID, // mismatched vs. the incoming TRIP_ID
+      creationRequest: {
+        clientRequestId: randomUUID(),
+        ownerId: OWNER_UID,
+        name: "Canada Trip — My Stash",
+        target: 1000,
+        startingBalanceMinor: 0,
+        color: null,
+        bucketType: "trip_personal",
+        linkedTripId: OTHER_TRIP_ID,
+      },
+    });
+
+    await assertRejectsWithCode(
+      createBucketCore(db, OWNER_UID, tripPersonalRequest()),
+      "already-exists"
+    );
   });
 });

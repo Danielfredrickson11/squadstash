@@ -1,34 +1,35 @@
 // Minimal "Goal Reached" indicator (Milestone 3 Checkpoint 3D), shared
-// between the Bucket list card and the Bucket detail screen so both
-// surfaces communicate completion identically. Text-based, not
-// color/icon-only, per the checkpoint's accessibility requirement.
-// Deliberately no celebration animation/confetti - see
-// src/domain/savingsGoal.ts for the deterministic balance >= target
-// derivation this badge is conditionally rendered from by its callers.
+// between the Bucket list card (BucketGridCard), Home's Top Buckets (if
+// used), and Bucket Detail so every surface communicates completion
+// identically. Text-based, not color/icon-only, per the checkpoint's
+// accessibility requirement. Deliberately no celebration animation/
+// confetti - see src/domain/savingsGoal.ts for the deterministic
+// balance >= target derivation this badge is conditionally rendered
+// from by its callers.
 //
-// Uses theme.colors.primary/onPrimary (the app's actual overridden brand
-// blue - see src/theme/appTheme.ts) rather than primaryContainer/
-// onPrimaryContainer, which were never re-derived from that brand color
-// override and stay the unmodified default MD3 purple-based container
-// tokens - a pale, off-brand, low-emphasis pairing that a manual smoke
-// test found easy to overlook (Checkpoint 3D goal-presentation review).
-// A solid, high-contrast, on-brand pill makes the completed state
-// unmistakable without changing its size/shape/copy - not a redesign.
+// Checkpoint 3F.2A transitional cleanup: a solid bright fill would now
+// read as a bright mint "button" (theme.colors.primary is the signature
+// mint accent) competing with real primary actions elsewhere on the
+// same screen - this is a small, subdued status treatment instead (a
+// pale mint-tinted surface behind mint text), matching the "muted
+// success" direction for Bucket Detail without changing this shared
+// component's size/shape/copy.
 import React from "react";
 import { StyleSheet, View } from "react-native";
-import { Text, useTheme } from "react-native-paper";
+import { Text } from "react-native-paper";
+
+import { radii } from "../../src/theme/tokens";
+import { useSemanticColors } from "../../src/theme/useSemanticColors";
 
 export function GoalReachedBadge() {
-  const theme = useTheme();
+  const colors = useSemanticColors();
 
   return (
     <View
-      style={[styles.badge, { backgroundColor: theme.colors.primary }]}
+      style={[styles.badge, { backgroundColor: colors.mintSurface }]}
       accessibilityLabel="Goal reached"
     >
-      <Text style={[styles.text, { color: theme.colors.onPrimary }]}>
-        Goal Reached
-      </Text>
+      <Text style={[styles.text, { color: colors.mintText }]}>Goal Reached</Text>
     </View>
   );
 }
@@ -36,12 +37,12 @@ export function GoalReachedBadge() {
 const styles = StyleSheet.create({
   badge: {
     alignSelf: "flex-start",
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: radii.pill,
   },
   text: {
-    fontSize: 12,
-    fontWeight: "800",
+    fontSize: 11,
+    fontWeight: "700",
   },
 });

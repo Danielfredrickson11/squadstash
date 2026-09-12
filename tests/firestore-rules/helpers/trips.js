@@ -16,6 +16,9 @@ function validTripData(overrides = {}) {
     target: 1000,
     saved: 0,
     imageUrl: 'https://example.com/trip.jpg',
+    // Checkpoint 3F.3B.2: tripStartDate is now required by the create
+    // rule, so every existing "valid trip" fixture needs one by default.
+    tripStartDate: '2027-06-12',
     ...overrides,
   };
 }

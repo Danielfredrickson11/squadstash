@@ -105,6 +105,15 @@ type SavingsMoneyActionContextValue = {
   submit: () => Promise<void>;
   successMessage: string | null;
   dismissSuccess: () => void;
+  // Checkpoint 3F.3B.4A: lets a caller OUTSIDE this controller's own
+  // submit() flow (Trip Detail's locally-scoped Shared Stash action,
+  // which records against resourceType: "trip" via its own handler, not
+  // this Bucket-specific one) surface a success toast through the exact
+  // same already-mounted MoneySuccessSnackbar, instead of Shared Stash
+  // needing its own separate success-feedback UI. Does not touch
+  // `state`/bucket/submitting at all - purely the success-message half
+  // of this controller, reused as-is.
+  announceSuccess: (message: string) => void;
 };
 
 const SavingsMoneyActionContext =
@@ -214,6 +223,7 @@ export function SavingsMoneyActionProvider({
   }, []);
 
   const dismissSuccess = useCallback(() => setSuccessMessage(null), []);
+  const announceSuccess = useCallback((message: string) => setSuccessMessage(message), []);
 
   const submit = useCallback(async () => {
     const uid = user?.uid;
@@ -357,8 +367,21 @@ export function SavingsMoneyActionProvider({
       submit,
       successMessage,
       dismissSuccess,
+      announceSuccess,
     }),
-    [state, open, close, setType, setAmountText, setQuickAmount, setNote, submit, successMessage, dismissSuccess]
+    [
+      state,
+      open,
+      close,
+      setType,
+      setAmountText,
+      setQuickAmount,
+      setNote,
+      submit,
+      successMessage,
+      dismissSuccess,
+      announceSuccess,
+    ]
   );
 
   return (

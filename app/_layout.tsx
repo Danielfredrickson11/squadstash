@@ -43,8 +43,18 @@ export default function RootLayout() {
 }
 
 function RootLayoutNav() {
+  // Checkpoint 3F.3A: the approved Light Mode is now the flagship active
+  // visual mode for review, pinned here regardless of system preference
+  // until the System/Light/Dark settings workflow (explicitly out of
+  // scope here) is built. Dark Mode (Checkpoint 3F.2) remains fully
+  // intact in paperThemes.dark - flipping this one flag back to `true`
+  // (or to `colorScheme === "dark"` for a real System option) is the
+  // entire switch-over, no per-screen changes required. useColorScheme()
+  // is kept imported/called so that future switcher doesn't have to
+  // re-wire theme selection from scratch.
   const colorScheme = useColorScheme();
-  const isDark = colorScheme === "dark";
+  void colorScheme;
+  const isDark = false;
 
   const paperTheme = isDark ? paperThemes.dark : paperThemes.light;
 

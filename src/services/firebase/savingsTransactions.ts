@@ -25,6 +25,7 @@ import {
   onSnapshot,
   orderBy,
   query,
+  Timestamp,
   where,
 } from "firebase/firestore";
 import type { DocumentData, Unsubscribe } from "firebase/firestore";
@@ -161,6 +162,54 @@ export function subscribeToRecentSavingsTransactionsForResource(
     },
     onError
   );
+}
+
+// One-shot, date-bounded read for the Home "Total Stashed vs. last
+// month" metric (Milestone 3 Checkpoint 3F.3A.2): every transaction with
+// createdAt >= `since`, across up to 30 resourceIds at once (Firestore's
+// `in` operator limit - chunked beyond that, mirroring the same 30-item
+// chunking app/(tabs)/buckets/index.tsx already uses for
+// subscribeToPublicUsersByIds). This is intentionally NOT the full
+// lifetime ledger and NOT a live subscription: it reuses the exact same
+// (resourceType, resourceId, createdAt) composite index every other
+// query in this file already relies on (`in` needs no additional index
+// dimension beyond what `==` would), just with a `>=` bound instead of an
+// unbounded orderBy, so no new Firestore index or backend change is
+// required. Grouped by resourceId in the result so a caller reconstructing
+// a per-bucket balance never has to re-filter the combined list itself.
+export async function fetchSavingsTransactionsSinceForResources(
+  resourceType: ResourceType,
+  resourceIds: readonly string[],
+  since: Date
+): Promise<Record<string, SavingsTransaction[]>> {
+  const result: Record<string, SavingsTransaction[]> = {};
+  if (resourceIds.length === 0) return result;
+
+  const sinceTimestamp = Timestamp.fromDate(since);
+  const CHUNK_SIZE = 30;
+  const chunks: string[][] = [];
+  for (let i = 0; i < resourceIds.length; i += CHUNK_SIZE) {
+    chunks.push(resourceIds.slice(i, i + CHUNK_SIZE));
+  }
+
+  for (const chunk of chunks) {
+    const snap = await getDocs(
+      query(
+        collection(db, "savingsTransactions"),
+        where("resourceType", "==", resourceType),
+        where("resourceId", "in", chunk),
+        where("createdAt", ">=", sinceTimestamp),
+        orderBy("createdAt", "desc")
+      )
+    );
+    snap.forEach((docSnap) => {
+      const data = docSnap.data() as DocumentData;
+      const transaction = mapSavingsTransactionDocument(docSnap.id, data);
+      (result[transaction.resourceId] ??= []).push(transaction);
+    });
+  }
+
+  return result;
 }
 
 // ---------------------------------------

@@ -237,6 +237,78 @@ describe('firestore.rules: trips - create', () => {
       )
     );
   });
+
+  // Checkpoint 3F.3B.2: tripStartDate/tripEndDate canonical-date fields.
+  describe('trip dates', () => {
+    it('create: valid tripStartDate (canonical YYYY-MM-DD) succeeds', async () => {
+      await assertSucceeds(
+        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripStartDate: '2027-06-12' }))
+      );
+    });
+
+    it('create: missing tripStartDate is rejected (now required)', async () => {
+      const { tripStartDate, ...withoutStart } = validTripData();
+      await assertFails(tripDoc(asOwner(), 'new-trip').set(withoutStart));
+    });
+
+    it('create: tripStartDate as a locale-formatted string is rejected', async () => {
+      await assertFails(
+        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripStartDate: '06/12/2027' }))
+      );
+    });
+
+    it('create: tripStartDate with a non-string type is rejected', async () => {
+      await assertFails(
+        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripStartDate: 20270612 }))
+      );
+    });
+
+    it('create: tripEndDate may be a valid canonical date on/after tripStartDate', async () => {
+      await assertSucceeds(
+        tripDoc(asOwner(), 'new-trip').set(
+          validTripData({ tripStartDate: '2027-06-12', tripEndDate: '2027-06-18' })
+        )
+      );
+    });
+
+    it('create: tripEndDate equal to tripStartDate succeeds (same-day trip)', async () => {
+      await assertSucceeds(
+        tripDoc(asOwner(), 'new-trip').set(
+          validTripData({ tripStartDate: '2027-06-12', tripEndDate: '2027-06-12' })
+        )
+      );
+    });
+
+    it('create: tripEndDate may be explicit null', async () => {
+      await assertSucceeds(
+        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripEndDate: null }))
+      );
+    });
+
+    it('create: tripEndDate may be omitted entirely', async () => {
+      await assertSucceeds(tripDoc(asOwner(), 'new-trip').set(validTripData()));
+    });
+
+    it('create: tripEndDate before tripStartDate is rejected', async () => {
+      await assertFails(
+        tripDoc(asOwner(), 'new-trip').set(
+          validTripData({ tripStartDate: '2027-06-12', tripEndDate: '2027-06-01' })
+        )
+      );
+    });
+
+    it('create: tripEndDate with an invalid type is rejected', async () => {
+      await assertFails(
+        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripEndDate: 20270618 }))
+      );
+    });
+
+    it('create: tripEndDate as a locale-formatted string is rejected', async () => {
+      await assertFails(
+        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripEndDate: '06/18/2027' }))
+      );
+    });
+  });
 });
 
 describe('firestore.rules: trips - owner updates', () => {
@@ -359,6 +431,96 @@ describe('firestore.rules: trips - owner updates', () => {
     await assertFails(tripDoc(asOwner(), TRIP_ID).update({ notes: 'not allowed' }));
   });
 
+  // Checkpoint 3F.3B.3: the Trip Detail date-edit flow is now real -
+  // tripStartDate/tripEndDate join the owner-only update allowlist.
+  describe('trip date edits (Checkpoint 3F.3B.3)', () => {
+    it('owner: can change tripStartDate to a new valid canonical date', async () => {
+      // A different value than the seeded default's tripStartDate
+      // ('2027-06-12') - otherwise the write is a same-value no-op with
+      // an empty diff, which would trivially (and unhelpfully) pass.
+      await assertSucceeds(
+        tripDoc(asOwner(), TRIP_ID).update({ tripStartDate: '2028-01-01' })
+      );
+    });
+
+    it('owner: can add tripEndDate on/after the existing tripStartDate', async () => {
+      await assertSucceeds(
+        tripDoc(asOwner(), TRIP_ID).update({ tripEndDate: '2027-06-18' })
+      );
+    });
+
+    it('owner: can update both dates together', async () => {
+      await assertSucceeds(
+        tripDoc(asOwner(), TRIP_ID).update({
+          tripStartDate: '2028-03-01',
+          tripEndDate: '2028-03-10',
+        })
+      );
+    });
+
+    it('owner: can clear an existing tripEndDate back to null', async () => {
+      await seedTrip(
+        testEnv,
+        TRIP_ID,
+        validTripData({ tripStartDate: '2027-06-12', tripEndDate: '2027-06-18' })
+      );
+      await assertSucceeds(
+        tripDoc(asOwner(), TRIP_ID).update({ tripEndDate: null })
+      );
+    });
+
+    it('owner: cannot set tripStartDate to a locale-formatted string', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ tripStartDate: '01/01/2028' })
+      );
+    });
+
+    it('owner: cannot set tripStartDate to an invalid type', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ tripStartDate: 20280101 })
+      );
+    });
+
+    it('owner: cannot set tripEndDate before the resulting tripStartDate', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({
+          tripStartDate: '2028-06-12',
+          tripEndDate: '2028-06-01',
+        })
+      );
+    });
+
+    it('owner: cannot set tripEndDate before the ALREADY-STORED tripStartDate when only changing tripEndDate', async () => {
+      // Seeded tripStartDate is '2027-06-12' - an end date before it must
+      // still be rejected even though this update doesn't touch start.
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ tripEndDate: '2027-01-01' })
+      );
+    });
+
+    it('owner: cannot clear tripStartDate to null (a dated trip cannot revert to dateless)', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ tripStartDate: null })
+      );
+    });
+
+    // Member-side date-immutability assertions live in the "non-owner
+    // member updates" describe below, alongside every other field's
+    // equivalent coverage.
+
+    it('unrelated owner update (title rename) on a trip with existing dates leaves them intact and still succeeds', async () => {
+      await assertSucceeds(
+        tripDoc(asOwner(), TRIP_ID).update({ title: 'Renamed Trip With Dates' })
+      );
+    });
+
+    it('unrelated owner update on a legacy trip with NO dates at all still succeeds without requiring dates', async () => {
+      const { tripStartDate, ...legacyTrip } = validTripData();
+      await seedTrip(testEnv, TRIP_ID, legacyTrip);
+      await assertSucceeds(tripDoc(asOwner(), TRIP_ID).update({ title: 'Legacy Renamed' }));
+    });
+  });
+
   it('owner: cannot write an invalid field type (saved)', async () => {
     await assertFails(tripDoc(asOwner(), TRIP_ID).update({ saved: 'lots' }));
   });
@@ -432,6 +594,24 @@ describe('firestore.rules: trips - non-owner member updates', () => {
 
   it('member: cannot add arbitrary fields not in the allowlist', async () => {
     await assertFails(tripDoc(asMember(), TRIP_ID).update({ notes: 'not allowed' }));
+  });
+
+  // Checkpoint 3F.3B.3: tripStartDate/tripEndDate joined the OWNER-only
+  // update allowlist (the Trip Detail date-edit flow is owner-only) -
+  // a member still cannot touch either, exactly like target/ownerId.
+  it('member: cannot change tripStartDate', async () => {
+    // A different value than the seeded default's tripStartDate
+    // ('2027-06-12') - otherwise the write is a same-value no-op with an
+    // empty diff, which would trivially (and incorrectly) pass.
+    await assertFails(
+      tripDoc(asMember(), TRIP_ID).update({ tripStartDate: '2028-01-01' })
+    );
+  });
+
+  it('member: cannot change tripEndDate', async () => {
+    await assertFails(
+      tripDoc(asMember(), TRIP_ID).update({ tripEndDate: '2027-06-18' })
+    );
   });
 
   it('member: cannot write an invalid field type (title)', async () => {

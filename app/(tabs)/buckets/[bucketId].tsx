@@ -325,15 +325,31 @@ export default function BucketDetailScreen() {
                   useSavingsMoneyAction(), identical to the Bucket list's
                   entry points. */}
               <View style={styles.actionsRow}>
+                {/* Checkpoint 3F.2A transitional cleanup: mode=
+                    "contained-tonal" previously read as lavender because
+                    MD3's secondaryContainer is auto-derived from this
+                    app's `secondary` seed color (violet, see
+                    src/theme/appTheme.ts), which was never remapped;
+                    buttonColor bypasses that derivation for a clean
+                    mint primary action instead. */}
                 <Button
-                  mode="contained-tonal"
+                  mode="contained"
+                  buttonColor={theme.colors.primary}
+                  textColor={theme.colors.onPrimary}
                   onPress={() => openMoneyAction(bucket, "contribution")}
                   style={styles.actionBtn}
                 >
                   Add Money
                 </Button>
+                {/* mode="outlined" defaults its TEXT color to
+                    theme.colors.primary (mint) even though its border
+                    already defaults to the neutral theme.colors.outline
+                    - overriding textColor makes this read as a genuinely
+                    neutral secondary action next to the mint primary
+                    one. */}
                 <Button
                   mode="outlined"
+                  textColor={theme.colors.onSurfaceVariant}
                   onPress={() => openMoneyAction(bucket, "withdrawal")}
                   style={styles.actionBtn}
                 >

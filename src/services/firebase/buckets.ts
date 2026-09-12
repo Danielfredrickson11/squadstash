@@ -33,6 +33,7 @@ import {
   collection,
   deleteDoc,
   doc,
+  getDoc,
   onSnapshot,
   orderBy,
   query,
@@ -43,7 +44,30 @@ import {
 import type { DocumentData, Unsubscribe } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
 import { db, functions } from "../../../firebase";
-import type { Bucket, CreateBucketInput } from "../../types/domain";
+import { getCurrentUser } from "./auth";
+import { tripPersonalBucketId } from "../../domain/tripPersonalFund";
+import type { Bucket, BucketType, CreateBucketInput } from "../../types/domain";
+
+// Shared field-by-field mapper (Checkpoint 3F.3B.4) so
+// subscribeToUserBuckets/fetchBucketById/subscribeToBucketById all read
+// bucketType/linkedTripId identically instead of drifting - previously
+// only inlined in subscribeToUserBuckets, which silently dropped both
+// fields even though they've existed on the Bucket type since the
+// Milestone 2A design freeze.
+function mapBucketDocument(id: string, d: DocumentData): Bucket {
+  return {
+    id,
+    name: d.name,
+    target: Number(d.target) || 0,
+    balance: Number(d.balance) || 0,
+    color: d.color ?? null,
+    createdAt: d.createdAt,
+    ownerId: String(d.ownerId ?? ""),
+    memberIds: Array.isArray(d.memberIds) ? d.memberIds : [],
+    bucketType: d.bucketType as BucketType | undefined,
+    linkedTripId: d.linkedTripId as string | null | undefined,
+  };
+}
 
 export function subscribeToUserBuckets(
   uid: string,
@@ -61,19 +85,41 @@ export function subscribeToUserBuckets(
     (snap) => {
       const next: Bucket[] = [];
       snap.forEach((docSnap) => {
-        const d = docSnap.data() as DocumentData;
-        next.push({
-          id: docSnap.id,
-          name: d.name,
-          target: Number(d.target) || 0,
-          balance: Number(d.balance) || 0,
-          color: d.color ?? null,
-          createdAt: d.createdAt,
-          ownerId: String(d.ownerId ?? ""),
-          memberIds: Array.isArray(d.memberIds) ? d.memberIds : [],
-        });
+        next.push(mapBucketDocument(docSnap.id, docSnap.data() as DocumentData));
       });
       onChange(next);
+    },
+    onError
+  );
+}
+
+// One-shot lookup by document id (Checkpoint 3F.3B.4) - used by the Trip
+// Detail "My Stash" section to check for an existing trip_personal
+// Bucket via its DETERMINISTIC id (see src/domain/tripPersonalFund.ts)
+// rather than a query, so no new Firestore index is needed. Returns null
+// both when the fund hasn't been created yet and when it doesn't exist
+// for any other reason - callers never need to distinguish those cases.
+export async function fetchBucketById(bucketId: string): Promise<Bucket | null> {
+  const snap = await getDoc(doc(db, "buckets", bucketId));
+  if (!snap.exists()) return null;
+  return mapBucketDocument(snap.id, snap.data() as DocumentData);
+}
+
+// Live variant of fetchBucketById (Checkpoint 3F.3B.4) - lets Trip
+// Detail's "My Stash" balance update in real time after Add Money/
+// Withdraw without a manual refetch, and also naturally picks up the
+// document the moment "Create My Stash" succeeds (onSnapshot on a
+// not-yet-existing document id keeps listening and fires again once it's
+// created - no separate "create then refetch" step is needed).
+export function subscribeToBucketById(
+  bucketId: string,
+  onChange: (bucket: Bucket | null) => void,
+  onError?: (error: unknown) => void
+): Unsubscribe {
+  return onSnapshot(
+    doc(db, "buckets", bucketId),
+    (snap) => {
+      onChange(snap.exists() ? mapBucketDocument(snap.id, snap.data() as DocumentData) : null);
     },
     onError
   );
@@ -98,9 +144,30 @@ export type CreateBucketResult = {
 // Validates the callable's response field-by-field rather than trusting
 // a whole-object cast, matching parseRecordSavingsTransactionResponse's
 // convention exactly - a malformed/unexpected shape must fail visibly.
+//
+// Checkpoint 3F.3B.4: for an ordinary "personal" Bucket, the trusted
+// backend deterministically uses clientRequestId as the document id, so
+// `expectedBucketId` is passed and checked exactly as before.
+//
+// Checkpoint 3F.3B.4A production-safety finding: for a trip_personal
+// fund, `expectedBucketId` is now ALSO always passed (the client already
+// knows the deterministic (linkedTripId, callerUid) formula - see
+// src/domain/tripPersonalFund.ts) rather than trusting the response
+// blindly. This closes a real compatibility gap: the OLD (currently
+// deployed, pre-3F.3B.4) createBucket Cloud Function has no idea
+// bucketType/linkedTripId exist - it silently ignores both and creates
+// an ORDINARY personal Bucket at `clientRequestId`, returning that id in
+// its response. Without this check, a new client talking to that old
+// backend would receive a response that "looks successful," and would
+// have silently accepted a stray, incorrectly-typed personal Bucket as
+// if it were the trip fund. Comparing the returned bucketId against the
+// independently-computed expected deterministic id catches exactly that
+// mismatch and fails loudly instead - see the checkpoint report for why
+// deploying the backend before the client is still the primary fix, and
+// this check is deliberate defense-in-depth for that window.
 function parseCreateBucketResponse(
   data: unknown,
-  clientRequestId: string
+  expectedBucketId?: string
 ): CreateBucketResult {
   if (typeof data !== "object" || data === null) {
     throw new Error(
@@ -115,13 +182,10 @@ function parseCreateBucketResponse(
       "createBucket: invalid response (bucketId must be a non-empty string)."
     );
   }
-  // The trusted backend deterministically uses clientRequestId as the
-  // Bucket document id - a mismatch here means the response cannot be
-  // trusted to describe the Bucket this call actually asked for, and
-  // must never be silently accepted.
-  if (bucketId !== clientRequestId) {
+  if (expectedBucketId !== undefined && bucketId !== expectedBucketId) {
     throw new Error(
-      "createBucket: invalid response (bucketId did not match the request's clientRequestId)."
+      "createBucket: invalid response (bucketId did not match the expected id - " +
+        "the deployed createBucket function may be out of date; this request did not succeed)."
     );
   }
   if (
@@ -152,7 +216,19 @@ export async function createBucket(
     "createBucket"
   );
   const res = await callable(input);
-  return parseCreateBucketResponse(res.data, input.clientRequestId);
+
+  // Checkpoint 3F.3B.4A: always compute a real expected id, for BOTH
+  // bucket types - see parseCreateBucketResponse's comment for why this
+  // now also covers trip_personal (a production-safety guard against an
+  // out-of-date deployed Cloud Function). getCurrentUser() is safe to
+  // call here: httpsCallable itself already requires an authenticated
+  // user for this call to have succeeded at all, so the current user is
+  // guaranteed to be signed in by the time this line runs.
+  const expectedBucketId =
+    input.bucketType === "trip_personal"
+      ? tripPersonalBucketId(input.linkedTripId as string, getCurrentUser()?.uid ?? "")
+      : input.clientRequestId;
+  return parseCreateBucketResponse(res.data, expectedBucketId);
 }
 
 // The only fields the current updateBucket() caller (buckets.tsx's

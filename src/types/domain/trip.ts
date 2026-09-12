@@ -23,10 +23,33 @@ export type Trip = {
 
   // Frozen Milestone 2A additive fields (see docs/architecture design
   // freeze). Optional only - no service writes these yet, and existing/
-  // legacy trip documents remain valid without them.
+  // legacy trip documents remain valid without them. Superseded by
+  // tripStartDate/tripEndDate below for actual calendar-date use
+  // (Checkpoint 3F.3B.2) - left in place, still unused/unwired, rather
+  // than removed, since no code depends on them either way.
   startDate?: PersistedTimestamp | null;
   endDate?: PersistedTimestamp | null;
   currency?: string;
+
+  // Checkpoint 3F.3B.2: canonical calendar-date-ONLY strings
+  // ("YYYY-MM-DD", e.g. "2027-06-12") - deliberately NOT the
+  // PersistedTimestamp fields above. A Timestamp encodes a specific
+  // instant and requires picking a timezone to convert to/from a
+  // calendar date, which is exactly the class of bug ("was it still
+  // June 12 where the user was, or had it already rolled to June 13
+  // UTC?") a date-only string avoids by construction - see
+  // src/domain/tripDates.ts for the parsing/formatting/horizon helpers
+  // built on this representation. tripStartDate is the date travel
+  // begins - also the intended future savings-planning deadline.
+  // tripEndDate is optional. Both remain optional/nullable: existing
+  // trip documents have neither, and neither is ever backfilled with a
+  // fabricated value - the UI shows truthful "Add trip dates" copy
+  // instead. Set by the client at trip-creation time (Trip creation is
+  // a direct client write gated by firestore.rules, not a trusted
+  // Cloud Function - see createTrip in src/services/firebase/trips.ts);
+  // not yet part of any update/edit path.
+  tripStartDate?: string | null;
+  tripEndDate?: string | null;
 
   // Frozen Milestone 2B additive fields. A neutral, resource-level
   // starting balance (integer minor units) representing money the
@@ -62,4 +85,11 @@ export type CreateTripInput = {
   target: number;
   imageUrl: string;
   ownerId: string;
+  // Checkpoint 3F.3B.2: canonical "YYYY-MM-DD" strings (see the Trip
+  // type comment above). tripStartDate is required for trips created
+  // from this checkpoint forward - app/(tabs)/trips/create.tsx validates
+  // this client-side before calling createTrip. tripEndDate stays
+  // optional/nullable.
+  tripStartDate: string;
+  tripEndDate: string | null;
 };

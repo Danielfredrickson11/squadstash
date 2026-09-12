@@ -81,9 +81,25 @@ service cloud.firestore {
     match /trips/{tripId} {
       allow list, get: if isTripMember() || isTripOwner();
 
+      // Checkpoint 3F.3B.2: a canonical "YYYY-MM-DD" calendar-date-only
+      // string - format only (a real calendar date, e.g. rejecting
+      // "2027-02-30", is deliberately NOT re-validated here; Firestore
+      // rules have no date-arithmetic primitives to do that cheaply and
+      // reliably, and a malformed-but-format-valid date is a data-
+      // quality nuisance, not a security or financial-integrity issue -
+      // see the checkpoint report). "Start date cannot be before today"
+      // is intentionally NOT enforced here either, for the same reason:
+      // "today" is a client-perspective, timezone-sensitive notion, and
+      // rejecting a legitimate create near a day boundary would be worse
+      // than not enforcing a soft product guardrail server-side; Trip
+      // Create validates this client-side instead.
+      function isValidCanonicalDate(v) {
+        return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+      }
+
       // Create requires: ownerId, memberIds includes owner, title string,
-      // target number, saved number, imageUrl string. location may be
-      // string or null.
+      // target number, saved number, imageUrl string, tripStartDate a
+      // valid canonical date. location/tripEndDate may be string or null.
       //
       // Milestone 2B Checkpoint 4I: Trip creation remains a direct client
       // write for now (unlike Bucket, which moved to a trusted callable
@@ -102,6 +118,14 @@ service cloud.firestore {
       // initialization and seeding forged financial state), or set only
       // one and permanently break the Trip via the backend's partial-
       // ledger failed-precondition guard - see recordSavingsTransaction.ts.
+      //
+      // Checkpoint 3F.3B.2: tripStartDate is required (matching the
+      // product decision that every trip created from this checkpoint
+      // forward must have a real start date) - tripEndDate stays
+      // optional/nullable, and when both are present as valid dates,
+      // end must be on/after start (a plain string >= comparison is
+      // correct here because same-length ISO "YYYY-MM-DD" strings sort
+      // lexicographically in calendar order).
       allow create: if signedIn()
         && request.resource.data.ownerId == request.auth.uid
         && request.resource.data.memberIds is list
@@ -116,9 +140,19 @@ service cloud.firestore {
           || request.resource.data.location is string
           || request.resource.data.location == null
         )
+        && isValidCanonicalDate(request.resource.data.tripStartDate)
+        && (
+          !(request.resource.data.keys().hasAny(['tripEndDate']))
+          || request.resource.data.tripEndDate == null
+          || (
+            isValidCanonicalDate(request.resource.data.tripEndDate)
+            && request.resource.data.tripEndDate >= request.resource.data.tripStartDate
+          )
+        )
         && request.resource.data.keys().hasOnly([
           'ownerId', 'memberIds', 'title', 'location', 'target', 'saved',
-          'imageUrl', 'createdAt', 'lastUpdatedAt', 'lastUpdatedBy'
+          'imageUrl', 'tripStartDate', 'tripEndDate', 'createdAt',
+          'lastUpdatedAt', 'lastUpdatedBy'
         ]);
 
       // SEC-001 fix: field-level allowlists for update, for both owner and
@@ -137,6 +171,16 @@ service cloud.firestore {
       // creation is unaffected - saved's create-time exposure is a
       // separate, deliberately deferred gap (see the "allow create"
       // clause above), tracked for a dedicated follow-up checkpoint.
+      // Checkpoint 3F.3B.3: tripStartDate/tripEndDate join the OWNER-only
+      // update allowlist (a member may still never touch them, matching
+      // "Owner may update dates; Member may NOT"). The shape checks below
+      // apply to the POST-write document regardless of which fields this
+      // particular update actually touched - that's safe/correct, not
+      // overly strict, because it only ever re-affirms an invariant the
+      // create rule already established (a trip with no dates at all has
+      // neither key present, so both checks short-circuit via
+      // !keys().hasAny(...) and an unrelated field-only update, like a
+      // title rename, is unaffected either way).
       allow update: if (isTripMember() || isTripOwner())
         && request.resource.data.ownerId == resource.data.ownerId
         && (resource.data.ownerId in request.resource.data.memberIds)
@@ -146,9 +190,25 @@ service cloud.firestore {
         && request.resource.data.imageUrl is string
         && request.resource.data.memberIds is list
         && (
+          !(request.resource.data.keys().hasAny(['tripStartDate']))
+          || isValidCanonicalDate(request.resource.data.tripStartDate)
+        )
+        && (
+          !(request.resource.data.keys().hasAny(['tripEndDate']))
+          || request.resource.data.tripEndDate == null
+          || (
+            isValidCanonicalDate(request.resource.data.tripEndDate)
+            && isValidCanonicalDate(request.resource.data.tripStartDate)
+            && request.resource.data.tripEndDate >= request.resource.data.tripStartDate
+          )
+        )
+        && (
           isTripOwner()
             ? request.resource.data.diff(resource.data).affectedKeys()
-                .hasOnly(['title', 'location', 'target', 'imageUrl', 'memberIds', 'lastUpdatedAt', 'lastUpdatedBy'])
+                .hasOnly([
+                  'title', 'location', 'target', 'imageUrl', 'memberIds',
+                  'tripStartDate', 'tripEndDate', 'lastUpdatedAt', 'lastUpdatedBy'
+                ])
             : request.resource.data.diff(resource.data).affectedKeys()
                 .hasOnly(['title', 'location', 'imageUrl', 'lastUpdatedAt', 'lastUpdatedBy'])
         );

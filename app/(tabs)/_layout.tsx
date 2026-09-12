@@ -4,7 +4,7 @@ import React from "react";
 import { ActivityIndicator, Platform, View } from "react-native";
 import { useTheme } from "react-native-paper";
 
-import { useClientOnlyValue } from "@/components/useClientOnlyValue";
+import { BottomNav } from "../../components/navigation/BottomNav";
 import { useAuth } from "../../src/contexts/AuthContext";
 
 function TabBarIcon(props: {
@@ -24,8 +24,6 @@ export default function TabLayout() {
   // checked by prefix below so no bucketId is ever hardcoded.
   const pathname = usePathname();
   const isOnBucketDetail = pathname.startsWith("/buckets/");
-
-  const headerShown = useClientOnlyValue(false, true);
 
   if (loading) {
     return (
@@ -48,8 +46,29 @@ export default function TabLayout() {
 
   return (
     <Tabs
+      // Checkpoint 3F.2: fully custom dark floating bar with a center
+      // create action, replacing the default tabBarStyle-only rendering
+      // below (that styling is now unused for the bar chrome itself but
+      // left in place - headerShown/sceneStyle/headerStyle etc. below
+      // still apply). See components/navigation/BottomNav.tsx for why
+      // its tab-press handling is written to keep the existing Buckets
+      // tabPress listener working unchanged.
+      tabBar={(props) => <BottomNav {...props} />}
       screenOptions={{
-        headerShown,
+        // Checkpoint 3F.2A root cause: this is the OUTER Tabs
+        // navigator's own header, entirely separate from either nested
+        // Stack's own header (app/(tabs)/buckets/_layout.tsx and
+        // app/(tabs)/trips/_layout.tsx already set headerShown:false on
+        // THEIR OWN Stack, independently of this setting) - it was
+        // previously resolving to `true` on web via useClientOnlyValue,
+        // painting a generic "Home"/"Buckets"/"Trips" bar above every
+        // screen's own custom in-content header. Every screen that needs
+        // a way back already has one of its own regardless of this
+        // value (Bucket Detail's Back button, Trip Detail's "← Back",
+        // Trip Create's Cancel button) - the tab bar itself is also
+        // always available - so hiding this outer header everywhere is
+        // safe and doesn't remove any actual navigation affordance.
+        headerShown: false,
 
         // ✅ One consistent app background
         sceneStyle: { backgroundColor: theme.colors.background },

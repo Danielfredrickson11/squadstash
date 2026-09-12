@@ -13,6 +13,7 @@ import {
   orderBy,
   query,
   serverTimestamp,
+  updateDoc,
   type DocumentData,
   where,
 } from "firebase/firestore";
@@ -45,6 +46,11 @@ function mapTripDocument(id: string, data: DocumentData): Trip {
     createdAt: data.createdAt as PersistedTimestamp | undefined,
     lastUpdatedAt: data.lastUpdatedAt as PersistedTimestamp | undefined,
     lastUpdatedBy: data.lastUpdatedBy as string | undefined,
+    // Checkpoint 3F.3B.2: canonical "YYYY-MM-DD" strings - absent on any
+    // trip created before this checkpoint, which is why both stay
+    // optional/undefined here rather than defaulted.
+    tripStartDate: data.tripStartDate as string | null | undefined,
+    tripEndDate: data.tripEndDate as string | null | undefined,
   };
 }
 
@@ -68,7 +74,7 @@ export async function fetchMemberTrips(uid: string): Promise<Trip[]> {
 }
 
 export async function createTrip(input: CreateTripInput): Promise<string> {
-  const { title, location, target, imageUrl, ownerId } = input;
+  const { title, location, target, imageUrl, ownerId, tripStartDate, tripEndDate } = input;
 
   const ref = await addDoc(collection(db, "trips"), {
     title,
@@ -77,6 +83,8 @@ export async function createTrip(input: CreateTripInput): Promise<string> {
     saved: 0,
 
     imageUrl,
+    tripStartDate,
+    tripEndDate,
 
     createdAt: serverTimestamp(),
     ownerId,
@@ -97,4 +105,28 @@ export async function fetchTripById(tripId: string): Promise<Trip | null> {
 
 export async function deleteTrip(tripId: string): Promise<void> {
   await deleteDoc(doc(db, "trips", tripId));
+}
+
+// Checkpoint 3F.3B.3: owner-only trip-date edit. Direct client write
+// (matching createTrip/deleteTrip's own pattern - Trip has no trusted
+// callable at all today), gated by firestore.rules' owner-only update
+// allowlist for tripStartDate/tripEndDate. tripStartDate is required
+// (cannot be cleared to null once set - a trip with dates cannot revert
+// to dateless); tripEndDate may be explicitly cleared via null.
+export type UpdateTripDatesInput = {
+  tripStartDate: string;
+  tripEndDate: string | null;
+  lastUpdatedBy: string;
+};
+
+export async function updateTripDates(
+  tripId: string,
+  input: UpdateTripDatesInput
+): Promise<void> {
+  await updateDoc(doc(db, "trips", tripId), {
+    tripStartDate: input.tripStartDate,
+    tripEndDate: input.tripEndDate,
+    lastUpdatedAt: serverTimestamp(),
+    lastUpdatedBy: input.lastUpdatedBy,
+  });
 }

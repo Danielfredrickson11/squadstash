@@ -1,48 +1,66 @@
 // src/theme/appTheme.ts
 import { MD3DarkTheme, MD3LightTheme } from "react-native-paper";
 
-const brand = {
-  primary: "#2B66FF",
-  secondary: "#5C47B8",
-};
+import { darkColors, lightColors } from "./tokens";
 
 export const paperThemes = {
+  // Checkpoint 3F.3A approved Light Mode - light, premium, clean fintech
+  // + travel. Built from lightColors (src/theme/tokens.ts) the same way
+  // the dark theme below is built from darkColors, so both themes share
+  // one semantic source of truth rather than duplicating color literals.
+  // primary is the restrained mint/teal accent (CTAs, active nav,
+  // success); secondary is the single approved soft-blue accent - no
+  // purple/orange/coral used as decorative brand color.
   light: {
     ...MD3LightTheme,
-    roundness: 14,
+    roundness: 18,
     colors: {
       ...MD3LightTheme.colors,
 
-      primary: brand.primary,
-      secondary: brand.secondary,
+      primary: lightColors.mint,
+      onPrimary: lightColors.onMint,
+      secondary: lightColors.blue,
 
-      background: "#F6F7FB",
-      surface: "#FFFFFF",
-      surfaceVariant: "#F1F5F9",
-      outline: "#E2E8F0",
+      background: lightColors.background,
+      surface: lightColors.surface,
+      surfaceVariant: lightColors.surfaceTertiary,
+      outline: lightColors.border,
+      outlineVariant: lightColors.border,
 
-      onBackground: "#0F172A",
-      onSurface: "#0F172A",
-      onSurfaceVariant: "#64748B",
+      onBackground: lightColors.textPrimary,
+      onSurface: lightColors.textPrimary,
+      onSurfaceVariant: lightColors.textSecondary,
+
+      error: lightColors.coral,
     },
   },
+  // Checkpoint 3F.2 dark signature UI - preserved unchanged as the future
+  // Dark Mode option. Built from src/theme/tokens.ts's darkColors so the
+  // palette lives in one place rather than being hardcoded per screen.
+  // primary is the signature mint accent (not the old brand blue) -
+  // onPrimary is a near-black for legible text/icons on a bright mint
+  // background.
   dark: {
     ...MD3DarkTheme,
-    roundness: 14,
+    roundness: 18,
     colors: {
       ...MD3DarkTheme.colors,
 
-      primary: brand.primary,
-      secondary: brand.secondary,
+      primary: darkColors.mint,
+      onPrimary: darkColors.onMint,
+      secondary: darkColors.violet,
 
-      background: "#0B0F1A",
-      surface: "#0F1526",
-      surfaceVariant: "#11182A",
-      outline: "#182240",
+      background: darkColors.background,
+      surface: darkColors.surface,
+      surfaceVariant: darkColors.surfaceElevated,
+      outline: darkColors.border,
+      outlineVariant: darkColors.border,
 
-      onBackground: "#FFFFFF",
-      onSurface: "#FFFFFF",
-      onSurfaceVariant: "#A9B0C3",
+      onBackground: darkColors.textPrimary,
+      onSurface: darkColors.textPrimary,
+      onSurfaceVariant: darkColors.textSecondary,
+
+      error: darkColors.coral,
     },
   },
 };

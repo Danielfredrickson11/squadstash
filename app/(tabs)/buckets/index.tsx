@@ -1,28 +1,28 @@
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
-  FlatList,
   Platform,
+  Pressable,
+  ScrollView,
   StyleSheet,
   View,
   useWindowDimensions,
 } from "react-native";
 import {
   Button,
-  Card,
-  Chip,
   Dialog,
   Portal,
   Text,
   TextInput,
   useTheme,
 } from "react-native-paper";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 
+import { AccentColorPicker } from "../../../components/buckets/AccentColorPicker";
 import { AvatarCircle, initialsFromName, shortUid } from "../../../components/buckets/AvatarCircle";
-import { BucketCard } from "../../../components/buckets/BucketCard";
+import { BucketGridCard } from "../../../components/buckets/BucketGridCard";
 import { useAuth } from "../../../src/contexts/AuthContext";
-import { useSavingsMoneyAction } from "../../../src/hooks/useSavingsMoneyAction";
 import {
   addBucketMember,
   createBucket,
@@ -35,6 +35,8 @@ import {
 import type { UpdateBucketInput } from "../../../src/services/firebase/buckets";
 import { lookupUserByEmail } from "../../../src/services/firebase/functions";
 import { subscribeToPublicUsersByIds } from "../../../src/services/firebase/users";
+import { radii, spacing, typography } from "../../../src/theme/tokens";
+import { useSemanticColors } from "../../../src/theme/useSemanticColors";
 import type { Bucket, PublicProfile } from "../../../src/types/domain";
 import { formatCurrency, parseDollarsToMinorUnits } from "../../../utils/format";
 
@@ -53,6 +55,8 @@ const COLORS = [
 // calculation (Checkpoint 3D goal-layout fix) so per-card widths are
 // computed against the actual available content width.
 const CONTENT_PADDING = 16;
+
+type BucketFilter = "all" | "personal" | "shared";
 
 function isValidInviteEmail(email: string) {
   const e = email.trim().toLowerCase();
@@ -158,7 +162,13 @@ export default function BucketsScreen() {
   const { user, loading } = useAuth();
   const { width } = useWindowDimensions();
   const theme = useTheme();
+  const colors = useSemanticColors();
   const router = useRouter();
+  // Global center-create action (Milestone 3 Checkpoint 3F.2): the
+  // BottomNav's "New Bucket" option navigates here with ?openCreate=1
+  // rather than duplicating this screen's own creation dialog/state -
+  // see components/navigation/CreateActionSheet.tsx.
+  const params = useLocalSearchParams<{ openCreate?: string }>();
 
   // Ownership here is a UI affordance only (hide/disable actions that are
   // guaranteed to fail). Firestore rules remain the authoritative
@@ -166,22 +176,17 @@ export default function BucketsScreen() {
   const isBucketOwner = (b: { ownerId?: string } | null | undefined) =>
     !!(user?.uid && b?.ownerId === user.uid);
 
+  // Checkpoint 3F.2: mobile-first target is a 2-column compact grid
+  // (previously 1 column below 700px) - the approved reference's
+  // Personal Essentials grid is 2-column even on a ~390-430px phone.
   const numColumns = useMemo(() => {
-    if (width >= 1100) return 3;
-    if (width >= 700) return 2;
-    return 1;
+    if (width >= 1100) return 4;
+    if (width >= 700) return 3;
+    return 2;
   }, [width]);
 
-  // Explicit per-card pixel width (Checkpoint 3D goal-layout fix),
-  // mirroring app/(tabs)/trips/index.tsx's proven cardWidth pattern
-  // exactly - replaces the previous flex:1 card sizing, which is only
-  // well-defined for equal-width sharing inside a bounded
-  // columnWrapperStyle row (numColumns > 1). When numColumns is 1,
-  // FlatList renders each card as a direct item in its own vertically
-  // scrolling (effectively unbounded-height) list, where flex-grow has
-  // no natural-content meaning - a known React Native list-item
-  // anti-pattern. CONTENT_PADDING/CARD_GAP mirror this screen's own
-  // container padding (16) and row gap (GAP, below).
+  const GAP = 12;
+
   const cardWidth = useMemo(() => {
     const available = width - CONTENT_PADDING * 2;
     const totalGaps = GAP * (numColumns - 1);
@@ -193,6 +198,8 @@ export default function BucketsScreen() {
 
   // Optional: show a friendly message if permissions fail
   const [readError, setReadError] = useState<string | null>(null);
+
+  const [filter, setFilter] = useState<BucketFilter>("all");
 
   // Create dialog
   const [createVisible, setCreateVisible] = useState(false);
@@ -216,16 +223,6 @@ export default function BucketsScreen() {
   // await; submitting remains solely responsible for the visible
   // loading/disabled UI.
   const createInFlightRef = useRef(false);
-
-  // The shared Personal Savings money-action controller (Milestone 3
-  // Checkpoint 3D) - see src/hooks/useSavingsMoneyAction.tsx for why this
-  // is a single Context-based controller rather than per-screen state:
-  // this screen and the Bucket detail screen both open the SAME
-  // underlying sheet/mutation, with one idempotency/serialization owner
-  // between them. Replaces the pre-3D quickAddSubmittingId/
-  // quickAddPendingRef/quickAddInFlightRef and the entire moneyDialog*
-  // state block that used to live here.
-  const { open: openMoneyAction } = useSavingsMoneyAction();
 
   // Edit/Delete state
   const [menuAnchor, setMenuAnchor] = useState<string | null>(null);
@@ -319,6 +316,17 @@ export default function BucketsScreen() {
 
   // Create dialog helpers
   const openCreate = () => setCreateVisible(true);
+
+  // Global center-create action support: opens this screen's own
+  // existing New Bucket dialog when navigated here with ?openCreate=1 -
+  // see components/navigation/CreateActionSheet.tsx. Reuses openCreate()
+  // above rather than any new creation path.
+  useEffect(() => {
+    if (params.openCreate) {
+      openCreate();
+    }
+  }, [params.openCreate]);
+
   // The unconditional internal reset - always clears the form AND the
   // pending request ref, with no guard of its own. onAddBucket's success
   // path calls this directly while createInFlightRef.current is still
@@ -652,8 +660,8 @@ export default function BucketsScreen() {
 
   // Navigates to the dedicated Bucket detail screen (Milestone 3
   // Checkpoint 3B). A plain presentation callback, not Expo Router
-  // dropped directly into BucketCard, so the card stays presentation-
-  // focused - see components/buckets/BucketCard.tsx's onOpenBucket prop.
+  // dropped directly into the card, so the card stays presentation-
+  // focused - see components/buckets/BucketGridCard.tsx's onOpenBucket prop.
   const openBucketDetail = (bucket: Bucket) => {
     router.push({
       pathname: "/(tabs)/buckets/[bucketId]",
@@ -661,81 +669,248 @@ export default function BucketsScreen() {
     });
   };
 
-  // Presentation lives in BucketCard (components/buckets/BucketCard.tsx)
-  // - this closure only supplies the per-item state slices and the
-  // existing screen-owned handlers (quickAdd/openMoneyDialog/etc. still
-  // perform every actual Firebase read/write; the card only invokes
-  // them).
-  const renderItem = ({ item }: { item: Bucket }) => {
-    return (
-      <BucketCard
-        bucket={item}
-        isOwner={isBucketOwner(item)}
-        isMenuOpen={menuAnchor === item.id}
-        cardWidth={cardWidth}
-        avatarForUid={avatarForUid}
-        onOpenBucket={openBucketDetail}
-        onOpenMembers={openMembers}
-        onOpenMenu={openMenu}
-        onCloseMenu={closeMenu}
-        onEdit={startEdit}
-        onDelete={startDelete}
-        onOpenMoneyAction={openMoneyAction}
-      />
-    );
-  };
+  // Checkpoint 3F.3B.4: a trip_personal Bucket ("My Stash") belongs to
+  // the Trip experience, not the ordinary Buckets tab - filtered out
+  // here at the presentation layer only (never deleted, never excluded
+  // from subscribeToUserBuckets itself, so the user's real data/access
+  // is unaffected - Trip Detail reads the exact same underlying
+  // document directly by its own id). This is deliberately the ONLY
+  // place that filter is applied on this screen; totalStashed below is
+  // computed from the same filtered list so the Buckets tab's own
+  // summary stays consistent with what it actually displays.
+  const visibleBuckets = useMemo(
+    () => buckets.filter((b) => b.bucketType !== "trip_personal"),
+    [buckets]
+  );
+
+  // Truthful client-side segmentation (Milestone 3 Checkpoint 3F.2) -
+  // derived entirely from the already-subscribed real `buckets` list, no
+  // new query. "Shared" = memberIds.length > 1 (more than just the
+  // owner); "Personal" = everything else. This is the "closest truthful
+  // existing definition" the checkpoint's own audit instruction allows
+  // when a strict ownerId-based split isn't meaningfully different -
+  // every bucket falls into exactly one section, with no gap/overlap.
+  const personalBuckets = useMemo(
+    () => visibleBuckets.filter((b) => (b.memberIds?.length ?? 0) <= 1),
+    [visibleBuckets]
+  );
+  const sharedBuckets = useMemo(
+    () => visibleBuckets.filter((b) => (b.memberIds?.length ?? 0) > 1),
+    [visibleBuckets]
+  );
+
+  const totalStashed = useMemo(
+    () => visibleBuckets.reduce((sum, b) => sum + (Number(b.balance) || 0), 0),
+    [visibleBuckets]
+  );
+
+  const showPersonal = filter !== "shared";
+  const showShared = filter !== "personal";
+
+  // Chunk personalBuckets into rows of `numColumns` for the compact
+  // grid - a plain flex-wrap layout (not FlatList) since this screen now
+  // renders two different card shapes (compact grid + full-width shared
+  // rows) in one scrollable composition.
+  const personalRows = useMemo(() => {
+    const rows: Bucket[][] = [];
+    for (let i = 0; i < personalBuckets.length; i += numColumns) {
+      rows.push(personalBuckets.slice(i, i + numColumns));
+    }
+    return rows;
+  }, [personalBuckets, numColumns]);
 
   return (
     <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
-      <View style={styles.headerRow}>
-        <View style={{ flex: 1 }}>
-          <Text variant="headlineSmall" style={styles.title}>
-            Personal Buckets
-          </Text>
-          <Text style={[styles.subtitle, { color: theme.colors.onSurfaceVariant }]}>
-            Track and manage your savings goals.
-          </Text>
+      <ScrollView contentContainerStyle={styles.scrollContent}>
+        <View style={styles.headerRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.title, { color: theme.colors.onBackground }]}>Buckets</Text>
+            <Text style={[styles.subtitle, { color: theme.colors.onSurfaceVariant }]}>
+              Smart saving for your essentials & squad goals.
+            </Text>
 
-          {readError ? (
-            <Text style={{ marginTop: 6, color: theme.colors.error }}>{readError}</Text>
-          ) : null}
+            {readError ? (
+              <Text style={{ marginTop: 6, color: theme.colors.error }}>{readError}</Text>
+            ) : null}
+          </View>
+
+          <Pressable
+            onPress={openCreate}
+            accessibilityRole="button"
+            accessibilityLabel="New Goal"
+            style={[styles.addButton, { backgroundColor: theme.colors.primary }]}
+          >
+            <MaterialCommunityIcons name="plus" size={22} color={theme.colors.onPrimary} />
+          </Pressable>
         </View>
 
-        <Button mode="contained" icon="plus" onPress={openCreate}>
-          New Goal
-        </Button>
-      </View>
+        {/* Checkpoint 3F.3A: the Buckets screen's Total Stashed treatment
+            is intentionally different from Home's dark-navy hero - the
+            approved mockup calls for a pale mint/cool surface card with
+            deep navy text here specifically. Dark Mode keeps its
+            original surface+border card unchanged. */}
+        <View
+          style={[
+            styles.summaryCard,
+            theme.dark
+              ? { backgroundColor: theme.colors.surface, borderColor: colors.border }
+              : { backgroundColor: colors.mintSurface, borderColor: "transparent" },
+          ]}
+        >
+          <Text style={[styles.summaryLabel, { color: theme.colors.onSurfaceVariant }]}>
+            TOTAL STASHED
+          </Text>
+          <Text style={[styles.summaryValue, { color: theme.colors.onSurface }]}>
+            {formatCurrency(totalStashed)}
+          </Text>
+        </View>
 
-      <FlatList
-        data={buckets}
-        keyExtractor={(b) => b.id}
-        renderItem={renderItem}
-        numColumns={numColumns}
-        key={numColumns}
-        columnWrapperStyle={numColumns > 1 ? styles.row : undefined}
-        contentContainerStyle={buckets.length === 0 ? styles.emptyContainer : undefined}
-        ListEmptyComponent={
-          <Card style={{ borderRadius: 12 }}>
-            <Card.Content>
-              <Text style={{ fontWeight: "700", marginBottom: 6 }}>
-                You don’t have any buckets yet.
-              </Text>
-              <Text style={[styles.muted, { color: theme.colors.onSurfaceVariant }]}>
-                Create your first goal to start tracking savings.
-              </Text>
-              <View style={{ height: 12 }} />
-              <Button mode="contained" icon="plus" onPress={openCreate}>
-                New Goal
-              </Button>
-            </Card.Content>
-          </Card>
-        }
-      />
+        <View style={styles.filterRow}>
+          {(
+            [
+              { key: "all", label: "All Buckets" },
+              { key: "personal", label: "Personal" },
+              { key: "shared", label: "Shared" },
+            ] as const
+          ).map((opt) => {
+            const active = filter === opt.key;
+            // Checkpoint 3F.3A: Dark Mode keeps its original mint-
+            // highlighted selected pill unchanged. The approved Light
+            // Mode mockup instead calls for a deep-navy filled selected
+            // pill with white text, and a soft blue-gray/light surface
+            // for unselected pills.
+            const chipColors = theme.dark
+              ? {
+                  background: active ? colors.mintSurface : theme.colors.surface,
+                  border: active ? colors.mint : colors.border,
+                  text: active ? colors.mintText : theme.colors.onSurfaceVariant,
+                }
+              : {
+                  background: active ? colors.navy : colors.surfaceTertiary,
+                  border: active ? colors.navy : colors.border,
+                  text: active ? "#FFFFFF" : colors.textSecondary,
+                };
+            return (
+              <Pressable
+                key={opt.key}
+                onPress={() => setFilter(opt.key)}
+                accessibilityRole="button"
+                accessibilityLabel={opt.label}
+                accessibilityState={{ selected: active }}
+                style={[
+                  styles.filterChip,
+                  { backgroundColor: chipColors.background, borderColor: chipColors.border },
+                ]}
+              >
+                <Text style={[styles.filterChipText, { color: chipColors.text }]}>
+                  {opt.label}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+
+        {visibleBuckets.length === 0 ? (
+          <View
+            style={[
+              styles.emptyCard,
+              { backgroundColor: theme.colors.surface, borderColor: colors.border },
+            ]}
+          >
+            <Text style={[styles.emptyTitle, { color: theme.colors.onSurface }]}>
+              You don’t have any buckets yet.
+            </Text>
+            <Text style={[styles.emptySub, { color: theme.colors.onSurfaceVariant }]}>
+              Create your first goal to start tracking savings.
+            </Text>
+            <View style={{ height: 12 }} />
+            <Button mode="contained" icon="plus" onPress={openCreate}>
+              New Goal
+            </Button>
+          </View>
+        ) : (
+          <>
+            {showPersonal && personalBuckets.length > 0 ? (
+              <View style={styles.section}>
+                <Text style={[styles.sectionTitle, { color: theme.colors.onSurface }]}>
+                  Personal Essentials
+                </Text>
+                {personalRows.map((row, rowIdx) => (
+                  <View key={rowIdx} style={[styles.gridRow, { gap: GAP }]}>
+                    {row.map((b, colIdx) => (
+                      <BucketGridCard
+                        key={b.id}
+                        variant="compact"
+                        bucket={b}
+                        accentIndex={rowIdx * numColumns + colIdx}
+                        isOwner={isBucketOwner(b)}
+                        isMenuOpen={menuAnchor === b.id}
+                        width={cardWidth}
+                        avatarForUid={avatarForUid}
+                        onOpenBucket={openBucketDetail}
+                        onOpenMembers={openMembers}
+                        onOpenMenu={openMenu}
+                        onCloseMenu={closeMenu}
+                        onEdit={startEdit}
+                        onDelete={startDelete}
+                      />
+                    ))}
+                  </View>
+                ))}
+              </View>
+            ) : null}
+
+            {showShared ? (
+              <View style={styles.section}>
+                <Text style={[styles.sectionTitle, { color: theme.colors.onSurface }]}>
+                  Shared Buckets
+                </Text>
+                {sharedBuckets.length === 0 ? (
+                  <View
+                    style={[
+                      styles.emptyCard,
+                      { backgroundColor: theme.colors.surface, borderColor: colors.border },
+                    ]}
+                  >
+                    <Text style={[styles.emptySub, { color: theme.colors.onSurfaceVariant }]}>
+                      No shared buckets yet. Add a member to a bucket to see it here.
+                    </Text>
+                  </View>
+                ) : (
+                  <View style={{ gap: spacing.sm }}>
+                    {sharedBuckets.map((b, index) => (
+                      <BucketGridCard
+                        key={b.id}
+                        variant="shared"
+                        bucket={b}
+                        accentIndex={index}
+                        isOwner={isBucketOwner(b)}
+                        isMenuOpen={menuAnchor === b.id}
+                        avatarForUid={avatarForUid}
+                        onOpenBucket={openBucketDetail}
+                        onOpenMembers={openMembers}
+                        onOpenMenu={openMenu}
+                        onCloseMenu={closeMenu}
+                        onEdit={startEdit}
+                        onDelete={startDelete}
+                      />
+                    ))}
+                  </View>
+                )}
+              </View>
+            ) : null}
+          </>
+        )}
+      </ScrollView>
 
       {/* Members Dialog */}
       <Portal>
-        <Dialog visible={membersVisible} onDismiss={closeMembers}>
-          <Dialog.Title>Bucket Members</Dialog.Title>
+        <Dialog
+          visible={membersVisible}
+          onDismiss={closeMembers}
+          style={[styles.dialogSurface, { backgroundColor: colors.surfaceElevated }]}
+        >
+          <Dialog.Title style={styles.dialogTitle}>Bucket Members</Dialog.Title>
           <Dialog.Content>
             <Text style={{ marginBottom: 8, opacity: 0.7 }}>
               Bucket:{" "}
@@ -841,115 +1016,136 @@ export default function BucketsScreen() {
         </Dialog>
       </Portal>
 
-      {/* Create Dialog */}
+      {/* Create Dialog - Checkpoint 3F.2A: compact dark premium surface,
+          explicit backgroundColor override since Paper's default Dialog
+          surface color is auto-computed from an MD3 elevation overlay
+          that reads as an off-brand tint against this app's palette
+          (the exact same category of issue diagnosed for Bucket Detail's
+          Add Money button in the 3F.1 review). Fields switched to
+          mode="outlined" + dense for a compact height; functionality
+          (state/handlers/idempotency) is completely unchanged below. */}
       <Portal>
-        <Dialog visible={createVisible} onDismiss={cancelCreate}>
-          <Dialog.Title>New Bucket</Dialog.Title>
+        <Dialog
+          visible={createVisible}
+          onDismiss={cancelCreate}
+          style={[styles.dialogSurface, { backgroundColor: colors.surfaceElevated }]}
+        >
+          <Dialog.Title style={styles.dialogTitle}>New Bucket</Dialog.Title>
           <Dialog.Content>
             <TextInput
+              mode="outlined"
+              dense
               label="Name (e.g., Rent, Food, Vacation)"
               value={name}
               onChangeText={setName}
-              style={{ marginBottom: 12 }}
+              style={styles.dialogField}
             />
             <TextInput
+              mode="outlined"
+              dense
               label="Target Amount (e.g., 5000)"
               value={target}
               onChangeText={setTarget}
               keyboardType="numeric"
-              style={{ marginBottom: 12 }}
+              style={styles.dialogField}
             />
             <TextInput
+              mode="outlined"
+              dense
               label="Starting Balance (optional)"
               value={balance}
               onChangeText={setBalance}
               keyboardType="numeric"
-              style={{ marginBottom: 16 }}
+              style={styles.dialogField}
             />
 
-            <Text style={{ marginBottom: 8 }}>Accent Color</Text>
-            <View style={styles.colorRow}>
-              {COLORS.map((c) => (
-                <Chip
-                  key={c}
-                  selected={color === c}
-                  onPress={() => setColor(c)}
-                  style={[
-                    styles.colorChip,
-                    { backgroundColor: c },
-                    color === c ? styles.colorChipSelected : null,
-                  ]}
-                  textStyle={{ color: "white", fontWeight: "700" }}
-                >
-                  {color === c ? "Selected" : " "}
-                </Chip>
-              ))}
-            </View>
+            <Text style={[styles.dialogLabel, { color: theme.colors.onSurfaceVariant }]}>
+              Accent Color
+            </Text>
+            <AccentColorPicker colors={COLORS} selected={color} onSelect={setColor} />
           </Dialog.Content>
           <Dialog.Actions>
-            <Button onPress={cancelCreate} disabled={submitting}>Cancel</Button>
-            <Button mode="contained" onPress={onAddBucket} disabled={!canCreate} loading={submitting}>
+            <Button onPress={cancelCreate} disabled={submitting} textColor={theme.colors.onSurfaceVariant}>
+              Cancel
+            </Button>
+            <Button
+              mode="contained"
+              buttonColor={theme.colors.primary}
+              textColor={theme.colors.onPrimary}
+              onPress={onAddBucket}
+              disabled={!canCreate}
+              loading={submitting}
+            >
               Save
             </Button>
           </Dialog.Actions>
         </Dialog>
       </Portal>
 
-      {/* Edit Dialog */}
+      {/* Edit Dialog - same compact dark treatment as Create, for visual
+          consistency. */}
       <Portal>
-        <Dialog visible={editVisible} onDismiss={closeEdit}>
-          <Dialog.Title>Edit Bucket</Dialog.Title>
+        <Dialog
+          visible={editVisible}
+          onDismiss={closeEdit}
+          style={[styles.dialogSurface, { backgroundColor: colors.surfaceElevated }]}
+        >
+          <Dialog.Title style={styles.dialogTitle}>Edit Bucket</Dialog.Title>
           <Dialog.Content>
             <TextInput
+              mode="outlined"
+              dense
               label="Name"
               value={editing?.name ?? ""}
               onChangeText={(v) => setEditing((p) => (p ? { ...p, name: v } : p))}
-              style={{ marginBottom: 12 }}
+              style={styles.dialogField}
             />
             <TextInput
+              mode="outlined"
+              dense
               label="Target Amount"
               value={editing?.target?.toString() ?? ""}
               onChangeText={(v) => setEditing((p) => (p ? { ...p, target: Number(v) || 0 } : p))}
               keyboardType="numeric"
               disabled={!editingIsOwner}
-              style={{ marginBottom: 12 }}
+              style={styles.dialogField}
             />
-            <Text style={{ marginBottom: 4, opacity: 0.7 }}>Current Balance</Text>
-            <Text style={{ marginBottom: 4, fontSize: 16, fontWeight: "800" }}>
+            <Text style={[styles.dialogLabel, { color: theme.colors.onSurfaceVariant }]}>
+              Current Balance
+            </Text>
+            <Text style={[styles.dialogBalance, { color: theme.colors.onSurface }]}>
               {formatCurrency(editing?.balance ?? 0)}
             </Text>
-            <Text style={{ marginBottom: 16, opacity: 0.6, fontSize: 12 }}>
-              Use Contribute or Withdraw to change savings.
+            <Text style={[styles.dialogHint, { color: theme.colors.onSurfaceVariant }]}>
+              Use Add Money or Withdraw (on Bucket Detail) to change savings.
             </Text>
 
             {!editingIsOwner ? (
-              <Text style={{ marginBottom: 12, opacity: 0.7, fontSize: 12 }}>
+              <Text style={[styles.dialogHint, { color: theme.colors.onSurfaceVariant }]}>
                 Only the bucket owner can change the target.
               </Text>
             ) : null}
 
-            <Text style={{ marginBottom: 8 }}>Accent Color</Text>
-            <View style={styles.colorRow}>
-              {COLORS.map((c) => (
-                <Chip
-                  key={c}
-                  selected={editing?.color === c}
-                  onPress={() => setEditing((p) => (p ? { ...p, color: c } : p))}
-                  style={[
-                    styles.colorChip,
-                    { backgroundColor: c },
-                    editing?.color === c ? styles.colorChipSelected : null,
-                  ]}
-                  textStyle={{ color: "white", fontWeight: "700" }}
-                >
-                  {editing?.color === c ? "Selected" : " "}
-                </Chip>
-              ))}
-            </View>
+            <Text style={[styles.dialogLabel, { color: theme.colors.onSurfaceVariant }]}>
+              Accent Color
+            </Text>
+            <AccentColorPicker
+              colors={COLORS}
+              selected={editing?.color ?? null}
+              onSelect={(c) => setEditing((p) => (p ? { ...p, color: c } : p))}
+            />
           </Dialog.Content>
           <Dialog.Actions>
-            <Button onPress={closeEdit}>Cancel</Button>
-            <Button mode="contained" onPress={onSaveEdit} loading={submitting}>
+            <Button onPress={closeEdit} textColor={theme.colors.onSurfaceVariant}>
+              Cancel
+            </Button>
+            <Button
+              mode="contained"
+              buttonColor={theme.colors.primary}
+              textColor={theme.colors.onPrimary}
+              onPress={onSaveEdit}
+              loading={submitting}
+            >
               Save
             </Button>
           </Dialog.Actions>
@@ -958,12 +1154,20 @@ export default function BucketsScreen() {
 
       {/* The single shared money-action sheet (Milestone 3 Checkpoint
           3D) is rendered once in app/(tabs)/buckets/_layout.tsx
-          (MoneyActionSheet), not per-screen - see openMoneyAction above. */}
+          (MoneyActionSheet), not per-screen. It is opened only from
+          Bucket Detail now (Checkpoint 3F.2 design decision - list
+          cards no longer surface Add Money/Withdraw directly, matching
+          the approved reference's card design; both actions remain
+          fully reachable from Bucket Detail, unchanged). */}
 
       {/* Delete Confirm */}
       <Portal>
-        <Dialog visible={deleteVisible} onDismiss={closeDelete}>
-          <Dialog.Title>Delete Bucket</Dialog.Title>
+        <Dialog
+          visible={deleteVisible}
+          onDismiss={closeDelete}
+          style={[styles.dialogSurface, { backgroundColor: colors.surfaceElevated }]}
+        >
+          <Dialog.Title style={styles.dialogTitle}>Delete Bucket</Dialog.Title>
           <Dialog.Content>
             <Text>
               Are you sure you want to delete{" "}
@@ -972,8 +1176,16 @@ export default function BucketsScreen() {
             <Text style={{ marginTop: 8, opacity: 0.7 }}>Only the bucket owner can delete.</Text>
           </Dialog.Content>
           <Dialog.Actions>
-            <Button onPress={closeDelete}>Cancel</Button>
-            <Button mode="contained" onPress={onConfirmDelete} loading={submitting}>
+            <Button onPress={closeDelete} textColor={theme.colors.onSurfaceVariant}>
+              Cancel
+            </Button>
+            <Button
+              mode="contained"
+              buttonColor={colors.coral}
+              textColor="#FFFFFF"
+              onPress={onConfirmDelete}
+              loading={submitting}
+            >
               Delete
             </Button>
           </Dialog.Actions>
@@ -983,30 +1195,72 @@ export default function BucketsScreen() {
   );
 }
 
-const GAP = 12;
-
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 16 },
+  container: { flex: 1 },
+  scrollContent: { padding: CONTENT_PADDING, paddingBottom: 140 },
 
   headerRow: {
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "center",
+    alignItems: "flex-start",
     gap: 12,
-    marginBottom: 14,
+    marginBottom: spacing.md,
   },
-  title: { fontWeight: "900" },
-  subtitle: { marginTop: 2 },
+  title: { ...typography.pageTitle },
+  subtitle: { ...typography.body, marginTop: spacing.xs },
 
-  row: { gap: GAP, marginBottom: GAP },
+  addButton: {
+    width: 40,
+    height: 40,
+    borderRadius: radii.pill,
+    alignItems: "center",
+    justifyContent: "center",
+  },
 
-  muted: {},
+  summaryCard: {
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+  },
+  summaryLabel: { ...typography.meta, textTransform: "uppercase", letterSpacing: 0.6 },
+  summaryValue: { ...typography.majorValue, fontSize: 26, marginTop: 2 },
 
-  emptyContainer: { flexGrow: 1, justifyContent: "center" },
+  filterRow: {
+    flexDirection: "row",
+    gap: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  filterChip: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.xs,
+    borderRadius: radii.pill,
+    borderWidth: 1,
+  },
+  filterChipText: { fontSize: 12, fontWeight: "700" },
 
-  colorRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  colorChip: { borderRadius: 999, marginBottom: 8 },
-  colorChipSelected: { borderWidth: 2, borderColor: "rgba(0,0,0,0.15)" },
+  section: { marginBottom: spacing.lg },
+  sectionTitle: { ...typography.sectionTitle, marginBottom: spacing.sm },
+  gridRow: { flexDirection: "row", marginBottom: 12 },
+
+  emptyCard: {
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    padding: spacing.lg,
+  },
+  emptyTitle: { ...typography.cardTitle, marginBottom: 4 },
+  emptySub: { ...typography.body },
+
+  // Checkpoint 3F.2A dialog restyle - compact dark premium surface for
+  // Members/Create/Edit/Delete. See the usage sites above for why an
+  // explicit backgroundColor override is needed rather than trusting
+  // Paper's default Dialog elevation color.
+  dialogSurface: { borderRadius: radii.xl },
+  dialogTitle: { fontSize: 17, fontWeight: "700" },
+  dialogField: { marginBottom: spacing.sm },
+  dialogLabel: { ...typography.meta, marginBottom: spacing.sm },
+  dialogBalance: { fontSize: 16, fontWeight: "800", marginBottom: 4 },
+  dialogHint: { fontSize: 12, marginBottom: spacing.md },
 
   memberRow: {
     flexDirection: "row",

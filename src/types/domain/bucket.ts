@@ -78,16 +78,28 @@ export type Bucket = {
 };
 
 // Input for the trusted createBucket Cloud Function (Milestone 2B
-// Checkpoint 4G-2). ownerId/memberIds/balance/ledger fields/currency/
-// bucketType are all backend-derived - none may be sent from here, and
-// none appear in this type (see functions/src/callables/createBucket.ts).
-// startingBalanceMinor is integer minor units, not dollars, matching
-// RecordSavingsTransactionInput's amountMinor convention - deliberately
-// distinct from `target`, which stays dollar-number for this checkpoint.
+// Checkpoint 4G-2; extended Checkpoint 3F.3B.4 for trip_personal funds).
+// ownerId/memberIds/balance/ledger fields/currency are all backend-
+// derived - none may be sent from here, and none appear in this type
+// (see functions/src/callables/createBucket.ts). startingBalanceMinor is
+// integer minor units, not dollars, matching RecordSavingsTransactionInput's
+// amountMinor convention - deliberately distinct from `target`, which
+// stays dollar-number for this checkpoint.
+//
+// bucketType/linkedTripId are optional and, when omitted, default to the
+// original "personal" behavior (bucketType: "personal", no linked trip) -
+// every existing caller that doesn't know about this checkpoint keeps
+// working unchanged. Passing bucketType: "trip_personal" requires
+// linkedTripId; the trusted callable is the sole place that verifies the
+// caller is actually a member of that Trip and enforces at most one
+// trip_personal Bucket per (caller uid, linkedTripId) - see
+// src/domain/tripPersonalFund.ts and the callable's own comments.
 export type CreateBucketInput = {
   name: string;
   target: number;
   startingBalanceMinor: number;
   color: string | null;
   clientRequestId: string;
+  bucketType?: BucketType;
+  linkedTripId?: string | null;
 };
