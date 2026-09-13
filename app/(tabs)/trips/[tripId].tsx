@@ -16,9 +16,11 @@ import {
 } from "react-native";
 import { useTheme } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 
 import { BAR_HEIGHT, CENTER_BUTTON_SIZE } from "../../../components/navigation/BottomNav";
-import { spacing } from "../../../src/theme/tokens";
+import { cardShadowFor, radii, spacing, typography, type SemanticColors } from "../../../src/theme/tokens";
+import { useSemanticColors } from "../../../src/theme/useSemanticColors";
 import { useAuth } from "../../../src/contexts/AuthContext";
 import { deleteTrip, fetchTripById, updateTripDates } from "../../../src/services/firebase/trips";
 import {
@@ -84,6 +86,7 @@ export default function TripDetails() {
   const { width } = useWindowDimensions();
   const { user } = useAuth();
   const theme = useTheme();
+  const colors = useSemanticColors();
   const insets = useSafeAreaInsets();
 
   // Checkpoint 3F.3B.4B: the floating BottomNav renders as an absolutely-
@@ -705,7 +708,6 @@ export default function TripDetails() {
     perWeekPerPerson: perPersonRemaining / p.weeks,
   }));
 
-  const dangerBg = theme.colors.errorContainer ?? "#FEE2E2";
   const dangerText = theme.colors.onErrorContainer ?? "#991B1B";
 
   if (loading) {
@@ -743,49 +745,6 @@ export default function TripDetails() {
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.colors.background }]}>
-      {/* Top bar */}
-      <View style={styles.topBar}>
-        <Pressable
-          onPress={() => router.back()}
-          style={({ pressed }) => [
-            styles.topBtn,
-            {
-              backgroundColor: theme.colors.surface,
-              borderColor: theme.colors.outline,
-            },
-            pressed && { opacity: 0.85 },
-          ]}
-          hitSlop={10}
-        >
-          <Text style={{ color: theme.colors.onBackground, fontWeight: "900" }}>← Back</Text>
-        </Pressable>
-
-        <View style={{ flexDirection: "row", gap: 10 }}>
-          {/* Checkpoint 3F.3B.3: "Record Expense" removed - it was a
-              dead control (onPress={() => console.log(...)}, no real
-              expense architecture exists to wire it to yet). See the
-              checkpoint report: SquadStash's frozen Milestone 2A domain
-              model already defines Expense/ExpenseSplit/Settlement types
-              for a future shared-vs-personal expense system, but none of
-              it has a service, Cloud Function, or Firestore rules today
-              - restoring this button requires that foundation first, not
-              a placeholder here. */}
-          {isOwner ? (
-            <Pressable
-              onPress={onDeleteTrip}
-              style={({ pressed }) => [
-                styles.topBtn,
-                { backgroundColor: dangerBg, borderColor: theme.colors.outline },
-                pressed && { opacity: 0.9 },
-              ]}
-              hitSlop={12}
-            >
-              <Text style={{ color: dangerText, fontWeight: "900" }}>Delete</Text>
-            </Pressable>
-          ) : null}
-        </View>
-      </View>
-
       <ScrollView
         contentContainerStyle={[styles.page, { paddingBottom: scrollBottomInset }]}
       >
@@ -795,11 +754,8 @@ export default function TripDetails() {
             <View
               style={[
                 styles.heroWrap,
-                {
-                  height: headerHeight,
-                  backgroundColor: theme.colors.surface,
-                  borderColor: theme.colors.outline,
-                },
+                { height: headerHeight },
+                cardShadowFor(theme.dark),
               ]}
             >
               <Image
@@ -808,15 +764,69 @@ export default function TripDetails() {
                 resizeMode="cover"
                 onError={() => setImgFailed(true)}
               />
-              <View style={styles.heroOverlay} />
+              {/* Checkpoint 3F.3C: a bottom-weighted two-band graduated
+                  scrim (mirrors components/home/ActiveStashHero.tsx's
+                  identical technique - no gradient dependency) instead of
+                  the previous flat rgba(0,0,0,0.28) wash over the WHOLE
+                  photo, so the top of the image stays bright/image-
+                  forward and only the lower text-bearing band is
+                  darkened. */}
+              <View pointerEvents="none" style={[styles.heroScrimWide, { height: headerHeight * 0.55 }]} />
+              <View pointerEvents="none" style={[styles.heroScrimStrong, { height: headerHeight * 0.32 }]} />
+
+              {/* Checkpoint 3F.3C: compact floating controls over the
+                  photo replace the previous full-width topBar strip
+                  above the hero - saves vertical space and reads as a
+                  modern travel-app detail screen. Back/Delete behavior
+                  is unchanged, only relocated and restyled; these pill
+                  backgrounds use the same fixed dark-on-photo treatment
+                  as ActiveStashHero's badges (PHOTO_NAVY-family, not
+                  semantic tokens) since they must stay legible over any
+                  photo regardless of the active app theme. */}
+              <View style={styles.heroTopRow}>
+                <Pressable
+                  onPress={() => router.back()}
+                  accessibilityRole="button"
+                  accessibilityLabel="Back"
+                  style={({ pressed }) => [styles.navPill, pressed && { opacity: 0.85 }]}
+                  hitSlop={8}
+                >
+                  <MaterialCommunityIcons name="chevron-left" size={18} color="#FFFFFF" />
+                  <Text style={styles.navPillText}>Back</Text>
+                </Pressable>
+
+                {/* Checkpoint 3F.3B.3: "Record Expense" removed - it was
+                    a dead control (onPress={() => console.log(...)}, no
+                    real expense architecture exists to wire it to yet).
+                    See the checkpoint report: SquadStash's frozen
+                    Milestone 2A domain model already defines Expense/
+                    ExpenseSplit/Settlement types for a future shared-vs-
+                    personal expense system, but none of it has a
+                    service, Cloud Function, or Firestore rules today -
+                    restoring this button requires that foundation
+                    first, not a placeholder here. */}
+                {isOwner ? (
+                  <Pressable
+                    onPress={onDeleteTrip}
+                    accessibilityRole="button"
+                    accessibilityLabel="Delete trip"
+                    style={({ pressed }) => [styles.iconOnlyPill, pressed && { opacity: 0.85 }]}
+                    hitSlop={10}
+                  >
+                    <MaterialCommunityIcons name="trash-can-outline" size={16} color="#FF8A85" />
+                  </Pressable>
+                ) : null}
+              </View>
 
               <View style={styles.heroText}>
                 <Text style={styles.heroTitle} numberOfLines={1}>
                   {title}
                 </Text>
-                <Text style={styles.heroLocation} numberOfLines={1}>
-                  {location}
-                </Text>
+                {location !== "No location" ? (
+                  <Text style={styles.heroLocation} numberOfLines={1}>
+                    {location}
+                  </Text>
+                ) : null}
                 {/* Checkpoint 3F.3B.3: owner-only tap-to-edit; a
                     non-owner member sees the identical text but it's
                     plain (read-only), matching "Owner may update dates;
@@ -827,32 +837,25 @@ export default function TripDetails() {
                     accessibilityRole="button"
                     accessibilityLabel="Edit trip dates"
                     hitSlop={6}
+                    style={styles.heroDateRow}
                   >
+                    <MaterialCommunityIcons name="calendar-blank-outline" size={12} color="rgba(255,255,255,0.75)" />
                     <Text style={[styles.heroDate, styles.heroDateEditable]} numberOfLines={1}>
                       {dateText} · Edit
                     </Text>
                   </Pressable>
                 ) : (
-                  <Text style={styles.heroDate} numberOfLines={1}>
-                    {dateText}
-                  </Text>
+                  <View style={styles.heroDateRow}>
+                    <MaterialCommunityIcons name="calendar-blank-outline" size={12} color="rgba(255,255,255,0.75)" />
+                    <Text style={styles.heroDate} numberOfLines={1}>
+                      {dateText}
+                    </Text>
+                  </View>
                 )}
               </View>
 
-              <View
-                style={[
-                  styles.pill,
-                  {
-                    backgroundColor: theme.dark
-                      ? "rgba(17,24,42,0.85)"
-                      : "rgba(255,255,255,0.85)",
-                    borderColor: "rgba(0,0,0,0.08)",
-                  },
-                ]}
-              >
-                <Text style={{ color: theme.colors.onBackground, fontWeight: "900" }}>
-                  {Math.round(pct * 100)}% funded
-                </Text>
+              <View style={styles.fundedPill}>
+                <Text style={styles.fundedPillText}>{Math.round(pct * 100)}% funded</Text>
               </View>
             </View>
 
@@ -864,16 +867,15 @@ export default function TripDetails() {
               <View
                 style={[
                   styles.card,
-                  { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline },
+                  { backgroundColor: theme.colors.surface, borderColor: colors.border },
+                  cardShadowFor(theme.dark),
                 ]}
               >
-                <Text style={[styles.cardTitle, { color: theme.colors.onBackground }]}>
-                  Trip dates
-                </Text>
+                <Text style={[styles.cardTitle, { color: colors.textPrimary }]}>Trip dates</Text>
 
-                <View style={{ height: 10 }} />
+                <View style={{ height: spacing.sm }} />
 
-                <Text style={[styles.dateFieldLabel, { color: theme.colors.onSurfaceVariant }]}>
+                <Text style={[styles.fieldLabel, { color: colors.textMuted }]}>
                   Trip starts (YYYY-MM-DD)
                 </Text>
                 <TextInput
@@ -883,22 +885,22 @@ export default function TripDetails() {
                     if (dateErr) setDateErr(null);
                   }}
                   placeholder={todayCanonicalDate()}
-                  placeholderTextColor={theme.colors.onSurfaceVariant}
+                  placeholderTextColor={colors.textMuted}
                   autoCapitalize="none"
                   autoCorrect={false}
                   style={[
-                    styles.dateInput,
+                    styles.input,
                     {
-                      color: theme.colors.onBackground,
-                      borderColor: theme.colors.outline,
+                      color: colors.textPrimary,
+                      borderColor: colors.border,
                       backgroundColor: theme.colors.background,
                     },
                   ]}
                 />
 
-                <View style={{ height: 10 }} />
+                <View style={{ height: spacing.sm }} />
 
-                <Text style={[styles.dateFieldLabel, { color: theme.colors.onSurfaceVariant }]}>
+                <Text style={[styles.fieldLabel, { color: colors.textMuted }]}>
                   Trip ends (optional, YYYY-MM-DD)
                 </Text>
                 <TextInput
@@ -910,32 +912,30 @@ export default function TripDetails() {
                   autoCapitalize="none"
                   autoCorrect={false}
                   style={[
-                    styles.dateInput,
+                    styles.input,
                     {
-                      color: theme.colors.onBackground,
-                      borderColor: theme.colors.outline,
+                      color: colors.textPrimary,
+                      borderColor: colors.border,
                       backgroundColor: theme.colors.background,
                     },
                   ]}
                 />
 
                 {dateErr ? (
-                  <Text style={[styles.dateErrorText, { color: dangerText }]}>{dateErr}</Text>
+                  <Text style={[styles.errorText, { color: dangerText }]}>{dateErr}</Text>
                 ) : null}
 
-                <View style={{ height: 12 }} />
-
-                <View style={{ flexDirection: "row", gap: 10 }}>
+                <View style={styles.actionsRow}>
                   <Pressable
                     onPress={saveDates}
                     disabled={dateSaving}
                     style={({ pressed }) => [
-                      styles.topBtn,
-                      { backgroundColor: theme.colors.primary },
+                      styles.primaryActionBtn,
+                      { backgroundColor: colors.mint },
                       (pressed || dateSaving) && { opacity: 0.85 },
                     ]}
                   >
-                    <Text style={{ color: theme.colors.onPrimary, fontWeight: "900" }}>
+                    <Text style={[styles.primaryActionText, { color: colors.onMint }]}>
                       {dateSaving ? "Saving…" : "Save"}
                     </Text>
                   </Pressable>
@@ -943,12 +943,12 @@ export default function TripDetails() {
                     onPress={cancelEditDates}
                     disabled={dateSaving}
                     style={({ pressed }) => [
-                      styles.topBtn,
-                      { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline },
+                      styles.secondaryActionBtn,
+                      { borderColor: colors.border },
                       pressed && { opacity: 0.9 },
                     ]}
                   >
-                    <Text style={{ color: theme.colors.onBackground, fontWeight: "900" }}>
+                    <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>
                       Cancel
                     </Text>
                   </Pressable>
@@ -959,51 +959,35 @@ export default function TripDetails() {
             <View
               style={[
                 styles.card,
-                { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline },
+                { backgroundColor: theme.colors.surface, borderColor: colors.border },
+                cardShadowFor(theme.dark),
               ]}
             >
-              <View style={styles.stashHeaderRow}>
+              <View style={styles.cardHeaderRow}>
+                <View style={[styles.iconBubble, { backgroundColor: colors.bluePale }]}>
+                  <MaterialCommunityIcons name="account-group-outline" size={18} color={colors.blue} />
+                </View>
                 <View style={{ flex: 1 }}>
-                  <Text style={[styles.cardTitle, { color: theme.colors.onBackground }]}>
-                    Shared Stash
-                  </Text>
-                  <Text style={[styles.stashSub, { color: theme.colors.onSurfaceVariant }]}>
-                    Group savings for shared trip costs
+                  <Text style={[styles.cardTitle, { color: colors.textPrimary }]}>Shared Stash</Text>
+                  <Text style={[styles.cardSub, { color: colors.textMuted }]}>
+                    Group money for the trip
                   </Text>
                 </View>
               </View>
 
-              <View style={{ height: 6 }} />
-
               <View style={styles.amountRow}>
-                <Text style={[styles.amountBig, { color: theme.colors.onBackground }]}>
-                  {money(saved)}
-                </Text>
-                <Text style={[styles.amountSmall, { color: theme.colors.onSurfaceVariant }]}>
-                  {" "}
-                  / {money(target)}
-                </Text>
+                <Text style={[styles.amountBig, { color: colors.textPrimary }]}>{money(saved)}</Text>
+                <Text style={[styles.amountSmall, { color: colors.textMuted }]}> / {money(target)}</Text>
               </View>
 
-              <View
-                style={[
-                  styles.progressOuter,
-                  { backgroundColor: theme.colors.surfaceVariant, borderColor: theme.colors.outline },
-                ]}
-              >
+              <View style={[styles.progressTrack, { backgroundColor: colors.slatePale }]}>
                 <View
-                  style={[
-                    styles.progressInner,
-                    { width: `${pct * 100}%`, backgroundColor: theme.colors.primary },
-                  ]}
+                  style={[styles.progressFill, { width: `${pct * 100}%`, backgroundColor: colors.mint }]}
                 />
               </View>
 
-              <Text style={[styles.remaining, { color: theme.colors.onSurfaceVariant }]}>
-                Remaining:{" "}
-                <Text style={{ fontWeight: "900", color: theme.colors.onBackground }}>
-                  {money(remaining)}
-                </Text>
+              <Text style={[styles.remainingText, { color: colors.textMuted }]}>
+                {money(remaining)} remaining
               </Text>
 
               {/* Checkpoint 3F.3B.4: real Add Money/Withdraw for the
@@ -1013,89 +997,72 @@ export default function TripDetails() {
                   member), via the same trusted recordSavingsTransaction
                   path Buckets already use. */}
               {!sharedAction.visible ? (
-                <View style={styles.stashActionsRow}>
+                <View style={styles.actionsRow}>
                   <Pressable
                     onPress={() => openSharedAction("contribution")}
                     style={({ pressed }) => [
-                      styles.stashActionBtn,
-                      { backgroundColor: theme.colors.primary },
+                      styles.primaryActionBtn,
+                      { backgroundColor: colors.mint },
                       pressed && { opacity: 0.9 },
                     ]}
                   >
-                    <Text style={{ color: theme.colors.onPrimary, fontWeight: "900" }}>
-                      Add Money
-                    </Text>
+                    <Text style={[styles.primaryActionText, { color: colors.onMint }]}>Add Money</Text>
                   </Pressable>
                   <Pressable
                     onPress={() => openSharedAction("withdrawal")}
                     style={({ pressed }) => [
-                      styles.stashActionBtn,
-                      { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline, borderWidth: 1 },
+                      styles.secondaryActionBtn,
+                      { borderColor: colors.border },
                       pressed && { opacity: 0.9 },
                     ]}
                   >
-                    <Text style={{ color: theme.colors.onBackground, fontWeight: "900" }}>
-                      Withdraw
-                    </Text>
+                    <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Withdraw</Text>
                   </Pressable>
                 </View>
               ) : (
-                <View style={styles.stashActionForm}>
-                  <Text style={[styles.dateFieldLabel, { color: theme.colors.onSurfaceVariant }]}>
+                <View style={styles.inlineForm}>
+                  <Text style={[styles.fieldLabel, { color: colors.textMuted }]}>
                     {sharedAction.type === "contribution" ? "Add to Shared Stash" : "Withdraw from Shared Stash"}
                   </Text>
                   <TextInput
                     value={sharedAction.amountText}
                     onChangeText={setSharedAmountText}
                     placeholder="0.00"
-                    placeholderTextColor={theme.colors.onSurfaceVariant}
+                    placeholderTextColor={colors.textMuted}
                     keyboardType="numeric"
                     editable={!sharedAction.submitting}
                     style={[
-                      styles.dateInput,
-                      {
-                        color: theme.colors.onBackground,
-                        borderColor: theme.colors.outline,
-                        backgroundColor: theme.colors.background,
-                      },
+                      styles.input,
+                      { color: colors.textPrimary, borderColor: colors.border, backgroundColor: theme.colors.background },
                     ]}
                   />
-
-                  <View style={{ height: 8 }} />
 
                   <TextInput
                     value={sharedAction.note}
                     onChangeText={setSharedNote}
                     placeholder="Note (optional)"
-                    placeholderTextColor={theme.colors.onSurfaceVariant}
+                    placeholderTextColor={colors.textMuted}
                     editable={!sharedAction.submitting}
                     maxLength={MAX_TRANSACTION_NOTE_LENGTH}
                     style={[
-                      styles.dateInput,
-                      {
-                        color: theme.colors.onBackground,
-                        borderColor: theme.colors.outline,
-                        backgroundColor: theme.colors.background,
-                      },
+                      styles.input,
+                      { color: colors.textPrimary, borderColor: colors.border, backgroundColor: theme.colors.background },
                     ]}
                   />
                   {sharedAction.error ? (
-                    <Text style={[styles.dateErrorText, { color: dangerText }]}>
-                      {sharedAction.error}
-                    </Text>
+                    <Text style={[styles.errorText, { color: dangerText }]}>{sharedAction.error}</Text>
                   ) : null}
-                  <View style={{ height: 10 }} />
-                  <View style={{ flexDirection: "row", gap: 10 }}>
+                  <View style={styles.actionsRow}>
                     <Pressable
                       onPress={submitSharedAction}
                       disabled={sharedAction.submitting}
                       style={({ pressed }) => [
-                        styles.topBtn,
-                        { backgroundColor: theme.colors.primary },
+                        styles.primaryActionBtn,
+                        { backgroundColor: colors.mint },
                         (pressed || sharedAction.submitting) && { opacity: 0.85 },
                       ]}
                     >
-                      <Text style={{ color: theme.colors.onPrimary, fontWeight: "900" }}>
+                      <Text style={[styles.primaryActionText, { color: colors.onMint }]}>
                         {sharedAction.submitting
                           ? "Saving…"
                           : sharedAction.type === "contribution"
@@ -1107,14 +1074,12 @@ export default function TripDetails() {
                       onPress={closeSharedAction}
                       disabled={sharedAction.submitting}
                       style={({ pressed }) => [
-                        styles.topBtn,
-                        { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline },
+                        styles.secondaryActionBtn,
+                        { borderColor: colors.border },
                         pressed && { opacity: 0.9 },
                       ]}
                     >
-                      <Text style={{ color: theme.colors.onBackground, fontWeight: "900" }}>
-                        Cancel
-                      </Text>
+                      <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Cancel</Text>
                     </Pressable>
                   </View>
                 </View>
@@ -1129,24 +1094,37 @@ export default function TripDetails() {
                 Firestore rules independently enforce that a Bucket's
                 access is governed solely by its own memberIds regardless
                 of who owns the linked Trip. */}
-            <View
-              style={[
-                styles.card,
-                { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline },
-              ]}
-            >
-              <Text style={[styles.cardTitle, { color: theme.colors.onBackground }]}>
-                My Stash
-              </Text>
+            <View style={[styles.card, styles.privateCard, { backgroundColor: theme.colors.surface }]}>
+              {/* Checkpoint 3F.3C.1: a translucent mint tint OVER the
+                  normal card surface, instead of `colors.mintSurface`
+                  used as an opaque solid fill - the solid fill (approved
+                  in 3F.3C) read as too saturated/panel-like in review.
+                  Combines the same two existing semantic tokens
+                  (mintSurface + the ordinary card surface) rather than
+                  hardcoding a new lighter green - halving mintSurface's
+                  opacity here is the "lighten one step" requested, not a
+                  new color. `pointerEvents="none"` + being the first
+                  child (painted below every subsequent sibling) keeps it
+                  purely decorative. */}
+              <View pointerEvents="none" style={[styles.privateTint, { backgroundColor: colors.mintSurface }]} />
+              <View style={styles.cardHeaderRow}>
+                <View style={[styles.iconBubble, { backgroundColor: theme.colors.surface }]}>
+                  <MaterialCommunityIcons name="lock-outline" size={18} color={colors.mintDark} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.cardTitle, { color: colors.textPrimary }]}>My Stash</Text>
+                  <Text style={[styles.cardSub, { color: colors.mintText }]}>Private to you</Text>
+                </View>
+              </View>
 
               {myStash === undefined ? (
-                <View style={{ paddingVertical: 12, alignItems: "center" }}>
+                <View style={styles.stashLoadingWrap}>
                   <ActivityIndicator />
                 </View>
               ) : myStash === null ? (
                 isCreatingStash ? (
-                  <View style={{ marginTop: 10 }}>
-                    <Text style={[styles.dateFieldLabel, { color: theme.colors.onSurfaceVariant }]}>
+                  <View style={styles.inlineForm}>
+                    <Text style={[styles.fieldLabel, { color: colors.textSecondary }]}>
                       Personal spending target
                     </Text>
                     <TextInput
@@ -1156,35 +1134,28 @@ export default function TripDetails() {
                         if (stashCreateErr) setStashCreateErr(null);
                       }}
                       placeholder="1000"
-                      placeholderTextColor={theme.colors.onSurfaceVariant}
+                      placeholderTextColor={colors.textMuted}
                       keyboardType="numeric"
                       editable={!stashCreating}
                       style={[
-                        styles.dateInput,
-                        {
-                          color: theme.colors.onBackground,
-                          borderColor: theme.colors.outline,
-                          backgroundColor: theme.colors.background,
-                        },
+                        styles.input,
+                        { color: colors.textPrimary, borderColor: colors.mintDark, backgroundColor: theme.colors.surface },
                       ]}
                     />
                     {stashCreateErr ? (
-                      <Text style={[styles.dateErrorText, { color: dangerText }]}>
-                        {stashCreateErr}
-                      </Text>
+                      <Text style={[styles.errorText, { color: dangerText }]}>{stashCreateErr}</Text>
                     ) : null}
-                    <View style={{ height: 10 }} />
-                    <View style={{ flexDirection: "row", gap: 10 }}>
+                    <View style={styles.actionsRow}>
                       <Pressable
                         onPress={submitCreateStash}
                         disabled={stashCreating}
                         style={({ pressed }) => [
-                          styles.topBtn,
-                          { backgroundColor: theme.colors.primary },
+                          styles.primaryActionBtn,
+                          { backgroundColor: colors.mintDark },
                           (pressed || stashCreating) && { opacity: 0.85 },
                         ]}
                       >
-                        <Text style={{ color: theme.colors.onPrimary, fontWeight: "900" }}>
+                        <Text style={[styles.primaryActionText, { color: colors.onMint }]}>
                           {stashCreating ? "Creating…" : "Create My Stash"}
                         </Text>
                       </Pressable>
@@ -1192,32 +1163,30 @@ export default function TripDetails() {
                         onPress={cancelCreateStash}
                         disabled={stashCreating}
                         style={({ pressed }) => [
-                          styles.topBtn,
-                          { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline },
+                          styles.secondaryActionBtn,
+                          { borderColor: colors.mintDark },
                           pressed && { opacity: 0.9 },
                         ]}
                       >
-                        <Text style={{ color: theme.colors.onBackground, fontWeight: "900" }}>
-                          Cancel
-                        </Text>
+                        <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Cancel</Text>
                       </Pressable>
                     </View>
                   </View>
                 ) : (
-                  <View style={{ marginTop: 6 }}>
-                    <Text style={[styles.stashSub, { color: theme.colors.onSurfaceVariant }]}>
+                  <View style={styles.stashEmptyWrap}>
+                    <Text style={[styles.cardSub, { color: colors.textSecondary }]}>
                       No personal stash yet
                     </Text>
-                    <View style={{ height: 10 }} />
                     <Pressable
                       onPress={startCreateStash}
                       style={({ pressed }) => [
-                        styles.stashActionBtn,
-                        { backgroundColor: theme.colors.primary, alignSelf: "flex-start" },
+                        styles.primaryActionBtn,
+                        styles.inlinePrimaryBtn,
+                        { backgroundColor: colors.mintDark },
                         pressed && { opacity: 0.9 },
                       ]}
                     >
-                      <Text style={{ color: theme.colors.onPrimary, fontWeight: "900" }}>
+                      <Text style={[styles.primaryActionText, { color: colors.onMint }]}>
                         Create My Stash
                       </Text>
                     </Pressable>
@@ -1225,30 +1194,25 @@ export default function TripDetails() {
                 )
               ) : (
                 <>
-                  <Text style={[styles.stashSub, { color: theme.colors.onSurfaceVariant }]}>
+                  <Text style={[styles.cardSub, { color: colors.textSecondary }]}>
                     Your personal spending money
                   </Text>
                   <View style={styles.amountRow}>
-                    <Text style={[styles.amountBig, { color: theme.colors.onBackground }]}>
+                    <Text style={[styles.amountBig, { color: colors.textPrimary }]}>
                       {money(myStash.balance)}
                     </Text>
-                    <Text style={[styles.amountSmall, { color: theme.colors.onSurfaceVariant }]}>
+                    <Text style={[styles.amountSmall, { color: colors.textSecondary }]}>
                       {" "}
                       / {money(myStash.target)}
                     </Text>
                   </View>
-                  <View
-                    style={[
-                      styles.progressOuter,
-                      { backgroundColor: theme.colors.surfaceVariant, borderColor: theme.colors.outline },
-                    ]}
-                  >
+                  <View style={[styles.progressTrack, { backgroundColor: colors.slatePale }]}>
                     <View
                       style={[
-                        styles.progressInner,
+                        styles.progressFill,
                         {
                           width: `${clamp01(myStash.target > 0 ? myStash.balance / myStash.target : 0) * 100}%`,
-                          backgroundColor: theme.colors.primary,
+                          backgroundColor: colors.mintDark,
                         },
                       ]}
                     />
@@ -1258,30 +1222,36 @@ export default function TripDetails() {
                       same trusted useSavingsMoneyAction()/
                       MoneyActionSheet Bucket Detail already uses, not a
                       new financial write system. */}
-                  <View style={styles.stashActionsRow}>
+                  <View style={styles.actionsRow}>
                     <Pressable
-                      onPress={() => openMoneyAction(myStash, "contribution")}
+                      onPress={() =>
+                        openMoneyAction(myStash, "contribution", {
+                          displayTitle: "My Stash",
+                          displaySubtitle: title,
+                        })
+                      }
                       style={({ pressed }) => [
-                        styles.stashActionBtn,
-                        { backgroundColor: theme.colors.primary },
+                        styles.primaryActionBtn,
+                        { backgroundColor: colors.mintDark },
                         pressed && { opacity: 0.9 },
                       ]}
                     >
-                      <Text style={{ color: theme.colors.onPrimary, fontWeight: "900" }}>
-                        Add Money
-                      </Text>
+                      <Text style={[styles.primaryActionText, { color: colors.onMint }]}>Add Money</Text>
                     </Pressable>
                     <Pressable
-                      onPress={() => openMoneyAction(myStash, "withdrawal")}
+                      onPress={() =>
+                        openMoneyAction(myStash, "withdrawal", {
+                          displayTitle: "My Stash",
+                          displaySubtitle: title,
+                        })
+                      }
                       style={({ pressed }) => [
-                        styles.stashActionBtn,
-                        { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline, borderWidth: 1 },
+                        styles.secondaryActionBtn,
+                        { borderColor: colors.mintDark },
                         pressed && { opacity: 0.9 },
                       ]}
                     >
-                      <Text style={{ color: theme.colors.onBackground, fontWeight: "900" }}>
-                        Withdraw
-                      </Text>
+                      <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Withdraw</Text>
                     </Pressable>
                   </View>
                 </>
@@ -1294,40 +1264,42 @@ export default function TripDetails() {
             <View
               style={[
                 styles.card,
-                { backgroundColor: theme.colors.surface, borderColor: theme.colors.outline },
+                { backgroundColor: theme.colors.surface, borderColor: colors.border },
+                cardShadowFor(theme.dark),
               ]}
             >
-              <Text style={[styles.cardTitle, { color: theme.colors.onBackground }]}>
-                Quick Analysis
+              <View style={styles.cardHeaderRow}>
+                <View style={[styles.iconBubble, { backgroundColor: colors.slatePale }]}>
+                  <MaterialCommunityIcons name="chart-donut" size={18} color={colors.textSecondary} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.cardTitle, { color: colors.textPrimary }]}>Quick Analysis</Text>
+                  <Text style={[styles.cardSub, { color: colors.textMuted }]}>
+                    Based on your shared goal
+                  </Text>
+                </View>
+              </View>
+
+              <View style={styles.metricRow}>
+                <MetricBlock label="Members" value={`${membersCount}`} colors={colors} />
+                <MetricBlock label="Saved" value={money(saved)} colors={colors} />
+                <MetricBlock label="Remaining" value={money(remaining)} colors={colors} />
+              </View>
+
+              <Text style={[styles.groupLabel, { color: colors.textMuted }]}>Per Person</Text>
+              <Row label="Target" value={money(perPersonTarget)} themeText={colors.textPrimary} muted={colors.textMuted} />
+              <Row label="Remaining" value={money(perPersonRemaining)} themeText={colors.textPrimary} muted={colors.textMuted} />
+
+              <Text style={[styles.groupLabel, { color: colors.textMuted, marginTop: spacing.md }]}>
+                Savings Pace
               </Text>
-              <Text style={[styles.sub, { color: theme.colors.onSurfaceVariant }]}>
-                Based on your goal and members.
-              </Text>
-
-              <View style={{ height: 12 }} />
-
-              <Row label="Members" value={`${membersCount}`} themeText={theme.colors.onBackground} muted={theme.colors.onSurfaceVariant} />
-              <Row label="Saved" value={money(saved)} themeText={theme.colors.onBackground} muted={theme.colors.onSurfaceVariant} />
-              <Row label="Remaining" value={money(remaining)} themeText={theme.colors.onBackground} muted={theme.colors.onSurfaceVariant} />
-
-              <View style={[styles.divider, { backgroundColor: theme.colors.outline }]} />
-
-              <Row label="Target / person" value={money(perPersonTarget)} themeText={theme.colors.onBackground} muted={theme.colors.onSurfaceVariant} />
-              <Row label="Remaining / person" value={money(perPersonRemaining)} themeText={theme.colors.onBackground} muted={theme.colors.onSurfaceVariant} />
-
-              <View style={[styles.divider, { backgroundColor: theme.colors.outline }]} />
-
-              <Text style={[styles.cardLabel, { color: theme.colors.onSurfaceVariant, marginBottom: 8 }]}>
-                Suggested weekly savings (total / per person)
-              </Text>
-
               {weeklyPlans.map((p) => (
-                <Row
+                <PaceRow
                   key={p.label}
                   label={p.label}
-                  value={`${money(p.perWeekTotal)} / ${money(p.perWeekPerPerson)}`}
-                  themeText={theme.colors.onBackground}
-                  muted={theme.colors.onSurfaceVariant}
+                  total={money(p.perWeekTotal)}
+                  perPerson={money(p.perWeekPerPerson)}
+                  colors={colors}
                 />
               ))}
             </View>
@@ -1352,121 +1324,288 @@ function Row({
   return (
     <View style={styles.qaRow}>
       <Text style={[styles.qaLabel, { color: muted }]}>{label}</Text>
-      <Text style={[styles.qaValue, { color: themeText }]}>{value}</Text>
+      <Text style={[styles.qaValue, { color: themeText }]} numberOfLines={1}>
+        {value}
+      </Text>
     </View>
   );
 }
 
+// Checkpoint 3F.3C: compact "mini metric block" for Quick Analysis' top
+// row (Members | Saved | Remaining) - a small value-over-label chip,
+// matching the density/scannability direction requested for this
+// checkpoint. No calculation logic lives here; it only renders values
+// already computed above.
+function MetricBlock({
+  label,
+  value,
+  colors,
+}: {
+  label: string;
+  value: string;
+  colors: SemanticColors;
+}) {
+  return (
+    <View style={[styles.metricBlock, { backgroundColor: colors.background }]}>
+      <Text style={[styles.metricValue, { color: colors.textPrimary }]} numberOfLines={1}>
+        {value}
+      </Text>
+      <Text style={[styles.metricLabel, { color: colors.textMuted }]}>{label}</Text>
+    </View>
+  );
+}
+
+// Checkpoint 3F.3C.1: a Savings Pace row, split into two stacked values
+// (Total, then a visually quieter Per Person underneath) instead of one
+// long "$X total · $Y/person" string on a single horizontal line - that
+// combined string was dense enough to risk wrapping/clipping at 390-
+// 430px widths. Stacking removes the wrapping risk structurally (each
+// line is short on its own) rather than depending on numberOfLines
+// truncation. Per Person is deliberately styled smaller/muted rather
+// than hidden when membersCount === 1 (where it's numerically identical
+// to Total) - showing it keeps the row's meaning consistent across
+// every trip size without a separate 1-member code path, while the
+// quieter styling stops the duplicate value from reading as a second,
+// equally-important number. Purely presentational - receives the exact
+// same already-computed money(...) strings the caller always did.
+function PaceRow({
+  label,
+  total,
+  perPerson,
+  colors,
+}: {
+  label: string;
+  total: string;
+  perPerson: string;
+  colors: SemanticColors;
+}) {
+  return (
+    <View style={styles.paceRow}>
+      <Text style={[styles.paceLabel, { color: colors.textPrimary }]}>{label}</Text>
+      <View style={styles.paceValues}>
+        <Text style={[styles.paceTotal, { color: colors.textPrimary }]}>{total} total</Text>
+        <Text style={[styles.pacePerPerson, { color: colors.textMuted }]}>{perPerson} / person</Text>
+      </View>
+    </View>
+  );
+}
+
+// Checkpoint 3F.3C: fixed (non-semantic) dark-on-photo treatment for
+// controls/badges drawn directly over the hero image - mirrors
+// components/home/ActiveStashHero.tsx's identical PHOTO_MINT/PHOTO_NAVY
+// rationale exactly: text/icons on a travel photo need to stay legible
+// regardless of whether the app theme is Light or Dark, so these
+// intentionally do NOT come from useSemanticColors().
+const PHOTO_MINT = "#45F0AE";
+
 const styles = StyleSheet.create({
   safe: { flex: 1 },
-
-  topBar: {
-    paddingHorizontal: 16,
-    paddingTop: 10,
-    paddingBottom: 10,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 10,
-  },
-  topBtn: {
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderRadius: 12,
-    borderWidth: 1,
-  },
 
   // Checkpoint 3F.3B.4B: bottom padding is applied dynamically via
   // scrollBottomInset (computed above from the real floating BottomNav
   // dimensions), not a static value here.
-  page: { padding: 16 },
+  page: { padding: spacing.lg },
 
-  gridWide: { flexDirection: "row", gap: 16, alignItems: "flex-start" },
+  gridWide: { flexDirection: "row", gap: spacing.lg, alignItems: "flex-start" },
   mainCol: { flex: 1, minWidth: 560 },
-  sideCol: { width: 380 },
+  sideCol: { width: 360 },
 
+  // --- Hero -----------------------------------------------------------
   heroWrap: {
-    borderRadius: 18,
+    borderRadius: radii.xl,
     overflow: "hidden",
-    borderWidth: 1,
     position: "relative",
   },
-  heroImg: { width: "100%", height: "100%" },
-  heroOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "rgba(0,0,0,0.28)",
+  heroImg: { width: "100%", height: "100%", position: "absolute" },
+  heroScrimWide: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: "rgba(9,14,26,0.2)",
   },
-  heroText: { position: "absolute", left: 16, right: 16, bottom: 16 },
-  heroTitle: { color: "#fff", fontSize: 32, fontWeight: "900" },
-  heroLocation: { marginTop: 4, color: "rgba(255,255,255,0.9)", fontSize: 14, fontWeight: "700" },
-  heroDate: { marginTop: 4, color: "rgba(255,255,255,0.78)", fontSize: 12, fontWeight: "600" },
+  heroScrimStrong: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: "rgba(9,14,26,0.45)",
+  },
+
+  heroTopRow: {
+    position: "absolute",
+    top: spacing.md,
+    left: spacing.md,
+    right: spacing.md,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    zIndex: 2,
+  },
+  navPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    height: 32,
+    paddingHorizontal: spacing.sm,
+    borderRadius: radii.pill,
+    backgroundColor: "rgba(9,14,26,0.55)",
+  },
+  navPillText: { color: "#FFFFFF", fontSize: 12, fontWeight: "700" },
+  iconOnlyPill: {
+    width: 32,
+    height: 32,
+    borderRadius: radii.pill,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(9,14,26,0.55)",
+  },
+
+  heroText: { position: "absolute", left: spacing.lg, right: spacing.lg, bottom: spacing.md },
+  heroTitle: { ...typography.headline, fontSize: 24, color: "#FFFFFF" },
+  heroLocation: { marginTop: 2, color: "rgba(255,255,255,0.85)", fontSize: 13, fontWeight: "600" },
+  heroDateRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 4 },
+  heroDate: { color: "rgba(255,255,255,0.78)", fontSize: 11, fontWeight: "600" },
   heroDateEditable: { textDecorationLine: "underline" },
 
-  dateFieldLabel: { fontSize: 12, fontWeight: "700", marginBottom: 6 },
-  dateInput: {
-    borderWidth: 1,
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 14,
-  },
-  dateErrorText: { marginTop: 10, fontSize: 12, fontWeight: "700" },
-
-  pill: {
+  fundedPill: {
     position: "absolute",
-    right: 16,
-    bottom: 16,
-    borderWidth: 1,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 999,
+    right: spacing.md,
+    bottom: spacing.md,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 5,
+    borderRadius: radii.pill,
+    backgroundColor: "rgba(9,14,26,0.55)",
   },
+  fundedPillText: { color: PHOTO_MINT, fontSize: 11, fontWeight: "800" },
 
+  // --- Shared form/field primitives (date edit, Shared Stash inline
+  // form, My Stash create form) ----------------------------------------
+  fieldLabel: { ...typography.meta, marginBottom: spacing.xs },
+  input: {
+    borderWidth: 1,
+    borderRadius: radii.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    fontSize: 14,
+    marginBottom: spacing.sm,
+  },
+  errorText: { fontSize: 12, fontWeight: "700", marginTop: 2, marginBottom: spacing.xs },
+  inlineForm: { marginTop: spacing.sm },
+
+  actionsRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.md },
+  primaryActionBtn: {
+    flex: 1,
+    height: 42,
+    borderRadius: radii.md,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  primaryActionText: { fontSize: 13, fontWeight: "800" },
+  secondaryActionBtn: {
+    flex: 1,
+    height: 42,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  secondaryActionText: { fontSize: 13, fontWeight: "800" },
+  inlinePrimaryBtn: { flex: undefined, alignSelf: "flex-start", paddingHorizontal: spacing.lg, marginTop: spacing.sm },
+
+  // --- Cards ------------------------------------------------------------
   card: {
-    marginTop: 14,
-    borderRadius: 18,
+    marginTop: spacing.md,
+    borderRadius: radii.lg,
     borderWidth: 1,
-    padding: 14,
+    padding: spacing.md,
   },
-  cardTitle: { fontSize: 16, fontWeight: "900" },
-  cardLabel: { fontSize: 12, fontWeight: "800" },
-
-  stashHeaderRow: { flexDirection: "row", alignItems: "flex-start" },
-  stashSub: { fontSize: 12, marginTop: 2 },
-  stashActionsRow: { flexDirection: "row", gap: 10, marginTop: 14 },
-  stashActionBtn: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 12,
+  // My Stash's pale mint tint IS its border - an explicit border would
+  // read as a harsh edge against its own near-white-mint background.
+  // overflow: "hidden" clips privateTint (below) to the card's own
+  // rounded corners instead of bleeding square corners over them.
+  privateCard: { borderWidth: 0, overflow: "hidden" },
+  // Checkpoint 3F.3C.1: half-opacity so the mint wash reads as a subtle
+  // tint over the card's normal surface rather than 3F.3C's solid,
+  // fully-saturated mintSurface fill.
+  privateTint: { ...StyleSheet.absoluteFillObject, opacity: 0.5 },
+  cardHeaderRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm, marginBottom: spacing.sm },
+  iconBubble: {
+    width: 34,
+    height: 34,
+    borderRadius: radii.md,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  stashActionForm: { marginTop: 14 },
+  cardTitle: { ...typography.cardTitle, fontSize: 15 },
+  cardSub: { fontSize: 12, fontWeight: "600", marginTop: 1 },
 
-  amountRow: { flexDirection: "row", alignItems: "flex-end", marginTop: 6 },
-  amountBig: { fontSize: 34, fontWeight: "900" },
-  amountSmall: { fontSize: 14, fontWeight: "800", marginBottom: 6 },
+  amountRow: { flexDirection: "row", alignItems: "flex-end", marginTop: spacing.xs },
+  amountBig: { fontSize: 28, fontWeight: "800" },
+  amountSmall: { fontSize: 13, fontWeight: "700", marginBottom: 3 },
 
-  progressOuter: {
-    marginTop: 10,
-    height: 12,
-    borderRadius: 999,
-    borderWidth: 1,
+  progressTrack: {
+    marginTop: spacing.sm,
+    height: 8,
+    borderRadius: radii.pill,
     overflow: "hidden",
   },
-  progressInner: { height: "100%", borderRadius: 999 },
+  progressFill: { height: "100%", borderRadius: radii.pill },
 
-  remaining: { marginTop: 10, fontSize: 13, fontWeight: "800" },
+  remainingText: { marginTop: spacing.sm, fontSize: 12, fontWeight: "700" },
 
-  divider: { height: 1, marginVertical: 12 },
+  stashLoadingWrap: { paddingVertical: spacing.md, alignItems: "center" },
+  stashEmptyWrap: { marginTop: spacing.xs },
+
+  // --- Quick Analysis -----------------------------------------------
+  groupLabel: {
+    fontSize: 11,
+    fontWeight: "800",
+    letterSpacing: 0.4,
+    textTransform: "uppercase",
+    marginTop: spacing.sm,
+    marginBottom: spacing.xs,
+  },
+  metricRow: { flexDirection: "row", gap: spacing.sm, marginBottom: spacing.sm },
+  metricBlock: {
+    flex: 1,
+    borderRadius: radii.md,
+    paddingVertical: spacing.sm,
+    alignItems: "center",
+  },
+  metricValue: { fontSize: 16, fontWeight: "800" },
+  metricLabel: { fontSize: 10, fontWeight: "700", marginTop: 2 },
 
   qaRow: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    marginTop: 10,
+    marginTop: spacing.xs,
   },
-  qaLabel: { fontWeight: "800" },
-  qaValue: { fontWeight: "900" },
+  qaLabel: { fontSize: 13, fontWeight: "700" },
+  qaValue: { fontSize: 13, fontWeight: "800", marginLeft: spacing.sm },
 
+  // Checkpoint 3F.3C.1: Savings Pace rows - label left, Total/Per Person
+  // stacked and right-aligned instead of one combined horizontal string.
+  // Each line is short on its own (e.g. "$1,225.00 total"), so neither
+  // value depends on numberOfLines truncation to avoid wrapping/clipping
+  // at 390-430px widths.
+  paceRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    marginTop: spacing.sm,
+  },
+  paceLabel: { fontSize: 13, fontWeight: "700", paddingTop: 2 },
+  paceValues: { alignItems: "flex-end" },
+  paceTotal: { fontSize: 13, fontWeight: "800" },
+  // Deliberately smaller/quieter than paceTotal (not just a differently-
+  // colored equal-weight number) - this is what keeps a 1-member trip's
+  // numerically-identical Per Person value from reading as a second,
+  // equally-important stat next to Total.
+  pacePerPerson: { fontSize: 11, fontWeight: "600", marginTop: 1 },
+
+  // --- Loading / not-found (unchanged states) -------------------------
   loadingWrap: { paddingTop: 60, alignItems: "center", gap: 10 },
   loadingText: { fontSize: 13 },
   h1: { fontSize: 20, fontWeight: "900" },

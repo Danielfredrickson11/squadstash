@@ -69,6 +69,17 @@ function savingsErrorMessage(e: unknown): string {
 export type MoneyActionState = {
   visible: boolean;
   bucket: Bucket | null;
+  // Checkpoint 3F.3C: PRESENTATION ONLY overrides for the sheet's
+  // resource line - never read by submit()/idempotency/validation, which
+  // all continue to key off `bucket` itself (id, balance, currency).
+  // Lets a caller show friendlier copy than the raw stored Bucket name
+  // (e.g. Trip Detail's My Stash: "My Stash" / "Arizona Trip" instead of
+  // the literal stored "Arizona Trip — My Stash") without ever touching
+  // what's actually persisted in Firestore. null for the ordinary Bucket
+  // call sites (Bucket list/detail), which keep rendering `bucket.name`
+  // exactly as before.
+  displayTitle: string | null;
+  displaySubtitle: string | null;
   type: SavingsTransactionType;
   amountText: string;
   // Non-null exactly when a quick-amount chip (e.g. $20/$50/$100) is the
@@ -86,6 +97,8 @@ export type MoneyActionState = {
 const CLOSED_STATE: MoneyActionState = {
   visible: false,
   bucket: null,
+  displayTitle: null,
+  displaySubtitle: null,
   type: "contribution",
   amountText: "",
   presetAmountMinor: null,
@@ -96,7 +109,11 @@ const CLOSED_STATE: MoneyActionState = {
 
 type SavingsMoneyActionContextValue = {
   state: MoneyActionState;
-  open: (bucket: Bucket, type: SavingsTransactionType) => void;
+  open: (
+    bucket: Bucket,
+    type: SavingsTransactionType,
+    display?: { displayTitle?: string; displaySubtitle?: string }
+  ) => void;
   close: () => void;
   setType: (type: SavingsTransactionType) => void;
   setAmountText: (text: string) => void;
@@ -144,19 +161,28 @@ export function SavingsMoneyActionProvider({
   // not just within a single screen.
   const inFlightRef = useRef(false);
 
-  const open = useCallback((bucket: Bucket, type: SavingsTransactionType) => {
-    if (inFlightRef.current) return;
-    setState({
-      visible: true,
-      bucket,
-      type,
-      amountText: "",
-      presetAmountMinor: null,
-      note: "",
-      submitting: false,
-      error: null,
-    });
-  }, []);
+  const open = useCallback(
+    (
+      bucket: Bucket,
+      type: SavingsTransactionType,
+      display?: { displayTitle?: string; displaySubtitle?: string }
+    ) => {
+      if (inFlightRef.current) return;
+      setState({
+        visible: true,
+        bucket,
+        displayTitle: display?.displayTitle ?? null,
+        displaySubtitle: display?.displaySubtitle ?? null,
+        type,
+        amountText: "",
+        presetAmountMinor: null,
+        note: "",
+        submitting: false,
+        error: null,
+      });
+    },
+    []
+  );
 
   // The user-facing cancel/dismiss path - Cancel button, backdrop tap,
   // hardware back, or any other Dialog dismissal. Ignored outright while
