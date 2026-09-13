@@ -34,7 +34,17 @@ import {
   MAX_TRANSACTION_NOTE_LENGTH,
   recordSavingsTransaction,
 } from "../../../src/services/firebase/savingsTransactions";
-import { formatTripDates, isValidCanonicalDate, todayCanonicalDate } from "../../../src/domain/tripDates";
+import {
+  formatCanonicalDateShort,
+  formatTripDates,
+  isValidCanonicalDate,
+  todayCanonicalDate,
+} from "../../../src/domain/tripDates";
+import {
+  computeTripSavingsGuidance,
+  formatTripHorizonText,
+  type TripSavingsGuidance,
+} from "../../../src/domain/tripSavingsGuidance";
 import { isMatchingTripPersonalBucket, tripPersonalBucketId } from "../../../src/domain/tripPersonalFund";
 import {
   normalizeTransactionNote,
@@ -698,15 +708,21 @@ export default function TripDetails() {
   const perPersonTarget = target / membersCount;
   const perPersonRemaining = remaining / membersCount;
 
-  const weeklyPlans = [
-    { label: "4 wks", weeks: 4 },
-    { label: "8 wks", weeks: 8 },
-    { label: "12 wks", weeks: 12 },
-  ].map((p) => ({
-    ...p,
-    perWeekTotal: remaining / p.weeks,
-    perWeekPerPerson: perPersonRemaining / p.weeks,
-  }));
+  // Checkpoint 3F.3D: replaces the old arbitrary 4/8/12-week scenarios
+  // with real date-driven guidance. Shared Stash's own saved/target/
+  // membersCount only - My Stash is never an input here (see the
+  // checkpoint report: mixing the two targets was explicitly out of
+  // scope). trip.saved/trip.target are dollar-denominated display
+  // caches, converted to integer minor units here for the same reason
+  // submitSharedAction's own withdrawal check does
+  // (Math.round(dollars * 100)) - computeTripSavingsGuidance does all
+  // its arithmetic in minor units.
+  const sharedGuidance = computeTripSavingsGuidance({
+    tripStartDate: trip?.tripStartDate,
+    targetMinor: Math.round(target * 100),
+    savedMinor: Math.round(saved * 100),
+    membersCount,
+  });
 
   const dangerText = theme.colors.onErrorContainer ?? "#991B1B";
 
@@ -1290,18 +1306,20 @@ export default function TripDetails() {
               <Row label="Target" value={money(perPersonTarget)} themeText={colors.textPrimary} muted={colors.textMuted} />
               <Row label="Remaining" value={money(perPersonRemaining)} themeText={colors.textPrimary} muted={colors.textMuted} />
 
+              {/* Checkpoint 3F.3D: real date-driven guidance, replacing
+                  the old arbitrary 4/8/12-week scenarios entirely - see
+                  TripTimelineSection below for the per-state copy
+                  (missing date / trip started / goal reached / active
+                  pace). Derived purely from current screen state
+                  (sharedGuidance above), never persisted. */}
               <Text style={[styles.groupLabel, { color: colors.textMuted, marginTop: spacing.md }]}>
-                Savings Pace
+                Trip Timeline
               </Text>
-              {weeklyPlans.map((p) => (
-                <PaceRow
-                  key={p.label}
-                  label={p.label}
-                  total={money(p.perWeekTotal)}
-                  perPerson={money(p.perWeekPerPerson)}
-                  colors={colors}
-                />
-              ))}
+              <TripTimelineSection
+                guidance={sharedGuidance}
+                tripStartDate={trip.tripStartDate}
+                colors={colors}
+              />
             </View>
           </View>
         </View>
@@ -1355,38 +1373,95 @@ function MetricBlock({
   );
 }
 
-// Checkpoint 3F.3C.1: a Savings Pace row, split into two stacked values
-// (Total, then a visually quieter Per Person underneath) instead of one
-// long "$X total · $Y/person" string on a single horizontal line - that
-// combined string was dense enough to risk wrapping/clipping at 390-
-// 430px widths. Stacking removes the wrapping risk structurally (each
-// line is short on its own) rather than depending on numberOfLines
-// truncation. Per Person is deliberately styled smaller/muted rather
-// than hidden when membersCount === 1 (where it's numerically identical
-// to Total) - showing it keeps the row's meaning consistent across
-// every trip size without a separate 1-member code path, while the
-// quieter styling stops the duplicate value from reading as a second,
-// equally-important number. Purely presentational - receives the exact
-// same already-computed money(...) strings the caller always did.
-function PaceRow({
-  label,
-  total,
-  perPerson,
+// Checkpoint 3F.3D: renders Quick Analysis' "Trip Timeline" section from
+// a computeTripSavingsGuidance() result - one clearly-separated branch
+// per truthful state (never a fabricated "on track" claim, never a
+// fallback to the old 4/8/12-week scenarios). Purely presentational -
+// all the arithmetic already happened in src/domain/tripSavingsGuidance.ts;
+// this only formats and lays out the result. tripStartDate is passed
+// separately (not derived from `guidance`) solely to render the real
+// "by <date>" footnote on the ACTIVE branch - the guidance computation
+// itself never returns the raw date string.
+function TripTimelineSection({
+  guidance,
+  tripStartDate,
   colors,
 }: {
-  label: string;
-  total: string;
-  perPerson: string;
+  guidance: TripSavingsGuidance;
+  tripStartDate: string | null | undefined;
   colors: SemanticColors;
 }) {
+  // Checkpoint 3F.3D.1: checked ahead of MISSING_DATE/TRIP_STARTED to
+  // match computeTripSavingsGuidance's own precedence - a target that
+  // was never usable is unrelated to whether the trip has a date.
+  if (guidance.status === "INVALID_TARGET") {
+    return (
+      <Text style={[styles.guidanceMuted, { color: colors.textMuted }]}>
+        Set a shared savings target to calculate your recommended pace.
+      </Text>
+    );
+  }
+
+  if (guidance.status === "MISSING_DATE") {
+    return (
+      <Text style={[styles.guidanceMuted, { color: colors.textMuted }]}>
+        Add a trip start date to calculate your savings pace.
+      </Text>
+    );
+  }
+
+  if (guidance.status === "TRIP_STARTED") {
+    return (
+      <Text style={[styles.guidanceHeadline, { color: colors.textPrimary }]}>
+        {guidance.startsToday ? "Trip starts today" : "Trip has started"}
+      </Text>
+    );
+  }
+
+  if (guidance.status === "GOAL_REACHED") {
+    return (
+      <>
+        <Text style={[styles.guidanceHeadline, { color: colors.mintText }]}>
+          Shared goal reached
+        </Text>
+        <Text style={[styles.guidanceSub, { color: colors.textMuted }]}>
+          {money(guidance.savedMinor / 100)} saved
+        </Text>
+      </>
+    );
+  }
+
+  // ACTIVE - a real required pace, never an "on track" prediction (no
+  // contribution-history/expected-pace model exists to truthfully claim
+  // that yet).
+  const unit = guidance.pace === "weekly" ? "week" : "day";
+  const startText = formatCanonicalDateShort(tripStartDate);
+
   return (
-    <View style={styles.paceRow}>
-      <Text style={[styles.paceLabel, { color: colors.textPrimary }]}>{label}</Text>
-      <View style={styles.paceValues}>
-        <Text style={[styles.paceTotal, { color: colors.textPrimary }]}>{total} total</Text>
-        <Text style={[styles.pacePerPerson, { color: colors.textMuted }]}>{perPerson} / person</Text>
-      </View>
-    </View>
+    <>
+      <Text style={[styles.guidanceHeadline, { color: colors.textPrimary }]}>
+        {formatTripHorizonText(guidance.fullWeeksUntilStart, guidance.extraDays)}
+      </Text>
+      <Text style={[styles.guidanceSub, { color: colors.textMuted }]}>
+        {money(guidance.remainingMinor / 100)} left to save
+      </Text>
+
+      <Text style={[styles.groupLabel, { color: colors.textMuted, marginTop: spacing.md }]}>
+        Recommended Pace
+      </Text>
+      <Text style={[styles.paceValue, { color: colors.textPrimary }]}>
+        {money(guidance.rateTotalMinor / 100)} / {unit} total
+      </Text>
+      <Text style={[styles.paceValueMuted, { color: colors.textMuted }]}>
+        {money(guidance.ratePerPersonMinor / 100)} / {unit} per person
+      </Text>
+
+      <Text style={[styles.guidanceFootnote, { color: colors.textMuted }]}>
+        {startText
+          ? `Average needed from today to reach the shared goal by ${startText}.`
+          : "Average needed from today to reach the shared goal."}
+      </Text>
+    </>
   );
 }
 
@@ -1585,25 +1660,20 @@ const styles = StyleSheet.create({
   qaLabel: { fontSize: 13, fontWeight: "700" },
   qaValue: { fontSize: 13, fontWeight: "800", marginLeft: spacing.sm },
 
-  // Checkpoint 3F.3C.1: Savings Pace rows - label left, Total/Per Person
-  // stacked and right-aligned instead of one combined horizontal string.
-  // Each line is short on its own (e.g. "$1,225.00 total"), so neither
-  // value depends on numberOfLines truncation to avoid wrapping/clipping
-  // at 390-430px widths.
-  paceRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "flex-start",
-    marginTop: spacing.sm,
-  },
-  paceLabel: { fontSize: 13, fontWeight: "700", paddingTop: 2 },
-  paceValues: { alignItems: "flex-end" },
-  paceTotal: { fontSize: 13, fontWeight: "800" },
-  // Deliberately smaller/quieter than paceTotal (not just a differently-
-  // colored equal-weight number) - this is what keeps a 1-member trip's
-  // numerically-identical Per Person value from reading as a second,
-  // equally-important stat next to Total.
-  pacePerPerson: { fontSize: 11, fontWeight: "600", marginTop: 1 },
+  // Checkpoint 3F.3D: Trip Timeline / Recommended Pace text (see
+  // TripTimelineSection) - short, stacked lines rather than one dense
+  // combined string, consistent with 3F.3C.1's wrapping/clipping fix for
+  // the section this one replaces.
+  guidanceMuted: { fontSize: 13, fontWeight: "600", marginTop: spacing.xs },
+  guidanceHeadline: { fontSize: 15, fontWeight: "800", marginTop: spacing.xs },
+  guidanceSub: { fontSize: 12, fontWeight: "600", marginTop: 2 },
+  paceValue: { fontSize: 15, fontWeight: "800", marginTop: 2 },
+  // Deliberately smaller/quieter than paceValue (the total rate) - keeps
+  // the per-person figure from reading as a second, equally-important
+  // number, matching 3F.3C.1's identical rationale for the section this
+  // replaces.
+  paceValueMuted: { fontSize: 12, fontWeight: "600", marginTop: 1 },
+  guidanceFootnote: { fontSize: 11, fontWeight: "500", marginTop: spacing.xs },
 
   // --- Loading / not-found (unchanged states) -------------------------
   loadingWrap: { paddingTop: 60, alignItems: "center", gap: 10 },

@@ -81,6 +81,13 @@ export type TripHorizon = {
   daysUntilStart: number;
   weeksUntilStart: number;
   hasStarted: boolean;
+  // Checkpoint 3F.3D: true only when the start date IS today (rawDays
+  // === 0) - false for a genuinely past start date, even though both
+  // cases report hasStarted: true/daysUntilStart: 0 identically. Added
+  // for callers (trip savings guidance) that need to say "Trip starts
+  // today" rather than the less accurate "Trip has started" for a trip
+  // that hasn't actually started yet today.
+  startsToday: boolean;
 };
 
 // Days/weeks until a trip's start date, in local calendar-day terms
@@ -111,6 +118,7 @@ export function computeTripHorizon(
     daysUntilStart,
     weeksUntilStart: Math.floor(daysUntilStart / 7),
     hasStarted,
+    startsToday: rawDays === 0,
   };
 }
 
@@ -121,6 +129,16 @@ const MONTH_ABBREVIATIONS = [
 
 function formatCalendarDate(calendarDate: CalendarDate): string {
   return `${MONTH_ABBREVIATIONS[calendarDate.month - 1]} ${calendarDate.day}, ${calendarDate.year}`;
+}
+
+// Checkpoint 3F.3D: a single formatted date with no "Starts "/range
+// prefix (unlike formatTripDates below), for callers that need to embed
+// just the trip's start date inline in a sentence (e.g. trip savings
+// guidance's "...reach the shared goal by Dec 31, 2026."). Returns null
+// for a missing/invalid date, same contract as formatTripDates.
+export function formatCanonicalDateShort(value: string | null | undefined): string | null {
+  const parsed = value ? parseCanonicalDate(value) : null;
+  return parsed ? formatCalendarDate(parsed) : null;
 }
 
 // Truthful display formatting for a trip's real dates - never invents a

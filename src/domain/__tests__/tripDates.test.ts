@@ -1,5 +1,6 @@
 import {
   computeTripHorizon,
+  formatCanonicalDateShort,
   formatTripDates,
   isValidCanonicalDate,
   todayCanonicalDate,
@@ -57,19 +58,46 @@ describe("computeTripHorizon", () => {
   it("computes days/weeks until a future start date", () => {
     const now = new Date(2027, 0, 1); // Jan 1, 2027
     const result = computeTripHorizon("2027-01-29", now); // 28 days later
-    expect(result).toEqual({ daysUntilStart: 28, weeksUntilStart: 4, hasStarted: false });
+    expect(result).toEqual({
+      daysUntilStart: 28,
+      weeksUntilStart: 4,
+      hasStarted: false,
+      startsToday: false,
+    });
   });
 
   it("a trip starting today reports hasStarted: true and 0, not a negative", () => {
     const now = new Date(2027, 5, 12);
     const result = computeTripHorizon("2027-06-12", now);
-    expect(result).toEqual({ daysUntilStart: 0, weeksUntilStart: 0, hasStarted: true });
+    expect(result).toEqual({
+      daysUntilStart: 0,
+      weeksUntilStart: 0,
+      hasStarted: true,
+      startsToday: true,
+    });
   });
 
   it("a trip that already started (past date) reports hasStarted: true and 0, never negative", () => {
     const now = new Date(2027, 5, 20);
     const result = computeTripHorizon("2027-06-12", now);
-    expect(result).toEqual({ daysUntilStart: 0, weeksUntilStart: 0, hasStarted: true });
+    expect(result).toEqual({
+      daysUntilStart: 0,
+      weeksUntilStart: 0,
+      hasStarted: true,
+      startsToday: false,
+    });
+  });
+
+  // Checkpoint 3F.3D: startsToday is the one field that distinguishes an
+  // otherwise-identical hasStarted:true/daysUntilStart:0 result between
+  // "starts later today" and "already started days/weeks ago" - both
+  // matter to trip savings guidance (TRIP_STARTED's copy differs).
+  it("distinguishes starts-today from an already-past start date via startsToday", () => {
+    const today = new Date(2027, 5, 12);
+    expect(computeTripHorizon("2027-06-12", today)?.startsToday).toBe(true);
+
+    const wellAfter = new Date(2027, 5, 12);
+    expect(computeTripHorizon("2027-05-01", wellAfter)?.startsToday).toBe(false);
   });
 
   it("floors partial weeks rather than rounding", () => {
@@ -123,5 +151,17 @@ describe("formatTripDates", () => {
 
   it("invalid start date with a valid end date still returns null (never fabricates a start)", () => {
     expect(formatTripDates("not-a-date", "2027-06-18")).toBeNull();
+  });
+});
+
+describe("formatCanonicalDateShort", () => {
+  it("formats a single valid date with no prefix", () => {
+    expect(formatCanonicalDateShort("2026-12-31")).toBe("Dec 31, 2026");
+  });
+
+  it("returns null for a missing or invalid date", () => {
+    expect(formatCanonicalDateShort(null)).toBeNull();
+    expect(formatCanonicalDateShort(undefined)).toBeNull();
+    expect(formatCanonicalDateShort("not-a-date")).toBeNull();
   });
 });
