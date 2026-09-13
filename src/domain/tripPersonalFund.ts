@@ -27,3 +27,31 @@
 export function tripPersonalBucketId(tripId: string, uid: string): string {
   return `tripfund_${tripId}_${uid}`;
 }
+
+// Checkpoint 3F.3B.4C: the predicate the client uses to verify a Bucket
+// document read back after "Create My Stash" (or discovered via an
+// already-exists retry) is actually the caller's OWN trip_personal fund
+// for THIS trip - not a coincidentally-shaped document, and not another
+// member's fund. This is a read-time sanity check, not a security
+// boundary (Firestore rules are the actual boundary - a caller can never
+// even fetch another member's fund document by id). Deliberately takes a
+// minimal structural shape rather than importing the full Bucket domain
+// type, keeping this file free of any outside dependency.
+export type MinimalTripPersonalBucketFields = {
+  bucketType?: string | null;
+  linkedTripId?: string | null;
+  ownerId?: string | null;
+};
+
+export function isMatchingTripPersonalBucket(
+  bucket: MinimalTripPersonalBucketFields | null | undefined,
+  tripId: string,
+  ownerUid: string
+): boolean {
+  return (
+    !!bucket &&
+    bucket.bucketType === "trip_personal" &&
+    bucket.linkedTripId === tripId &&
+    bucket.ownerId === ownerUid
+  );
+}

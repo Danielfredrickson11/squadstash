@@ -24,6 +24,11 @@ export default function TabLayout() {
   // checked by prefix below so no bucketId is ever hardcoded.
   const pathname = usePathname();
   const isOnBucketDetail = pathname.startsWith("/buckets/");
+  // Checkpoint 3F.3B.4C: same prefix-check pattern as Buckets above -
+  // covers both nested Trips routes ("/trips/create" and
+  // "/trips/<tripId>"), so re-tapping Trips from either one returns to
+  // the Trips list, not just from a Trip Detail screen specifically.
+  const isOnTripsNonRoot = pathname.startsWith("/trips/");
 
   if (loading) {
     return (
@@ -116,6 +121,17 @@ export default function TabLayout() {
           tabBarIcon: ({ color }) => (
             <TabBarIcon name="pie-chart" color={color} />
           ),
+          // Checkpoint 3F.3B.4C audit: the tabPress listener below only
+          // resets Buckets' nested stack when Buckets is already the
+          // focused tab (a bare tab SWITCH away to Home/Trips and back
+          // never fires tabPress, so a stale Bucket Detail screen was
+          // still being revived on return - the same product bug as
+          // Trips, just not previously named). popToTopOnBlur is
+          // @react-navigation/bottom-tabs' own built-in mechanism for
+          // exactly this: it pops the nested stack to its root the
+          // moment this tab loses focus, so by the time the user comes
+          // back to Buckets (by any route), the list is already showing.
+          popToTopOnBlur: true,
         }}
         // Checkpoint 3C navigation review fix, scoped to Buckets only:
         // the nested buckets/_layout.tsx Stack can leave a Bucket detail
@@ -126,7 +142,11 @@ export default function TabLayout() {
         // ("/buckets/<bucketId>") - already being on the Bucket list
         // itself ("/buckets") must keep completely normal tab behavior,
         // and pressing the tab from a DIFFERENT tab is unaffected either
-        // way (isFocused() is false there).
+        // way (isFocused() is false there). Kept alongside
+        // popToTopOnBlur above rather than replaced by it - blur-based
+        // reset never fires for a tabPress on an ALREADY-focused tab
+        // (nothing blurs), so this listener is still the only thing
+        // that handles that specific case.
         listeners={({ navigation }) => ({
           tabPress: (e) => {
             if (navigation.isFocused() && isOnBucketDetail) {
@@ -144,7 +164,28 @@ export default function TabLayout() {
           tabBarIcon: ({ color }) => (
             <TabBarIcon name="suitcase" color={color} />
           ),
+          // Checkpoint 3F.3B.4C: Trip Detail -> Home -> Trips must land
+          // on the Trips list, not revive the stale Trip Detail screen -
+          // see the matching Buckets popToTopOnBlur comment above for
+          // why this specific option is the correct fix (resets the
+          // nested trips/_layout.tsx Stack to its root the moment this
+          // tab blurs, rather than on the next tabPress).
+          popToTopOnBlur: true,
         }}
+        // Mirrors the Buckets tabPress listener above (same product
+        // rule, same reasoning): re-tapping the Trips icon while Trips
+        // is already the focused tab, from either nested non-root route
+        // ("/trips/create" or "/trips/<tripId>"), returns to the Trips
+        // list instead of leaving the stale screen on top. Nothing else
+        // about Trips navigation changes.
+        listeners={({ navigation }) => ({
+          tabPress: (e) => {
+            if (navigation.isFocused() && isOnTripsNonRoot) {
+              e.preventDefault();
+              router.replace("/(tabs)/trips");
+            }
+          },
+        })}
       />
 
       {/* Milestone 3 Checkpoint 3E: the Transactions surface is an

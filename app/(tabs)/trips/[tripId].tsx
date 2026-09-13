@@ -23,6 +23,7 @@ import { useAuth } from "../../../src/contexts/AuthContext";
 import { deleteTrip, fetchTripById, updateTripDates } from "../../../src/services/firebase/trips";
 import {
   createBucket,
+  fetchBucketById,
   generateBucketClientRequestId,
   subscribeToBucketById,
 } from "../../../src/services/firebase/buckets";
@@ -32,7 +33,7 @@ import {
   recordSavingsTransaction,
 } from "../../../src/services/firebase/savingsTransactions";
 import { formatTripDates, isValidCanonicalDate, todayCanonicalDate } from "../../../src/domain/tripDates";
-import { tripPersonalBucketId } from "../../../src/domain/tripPersonalFund";
+import { isMatchingTripPersonalBucket, tripPersonalBucketId } from "../../../src/domain/tripPersonalFund";
 import {
   normalizeTransactionNote,
   resolveAmountMinor,
@@ -283,11 +284,7 @@ export default function TripDetails() {
   // My Stash - undefined while the first snapshot hasn't arrived yet,
   // null once confirmed the fund doesn't exist, a real Bucket once it
   // does. Looked up by its DETERMINISTIC id (tripPersonalBucketId) - a
-  // direct document subscription, no query, no new Firestore index - and
-  // stays live so Add Money/Withdraw and "Create My Stash" both reflect
-  // immediately without a manual refetch (onSnapshot on a not-yet-
-  // existing document id keeps listening and fires again once it's
-  // created).
+  // direct document subscription, no query, no new Firestore index.
   //
   // Checkpoint 3F.3B.4A: the effect below references only this extracted
   // `myStashUid` primitive, never `user` itself, so its dependency array
@@ -295,14 +292,41 @@ export default function TripDetails() {
   // identity can change (e.g. a profile field update) without needing to
   // tear down and recreate this subscription, which only ever actually
   // needs to change when the uid itself changes.
+  //
+  // Checkpoint 3F.3B.4C root-cause finding: contrary to this file's
+  // earlier assumption, onSnapshot on a not-yet-existing document does
+  // NOT reliably "keep listening and fire again once it's created". This
+  // collection's rules (firestore.rules: isBucketMember()/isBucketOwner()
+  // both read resource.data) evaluate `resource` as null for a
+  // nonexistent document, and referencing `.data` on a null resource is
+  // a Firestore Rules evaluation error, which Firestore treats as
+  // permission-denied - not as an empty/not-found snapshot. A
+  // permission-denied listener error is TERMINAL: the SDK does not
+  // retry it the way it retries transient errors like `unavailable`, so
+  // once this mount-time listener hits that error (which it always will,
+  // for a member creating their fund for the first time) it is
+  // permanently dead - it will never observe the document even after the
+  // trusted callable creates it moments later. This is a real, pre-
+  // existing Firestore Rules defect (not introduced by this checkpoint),
+  // but per this checkpoint's scope it is reported, not patched here -
+  // see the checkpoint report. Firestore rules are NOT modified in this
+  // checkpoint.
+  //
+  // The onError handler below still treats that permission-denied as "no
+  // fund yet" (correct for this specific first-mount case - it's
+  // indistinguishable client-side from "genuinely doesn't exist"), but
+  // the listener it came from is deliberately never reused afterward -
+  // attachMyStashListener() below always tears down whatever listener is
+  // currently active and installs a fresh one, which is what actually
+  // recovers live updates once the fund is confirmed (via an explicit
+  // read, see reconcileMyStash) to exist.
   const myStashUid = user?.uid;
   const [myStash, setMyStash] = useState<Bucket | null | undefined>(undefined);
+  const myStashUnsubRef = useRef<(() => void) | null>(null);
 
-  useEffect(() => {
-    setMyStash(undefined);
-    if (!tripId || !myStashUid) return;
-    const bucketId = tripPersonalBucketId(tripId, myStashUid);
-    const unsub = subscribeToBucketById(
+  const attachMyStashListener = useCallback((bucketId: string) => {
+    myStashUnsubRef.current?.();
+    myStashUnsubRef.current = subscribeToBucketById(
       bucketId,
       (bucket) => setMyStash(bucket),
       (err) => {
@@ -310,8 +334,43 @@ export default function TripDetails() {
         setMyStash(null);
       }
     );
-    return () => unsub();
-  }, [tripId, myStashUid]);
+  }, []);
+
+  useEffect(() => {
+    setMyStash(undefined);
+    myStashUnsubRef.current?.();
+    myStashUnsubRef.current = null;
+    if (!tripId || !myStashUid) return undefined;
+    attachMyStashListener(tripPersonalBucketId(tripId, myStashUid));
+    return () => {
+      myStashUnsubRef.current?.();
+      myStashUnsubRef.current = null;
+    };
+  }, [tripId, myStashUid, attachMyStashListener]);
+
+  // Checkpoint 3F.3B.4C: explicit post-create/post-already-exists
+  // reconciliation (see submitCreateStash below) - a one-shot trusted
+  // read, never a second source of truth. The live listener
+  // (attachMyStashListener) remains the ongoing source of updates once
+  // re-attached; this only bridges the gap for the one read that a dead
+  // mount-time listener can't. Validates bucketType/linkedTripId/ownerId
+  // rather than trusting the read blindly, so a structurally-wrong
+  // document (or one belonging to someone else, which Firestore Rules
+  // should never actually return, but this stays a real check rather
+  // than an assumption) surfaces a real error instead of silently
+  // rendering as this member's fund.
+  const reconcileMyStash = useCallback(
+    async (bucketId: string): Promise<Bucket> => {
+      const fetched = await fetchBucketById(bucketId);
+      if (!tripId || !myStashUid || !isMatchingTripPersonalBucket(fetched, tripId, myStashUid)) {
+        throw new Error(
+          "Your My Stash was saved, but couldn't be loaded. Please try again."
+        );
+      }
+      return fetched as Bucket;
+    },
+    [tripId, myStashUid]
+  );
 
   const [isCreatingStash, setIsCreatingStash] = useState(false);
   const [stashTargetText, setStashTargetText] = useState("");
@@ -382,7 +441,7 @@ export default function TripDetails() {
     setStashCreateErr(null);
 
     try {
-      await createBucket({
+      const result = await createBucket({
         name: facts.name,
         target: facts.target,
         // Minimum viable creation flow (Checkpoint 3F.3B.4): a starting
@@ -395,22 +454,67 @@ export default function TripDetails() {
         bucketType: "trip_personal",
         linkedTripId: tripId,
       });
+
+      // Checkpoint 3F.3B.4C: reconcile via an explicit read rather than
+      // waiting on the (likely already-dead, see the effect above) live
+      // listener. The trusted callable does not return until its
+      // transaction commits, so this read resolves the committed
+      // document immediately - if it somehow doesn't, reconcileMyStash
+      // throws and the catch block below surfaces a real error instead
+      // of silently reverting to "No personal stash yet".
+      const created = await reconcileMyStash(result.bucketId);
       // Success clears the pending record - a later create is a new
       // logical request and must get a new id.
       stashPendingRef.current = null;
+      setMyStash(created);
+      attachMyStashListener(result.bucketId);
       setIsCreatingStash(false);
-      // No manual refetch - the live subscribeToBucketById listener
-      // above picks up the newly-created document automatically.
     } catch (e) {
       console.error("Failed to create My Stash:", e);
-      if ((e as { code?: string } | null | undefined)?.code === "functions/already-exists") {
+      const code = (e as { code?: string } | null | undefined)?.code;
+
+      if (code === "functions/already-exists") {
+        // Definitive, not ambiguous - and for trip_personal specifically
+        // (Checkpoint 3F.3B.4C section C), it also means a real fund
+        // already exists: the earlier-looking "failed" attempt may have
+        // actually succeeded server-side. The deterministic id is known
+        // client-side regardless of this request's own outcome, so fetch
+        // and show that real fund instead of leaving the user stuck on a
+        // dead-end error - this is a READ only, so it can never create a
+        // duplicate or overwrite the existing fund's stored target with
+        // this attempt's form data.
         stashPendingRef.current = null;
+        if (tripId && myStashUid) {
+          try {
+            const existingId = tripPersonalBucketId(tripId, myStashUid);
+            const existing = await reconcileMyStash(existingId);
+            setMyStash(existing);
+            attachMyStashListener(existingId);
+            setIsCreatingStash(false);
+            return;
+          } catch (reconcileErr) {
+            console.error("Failed to load existing My Stash:", reconcileErr);
+            // Falls through to the generic error message below - the
+            // create form stays open with a real error rather than
+            // silently reverting to "No personal stash yet".
+          }
+        }
       }
+
       setStashCreateErr(stashCreateErrorMessage(e));
     } finally {
       setStashCreating(false);
     }
-  }, [tripId, trip, user, stashCreating, stashTargetText]);
+  }, [
+    tripId,
+    trip,
+    user,
+    myStashUid,
+    stashCreating,
+    stashTargetText,
+    reconcileMyStash,
+    attachMyStashListener,
+  ]);
 
   // Shared Stash - a small, locally-scoped action form (not the shared
   // Bucket-specific MoneyActionSheet, which is typed around Bucket and
