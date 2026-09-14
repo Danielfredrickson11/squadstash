@@ -1,14 +1,29 @@
-// Pure, client-side Shared Stash savings-pace guidance (Milestone 3
-// Checkpoint 3F.3D). No Firestore, no UI, no framework imports - derived
-// display-only math, never persisted, never a second source of truth for
-// any stored financial field. Reuses computeTripHorizon (tripDates.ts)
-// for all date arithmetic rather than duplicating calendar-date logic.
+// Pure, client-side Trip savings-pace guidance (Milestone 3 Checkpoint
+// 3F.3D; generalized in Checkpoint 3F.3E to also cover My Stash - see
+// below). No Firestore, no UI, no framework imports - derived display-
+// only math, never persisted, never a second source of truth for any
+// stored financial field. Reuses computeTripHorizon (tripDates.ts) for
+// all date arithmetic rather than duplicating calendar-date logic.
 //
-// Money in this file is integer MINOR units (cents), never dollars - the
-// caller (Trip Detail) converts trip.saved/trip.target (dollar-
-// denominated display caches) to minor units before calling, the same
-// Math.round(dollars * 100) conversion submitSharedAction already uses
-// for its own non-authoritative balance check.
+// This helper is target-agnostic: it takes a (target, saved,
+// membersCount) triple and doesn't know or care which real-world
+// resource they came from. Trip Detail calls it twice with different
+// inputs, never two separate calculation engines:
+//   - Shared Stash: trip.saved / trip.target / the Trip's real member
+//     count (>= 1) - see Quick Analysis' "Trip Timeline".
+//   - My Stash (Checkpoint 3F.3E): the authenticated member's OWN
+//     myStash.balance / myStash.target / membersCount hardcoded to 1 -
+//     a personal fund has exactly one "member" by definition, so
+//     ratePerPersonMinor always equals rateTotalMinor for this caller
+//     (the UI uses only rateTotalMinor and never renders "per person"
+//     copy for My Stash - that phrasing belongs to Shared guidance).
+//
+// Money in this file is integer MINOR units (cents), never dollars -
+// each caller converts its own dollar-denominated display cache
+// (trip.saved/trip.target, or myStash.balance/myStash.target) to minor
+// units before calling, the same Math.round(dollars * 100) conversion
+// submitSharedAction already uses for its own non-authoritative balance
+// check.
 import { computeTripHorizon } from "./tripDates";
 
 // A trip within this many days is close enough that an average WEEKLY

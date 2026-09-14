@@ -14,13 +14,29 @@
 //
 // Checkpoint 3F.3C: re-skinned from a react-native-paper MD3 Dialog
 // (lavender surfaces, large default sizing) to a compact bottom sheet
-// matching the approved Light Mode language - same visual shell pattern
-// as components/navigation/CreateActionSheet.tsx (RN Modal + backdrop
-// Pressable + rounded sheet), styled with the shared semantic
-// colors/tokens so Dark Mode keeps working unchanged. PRESENTATION ONLY:
-// no change to useSavingsMoneyAction's state shape, validation,
-// idempotency, error handling, or submit() call - this file only reads
-// state and forwards the exact same handler calls as before.
+// matching the approved Light Mode language, styled with the shared
+// semantic colors/tokens so Dark Mode keeps working unchanged.
+// PRESENTATION ONLY: no change to useSavingsMoneyAction's state shape,
+// validation, idempotency, error handling, or submit() call - this file
+// only reads state and forwards the exact same handler calls as before.
+//
+// Checkpoint 3F.3E.1: the backdrop and the sheet are SIBLINGS inside
+// `modalRoot`, not parent (Pressable)/child (sheet) - the original
+// shell (matching components/navigation/CreateActionSheet.tsx's
+// pattern) nested the entire sheet, TextInputs included, inside the
+// backdrop's own Pressable and relied on `onStartShouldSetResponder` on
+// the sheet to stop taps from reaching it. That responder-interception
+// approach proved fragile for a TextInput specifically on React Native
+// Web: focusing the custom amount field could still let the interaction
+// reach the backdrop's onPress (closing the sheet) and, since the sheet
+// sits above Trip Detail in the same nested Stack, the resulting
+// close+re-render could be observed as "leaving" the detail screen.
+// Making the backdrop an absolutely-positioned sibling that only covers
+// the Modal's own space, with the sheet as a completely separate
+// sibling, removes the shared-responder-chain path structurally -
+// nothing inside the sheet is ever a descendant of the backdrop
+// Pressable, so no interaction inside the sheet can activate it,
+// without any stopPropagation-style hack.
 import React from "react";
 import { Modal, Pressable, StyleSheet, TextInput, View } from "react-native";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -67,11 +83,20 @@ export function MoneyActionSheet() {
 
   return (
     <Modal visible={state.visible} transparent animationType="fade" onRequestClose={close}>
-      <Pressable style={styles.backdrop} onPress={close} accessibilityLabel="Close">
-        <View
-          style={[styles.sheet, { backgroundColor: theme.colors.surface, borderColor: colors.border }]}
-          onStartShouldSetResponder={() => true}
-        >
+      <View style={styles.modalRoot}>
+        {/* Checkpoint 3F.3E.1: a sibling of the sheet below, not its
+            parent - see the module comment above for why that
+            distinction is the actual fix. Absolutely positioned so it
+            covers exactly the Modal's own space regardless of the
+            sheet's height. */}
+        <Pressable
+          style={styles.backdrop}
+          onPress={close}
+          accessibilityRole="button"
+          accessibilityLabel="Close"
+        />
+
+        <View style={[styles.sheet, { backgroundColor: theme.colors.surface, borderColor: colors.border }]}>
           <View style={styles.headerRow}>
             <Text style={[styles.title, { color: colors.textPrimary }]}>{title}</Text>
             <Text style={[styles.subtitle, { color: colors.textMuted }]} numberOfLines={1}>
@@ -207,16 +232,20 @@ export function MoneyActionSheet() {
             </Pressable>
           </View>
         </View>
-      </Pressable>
+      </View>
     </Modal>
   );
 }
 
 const styles = StyleSheet.create({
+  // Checkpoint 3F.3E.1: lays out the backdrop and sheet as siblings -
+  // the backdrop is position:absolute (see below) so it's removed from
+  // this flex flow entirely, leaving `sheet` as the only flex
+  // participant, naturally pinned to the bottom by justifyContent.
+  modalRoot: { flex: 1, justifyContent: "flex-end" },
   backdrop: {
-    flex: 1,
+    ...StyleSheet.absoluteFillObject,
     backgroundColor: "rgba(9,14,26,0.55)",
-    justifyContent: "flex-end",
   },
   sheet: {
     borderTopLeftRadius: radii.xl,

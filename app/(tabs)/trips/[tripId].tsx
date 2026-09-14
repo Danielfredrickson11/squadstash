@@ -724,6 +724,29 @@ export default function TripDetails() {
     membersCount,
   });
 
+  // Checkpoint 3F.3E: personal guidance for My Stash, via the SAME
+  // computeTripSavingsGuidance() call above - not a second calculation
+  // engine. Only computed when a real My Stash exists (myStash is a
+  // Bucket, not undefined/null) so the loading/no-fund-yet states never
+  // show a fabricated pace. Inputs are exclusively THIS member's own
+  // already-loaded myStash.balance/myStash.target - never Shared
+  // Stash's saved/target, never trip.memberIds.length, and never
+  // another member's fund (this screen never queries one - see
+  // myStash's own subscription effect above, keyed to this member's
+  // deterministic bucket id only). membersCount is hardcoded to 1: a
+  // personal fund has exactly one "member" by definition, so the UI
+  // (PersonalPaceSection) only ever reads rateTotalMinor, never
+  // ratePerPersonMinor - see tripSavingsGuidance.ts's own module
+  // comment for why that's safe to do generically.
+  const personalGuidance = myStash
+    ? computeTripSavingsGuidance({
+        tripStartDate: trip?.tripStartDate,
+        targetMinor: Math.round(myStash.target * 100),
+        savedMinor: Math.round(myStash.balance * 100),
+        membersCount: 1,
+      })
+    : null;
+
   const dangerText = theme.colors.onErrorContainer ?? "#991B1B";
 
   if (loading) {
@@ -1234,6 +1257,13 @@ export default function TripDetails() {
                     />
                   </View>
 
+                  {/* Checkpoint 3F.3E: compact personal pace, derived
+                      live from myStash's own real-time subscription -
+                      no new listener, nothing persisted. */}
+                  {personalGuidance ? (
+                    <PersonalPaceSection guidance={personalGuidance} colors={colors} />
+                  ) : null}
+
                   {/* My Stash IS an ordinary Bucket - reuses the exact
                       same trusted useSavingsMoneyAction()/
                       MoneyActionSheet Bucket Detail already uses, not a
@@ -1465,6 +1495,77 @@ function TripTimelineSection({
   );
 }
 
+// Checkpoint 3F.3E: a COMPACT personal-pace section rendered inside the
+// existing My Stash card (never a second full-width analysis card, and
+// never rendered for My Stash's loading/no-fund-yet states - see the
+// `personalGuidance` computation above, which is null in both of
+// those). Deliberately much shorter than TripTimelineSection: no
+// separate headline/sub/footnote layout, since My Stash's own "$X / Y"
+// balance line and progress bar already establish the amount context -
+// this only adds the pace itself. Personalizes every state's copy
+// ("personal"/"your" instead of "shared") and, for ACTIVE, renders ONLY
+// guidance.rateTotalMinor - never ratePerPersonMinor and never the
+// words "total"/"per person", which belong to Shared guidance only (My
+// Stash IS already one person's fund, so a second "per person" number
+// would just be a confusing duplicate of the same figure).
+function PersonalPaceSection({
+  guidance,
+  colors,
+}: {
+  guidance: TripSavingsGuidance;
+  colors: SemanticColors;
+}) {
+  if (guidance.status === "INVALID_TARGET") {
+    return (
+      <Text style={[styles.guidanceMuted, { color: colors.textSecondary }]}>
+        Set a personal savings target to calculate your pace.
+      </Text>
+    );
+  }
+
+  if (guidance.status === "MISSING_DATE") {
+    return (
+      <Text style={[styles.guidanceMuted, { color: colors.textSecondary }]}>
+        Add a trip start date to calculate your personal pace.
+      </Text>
+    );
+  }
+
+  if (guidance.status === "TRIP_STARTED") {
+    return (
+      <Text style={[styles.guidanceMuted, { color: colors.textSecondary }]}>
+        {guidance.startsToday ? "Trip starts today" : "Trip has started"}
+      </Text>
+    );
+  }
+
+  if (guidance.status === "GOAL_REACHED") {
+    return (
+      <View style={styles.personalPaceWrap}>
+        <Text style={[styles.paceValue, { color: colors.mintText }]}>Personal goal reached</Text>
+        <Text style={[styles.guidanceSub, { color: colors.textSecondary }]}>
+          {money(guidance.savedMinor / 100)} saved
+        </Text>
+      </View>
+    );
+  }
+
+  // ACTIVE - rateTotalMinor only (see the module comment above).
+  const unit = guidance.pace === "weekly" ? "week" : "day";
+  return (
+    <View style={styles.personalPaceWrap}>
+      <Text style={[styles.groupLabel, { color: colors.textSecondary }]}>Your Pace</Text>
+      <Text style={[styles.paceValue, { color: colors.textPrimary }]}>
+        {money(guidance.rateTotalMinor / 100)} / {unit}
+      </Text>
+      <Text style={[styles.guidanceSub, { color: colors.textSecondary }]}>
+        {money(guidance.remainingMinor / 100)} left ·{" "}
+        {formatTripHorizonText(guidance.fullWeeksUntilStart, guidance.extraDays)}
+      </Text>
+    </View>
+  );
+}
+
 // Checkpoint 3F.3C: fixed (non-semantic) dark-on-photo treatment for
 // controls/badges drawn directly over the hero image - mirrors
 // components/home/ActiveStashHero.tsx's identical PHOTO_MINT/PHOTO_NAVY
@@ -1674,6 +1775,12 @@ const styles = StyleSheet.create({
   // replaces.
   paceValueMuted: { fontSize: 12, fontWeight: "600", marginTop: 1 },
   guidanceFootnote: { fontSize: 11, fontWeight: "500", marginTop: spacing.xs },
+
+  // Checkpoint 3F.3E: My Stash's compact personal-pace area (see
+  // PersonalPaceSection) - a small gap above/below so it reads as its
+  // own compact block between the progress bar and the Add Money/
+  // Withdraw buttons, without materially growing the card.
+  personalPaceWrap: { marginTop: spacing.sm, marginBottom: spacing.xs },
 
   // --- Loading / not-found (unchanged states) -------------------------
   loadingWrap: { paddingTop: 60, alignItems: "center", gap: 10 },
