@@ -556,6 +556,309 @@ describe("recordSavingsTransactionCore - ambiguous/partial ledger state", () => 
   });
 });
 
+// Checkpoint 4B.5C (docs/audits/TRIP_ARCHIVE_DELETE_SAFETY_PREFLIGHT_
+// 2026-09-13.md, as hardened by its 4B.5A.1 amendment): the trusted
+// enforcement half of the archive lifecycle - 4B.5B already built the
+// Rules/UI half. `archivedAt`/`archivedBy` are the same fields
+// firestore.rules' `tripIsActive()` checks, so seeding them here directly
+// (bypassing Rules entirely via the Admin SDK, same as every other seed
+// in this file) exercises exactly the shape the trusted backend must
+// reason about independently of any client enforcement.
+describe("recordSavingsTransactionCore - archived Trip enforcement (Checkpoint 4B.5C)", () => {
+  it("1. active Trip contribution succeeds", async () => {
+    await seedTrip();
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({ resourceType: "trip", resourceId: TRIP_ID })
+    );
+    assert.equal(result.balanceMinor, 500);
+  });
+
+  it("2. archived Trip NEW contribution fails with failed-precondition", async () => {
+    await seedTrip({ archivedAt: new Date(), archivedBy: OWNER_UID });
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({ resourceType: "trip", resourceId: TRIP_ID })
+      ),
+      "failed-precondition"
+    );
+  });
+
+  // Checkpoint 4B.5C.1: authorization must be resolved BEFORE the archive
+  // precondition is ever evaluated, so an unauthorized caller learns only
+  // permission-denied - never whether the Trip they're not authorized for
+  // happens to be archived.
+  it("4B.5C.1-1. archived Trip + authenticated non-member using their own uid fails with permission-denied, not failed-precondition", async () => {
+    await seedTrip({ archivedAt: new Date(), archivedBy: OWNER_UID });
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(
+        db,
+        OUTSIDER_UID,
+        baseRequest({
+          resourceType: "trip",
+          resourceId: TRIP_ID,
+          memberUid: OUTSIDER_UID,
+        })
+      ),
+      "permission-denied"
+    );
+  });
+
+  it("4B.5C.1-2. archived Trip + memberUid names a real member but authUid differs fails with permission-denied (self-only), not archive failed-precondition", async () => {
+    await seedTrip({ archivedAt: new Date(), archivedBy: OWNER_UID });
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(
+        db,
+        OWNER_UID,
+        baseRequest({
+          resourceType: "trip",
+          resourceId: TRIP_ID,
+          memberUid: MEMBER_UID,
+        })
+      ),
+      "permission-denied"
+    );
+  });
+
+  it("3. archived Trip withdrawal succeeds when balance is sufficient", async () => {
+    await seedTrip({
+      archivedAt: new Date(),
+      archivedBy: OWNER_UID,
+      saved: 10, // -> 1000 minor
+    });
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({
+        resourceType: "trip",
+        resourceId: TRIP_ID,
+        type: "withdrawal",
+        amountMinor: 400,
+      })
+    );
+    assert.equal(result.balanceMinor, 600);
+  });
+
+  it("4. archived Trip withdrawal still fails when balance is insufficient", async () => {
+    await seedTrip({
+      archivedAt: new Date(),
+      archivedBy: OWNER_UID,
+      saved: 1, // -> 100 minor
+    });
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({
+          resourceType: "trip",
+          resourceId: TRIP_ID,
+          type: "withdrawal",
+          amountMinor: 200,
+        })
+      ),
+      "failed-precondition"
+    );
+  });
+
+  it("5. legacy Trip with no archivedAt key contribution succeeds", async () => {
+    await seedTrip();
+    const snap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.equal("archivedAt" in snap.data()!, false);
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({ resourceType: "trip", resourceId: TRIP_ID })
+    );
+    assert.equal(result.balanceMinor, 500);
+  });
+
+  it("6. Trip with archivedAt: null contribution succeeds", async () => {
+    await seedTrip({ archivedAt: null });
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({ resourceType: "trip", resourceId: TRIP_ID })
+    );
+    assert.equal(result.balanceMinor, 500);
+  });
+
+  it("7. ordinary Bucket contribution is unchanged", async () => {
+    await seedBucket();
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest()
+    );
+    assert.equal(result.balanceMinor, 10500);
+  });
+
+  it("8. ordinary Bucket withdrawal is unchanged", async () => {
+    await seedBucket({ balance: 100 });
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({ type: "withdrawal", amountMinor: 400 })
+    );
+    assert.equal(result.balanceMinor, 9600);
+  });
+
+  it("9. trip_personal Bucket contribution is unchanged even when the linked Trip is archived", async () => {
+    await seedTrip({ archivedAt: new Date(), archivedBy: OWNER_UID });
+    const personalBucketId = "test-trip-personal-bucket";
+    await db.collection("buckets").doc(personalBucketId).set({
+      ownerId: MEMBER_UID,
+      memberIds: [MEMBER_UID],
+      bucketType: "trip_personal",
+      linkedTripId: TRIP_ID,
+      name: "My Stash",
+      target: 500,
+      balance: 5,
+    });
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({
+        resourceType: "bucket",
+        resourceId: personalBucketId,
+        amountMinor: 200,
+      })
+    );
+    assert.equal(result.balanceMinor, 700); // 500 legacy + 200
+  });
+
+  it("10. trip_personal Bucket withdrawal is unchanged even when the linked Trip is archived", async () => {
+    await seedTrip({ archivedAt: new Date(), archivedBy: OWNER_UID });
+    const personalBucketId = "test-trip-personal-bucket";
+    await db.collection("buckets").doc(personalBucketId).set({
+      ownerId: MEMBER_UID,
+      memberIds: [MEMBER_UID],
+      bucketType: "trip_personal",
+      linkedTripId: TRIP_ID,
+      name: "My Stash",
+      target: 500,
+      balance: 5, // -> 500 minor
+    });
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({
+        resourceType: "bucket",
+        resourceId: personalBucketId,
+        type: "withdrawal",
+        amountMinor: 200,
+      })
+    );
+    assert.equal(result.balanceMinor, 300);
+  });
+
+  it("11. an exact successful Trip contribution replay still reconciles idempotently after the Trip later archives", async () => {
+    await seedTrip();
+    const request = baseRequest({
+      resourceType: "trip",
+      resourceId: TRIP_ID,
+      amountMinor: 250,
+    });
+
+    const first = await recordSavingsTransactionCore(db, MEMBER_UID, request);
+    assert.equal(first.balanceMinor, 250);
+
+    await db.collection("trips").doc(TRIP_ID).update({
+      archivedAt: new Date(),
+      archivedBy: OWNER_UID,
+    });
+
+    const replay = await recordSavingsTransactionCore(db, MEMBER_UID, request);
+    assert.equal(replay.balanceMinor, 250);
+    assert.equal(replay.transactionId, first.transactionId);
+
+    const txnSnap = await db.collection("savingsTransactions").get();
+    assert.equal(txnSnap.size, 1);
+  });
+
+  it("12. a NEW request id against a Trip that archived after an earlier contribution fails", async () => {
+    await seedTrip();
+    await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({
+        resourceType: "trip",
+        resourceId: TRIP_ID,
+        amountMinor: 250,
+      })
+    );
+
+    await db.collection("trips").doc(TRIP_ID).update({
+      archivedAt: new Date(),
+      archivedBy: OWNER_UID,
+    });
+
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({
+          resourceType: "trip",
+          resourceId: TRIP_ID,
+          amountMinor: 100,
+        })
+      ),
+      "failed-precondition"
+    );
+  });
+
+  it("13. an archived Trip contribution creates no savingsTransactions document", async () => {
+    await seedTrip({ archivedAt: new Date(), archivedBy: OWNER_UID });
+    await assert.rejects(
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({ resourceType: "trip", resourceId: TRIP_ID })
+      )
+    );
+    const snap = await db.collection("savingsTransactions").get();
+    assert.equal(snap.size, 0);
+  });
+
+  it("14. an archived Trip contribution does not mutate ledgerBalanceMinor", async () => {
+    await seedTrip({
+      archivedAt: new Date(),
+      archivedBy: OWNER_UID,
+      ledgerOpeningBalanceMinor: 1000,
+      ledgerBalanceMinor: 1000,
+    });
+    await assert.rejects(
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({ resourceType: "trip", resourceId: TRIP_ID })
+      )
+    );
+    const snap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.equal(snap.data()!.ledgerBalanceMinor, 1000);
+  });
+
+  it("15. an archived Trip contribution does not mutate Trip.saved", async () => {
+    await seedTrip({
+      archivedAt: new Date(),
+      archivedBy: OWNER_UID,
+      saved: 10,
+    });
+    await assert.rejects(
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({ resourceType: "trip", resourceId: TRIP_ID })
+      )
+    );
+    const snap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.equal(snap.data()!.saved, 10);
+    assert.equal("ledgerBalanceMinor" in snap.data()!, false);
+  });
+});
+
 describe("recordSavingsTransactionCore - persisted transaction shape", () => {
   it("records memberUid, recordedBy, reversalOf, createdAt, and no stored id field for a valid self write", async () => {
     await seedBucket();

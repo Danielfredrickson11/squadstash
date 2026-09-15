@@ -171,6 +171,36 @@ export async function recordSavingsTransactionCore(
       );
     }
 
+    // Checkpoint 4B.5C (docs/audits/TRIP_ARCHIVE_DELETE_SAFETY_PREFLIGHT_
+    // 2026-09-13.md, as hardened by its 4B.5A.1 amendment), ordering
+    // corrected by 4B.5C.1: the trusted enforcement half of the archive
+    // lifecycle 4B.5B already built in Rules/UI. This sits AFTER the
+    // idempotent-replay check above (an exact replay of an already-
+    // committed contribution answers "did this already happen?", not "is
+    // it still allowed today" - it must keep reconciling to the original
+    // success even once the Trip has since been archived) AND after the
+    // membership/self-only authorization checks immediately above (an
+    // unauthorized caller must learn permission-denied, never the Trip's
+    // archive state - putting this check any earlier would leak Trip
+    // lifecycle state to a caller who isn't even authorized to act on the
+    // resource). Only new "trip" contributions are affected: withdrawals
+    // continue through every existing invariant unchanged (the wind-down
+    // model only closes the contribution path), and "bucket" (including a
+    // trip_personal My Stash Bucket) never consults Trip archive state at
+    // all - archive status is not permission-denied (the caller is, by
+    // this point, already confirmed to be a fully valid member) but a
+    // failed-precondition on the resource's own lifecycle state.
+    if (
+      input.resourceType === "trip" &&
+      input.type === "contribution" &&
+      isTripArchived(parentData)
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip is archived and no longer accepts shared contributions."
+      );
+    }
+
     let effectiveCurrency = "USD";
     if ("currency" in parentData) {
       const parentCurrency = parentData.currency;
@@ -302,6 +332,22 @@ export async function recordSavingsTransactionCore(
       balanceMinor: newBalanceMinor,
     };
   });
+}
+
+/**
+ * Checkpoint 4B.5C: trusted-backend mirror of the client Rules'
+ * `tripIsActive()` missing-safe check (firestore.rules) - deliberately no
+ * separate `status: "active" | "archived"` field exists anywhere in this
+ * system, so `archivedAt`'s own presence is the only source of truth. A
+ * legacy Trip with no `archivedAt` key, or one explicitly `null`, reads as
+ * active; only a real archivedAt value (Firestore returns a Timestamp for
+ * a persisted field, but this only needs "is a real value present") reads
+ * as archived.
+ * @param {FirebaseFirestore.DocumentData} tripData The Trip document data.
+ * @return {boolean} True if the Trip is archived.
+ */
+function isTripArchived(tripData: FirebaseFirestore.DocumentData): boolean {
+  return tripData.archivedAt !== undefined && tripData.archivedAt !== null;
 }
 
 /**
