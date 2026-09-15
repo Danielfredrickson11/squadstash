@@ -77,6 +77,21 @@ export type Trip = {
   // around once ledger tracking has begun. Optional for backward
   // compatibility; never a client-write input.
   ledgerBalanceMinor?: number;
+
+  // Checkpoint 4B.5B, per the approved docs/audits/
+  // TRIP_ARCHIVE_DELETE_SAFETY_PREFLIGHT_2026-09-13.md (as hardened by
+  // its 4B.5A.1 amendment): a Trip is never client-hard-deletable -
+  // "Delete Trip" is archiving instead, a one-way, owner-only Firestore
+  // Rules-enforced transition (firestore.rules). archivedAt's own
+  // presence/absence IS the archive status - there is deliberately NO
+  // separate `status: "active" | "archived"` field, which would just be
+  // a second, independently-settable source of truth for the exact same
+  // fact and could disagree with archivedAt from a bug or partial write.
+  // Both fields are optional/nullable: a legacy Trip has neither key at
+  // all and must be treated as active everywhere (mapTripDocument does
+  // not fabricate a value for either - see src/services/firebase/trips.ts).
+  archivedAt?: PersistedTimestamp | null;
+  archivedBy?: string | null;
 };
 
 export type CreateTripInput = {

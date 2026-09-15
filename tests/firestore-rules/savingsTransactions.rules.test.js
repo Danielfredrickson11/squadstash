@@ -159,6 +159,24 @@ describe('firestore.rules: savingsTransactions - reads', () => {
     await assertFails(transactionDoc(asOutsider(), 'txn-trip-1').get());
   });
 
+  // Checkpoint 4B.5B: archiving a Trip (firestore.rules'
+  // tripIsActive()/archive-transition clause) only closes off further
+  // metadata edits and new contributions - it has zero effect on reading
+  // the Trip's existing financial history. savingsTransactions' own read
+  // rule authorizes off the parent Trip's ownerId/memberIds only, which
+  // archiving never touches, so this is really a parity check that
+  // archiving didn't accidentally regress an unrelated read path.
+  it("12. trip member can still read a savingsTransaction for an archived trip", async () => {
+    await seedTrip(
+      testEnv,
+      TRIP_ID,
+      validTripData({ archivedAt: Timestamp.now(), archivedBy: OWNER_UID })
+    );
+    await seedTransaction('txn-trip-archived-1', validTripContribution());
+    await assertSucceeds(transactionDoc(asOwner(), 'txn-trip-archived-1').get());
+    await assertSucceeds(transactionDoc(asMember(), 'txn-trip-archived-1').get());
+  });
+
   it('7. authorized resource-scoped list query succeeds', async () => {
     await seedTransaction('txn-1', validContribution());
     await seedTransaction('txn-2', validWithdrawal({ amountMinor: 200 }));

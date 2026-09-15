@@ -87,8 +87,27 @@ export default function TripsIndex() {
     });
   }, [trips, queryText]);
 
-  const heroTrip = filteredTrips[0] ?? null;
-  const otherTrips = filteredTrips.slice(1);
+  // Checkpoint 4B.5B: client-side PARTITION (never a
+  // `where("archivedAt", "==", null)` query - see the approved preflight
+  // §9: that query would silently exclude every legacy Trip, since
+  // Firestore's `== null` only matches a field explicitly present and
+  // set to null, never a field that's entirely absent). `!t.archivedAt`
+  // is true for both "field absent" (legacy) and "field null" (never
+  // archived), so legacy Trips land in the active group automatically,
+  // with no backfill needed. fetchMemberTripsOrdered/fetchMemberTrips
+  // themselves are completely unchanged - this only partitions their
+  // already-fetched, already-search-filtered result.
+  const activeFilteredTrips = useMemo(
+    () => filteredTrips.filter((t) => !t.archivedAt),
+    [filteredTrips]
+  );
+  const archivedFilteredTrips = useMemo(
+    () => filteredTrips.filter((t) => !!t.archivedAt),
+    [filteredTrips]
+  );
+
+  const heroTrip = activeFilteredTrips[0] ?? null;
+  const otherTrips = activeFilteredTrips.slice(1);
 
   const listSection = otherTrips.length === 0 ? null : (
     <View>
@@ -104,6 +123,50 @@ export default function TripsIndex() {
               router.push({ pathname: "/(tabs)/trips/[tripId]", params: { tripId: trip.id } })
             }
           />
+        ))}
+      </View>
+    </View>
+  );
+
+  // Checkpoint 4B.5B: the minimal, always-present Archived section
+  // (approved preflight §9/§10) - the ONLY in-app path back to an
+  // archived Trip, and therefore to that member's own My Stash (Trip
+  // Detail is the sole screen that ever renders a My Stash card - see
+  // the preflight's executive summary for why hiding archived Trips
+  // with no path back would silently reintroduce the exact hazard this
+  // whole feature exists to prevent). Deliberately compact/subdued
+  // (title + chevron only, no photo/progress) rather than a second
+  // OtherTripCard-style rich card - this is a status list, not a second
+  // set of active trip cards. Tapping a row opens the EXACT same Trip
+  // Detail route as any other trip - no separate route, no restore, no
+  // management UI.
+  const archivedSection = archivedFilteredTrips.length === 0 ? null : (
+    <View style={{ marginTop: spacing.lg }}>
+      <Text style={[styles.sectionTitle, { color: colors.textMuted }]}>Archived</Text>
+      <View style={{ gap: spacing.xs }}>
+        {archivedFilteredTrips.map((trip) => (
+          <Pressable
+            key={trip.id}
+            onPress={() =>
+              router.push({ pathname: "/(tabs)/trips/[tripId]", params: { tripId: trip.id } })
+            }
+            accessibilityRole="button"
+            accessibilityLabel={`Open ${trip.title?.trim() || "archived trip"} details`}
+            style={({ pressed }) => [
+              styles.archivedRow,
+              { backgroundColor: theme.colors.surface, borderColor: colors.border },
+              pressed && { opacity: 0.85 },
+            ]}
+          >
+            <MaterialCommunityIcons name="archive-outline" size={16} color={colors.textMuted} />
+            <Text
+              style={[styles.archivedRowTitle, { color: colors.textSecondary }]}
+              numberOfLines={1}
+            >
+              {trip.title?.trim() || "Untitled trip"}
+            </Text>
+            <MaterialCommunityIcons name="chevron-right" size={18} color={colors.textMuted} />
+          </Pressable>
         ))}
       </View>
     </View>
@@ -194,39 +257,49 @@ export default function TripsIndex() {
               </Text>
             </View>
           ) : isDesktop ? (
-            <View style={styles.desktopRow}>
-              <View style={styles.desktopMainCol}>
-                {heroTrip ? (
-                  <ActiveStashHero
-                    trip={heroTrip}
-                    variant="trips"
-                    onPress={() =>
-                      router.push({
-                        pathname: "/(tabs)/trips/[tripId]",
-                        params: { tripId: heroTrip.id },
-                      })
-                    }
-                  />
-                ) : null}
-              </View>
-              <View style={styles.desktopSideCol}>{listSection}</View>
-            </View>
+            <>
+              {activeFilteredTrips.length > 0 ? (
+                <View style={styles.desktopRow}>
+                  <View style={styles.desktopMainCol}>
+                    {heroTrip ? (
+                      <ActiveStashHero
+                        trip={heroTrip}
+                        variant="trips"
+                        onPress={() =>
+                          router.push({
+                            pathname: "/(tabs)/trips/[tripId]",
+                            params: { tripId: heroTrip.id },
+                          })
+                        }
+                      />
+                    ) : null}
+                  </View>
+                  <View style={styles.desktopSideCol}>{listSection}</View>
+                </View>
+              ) : null}
+              {archivedSection}
+            </>
           ) : (
             <>
-              {heroTrip ? (
-                <ActiveStashHero
-                  trip={heroTrip}
-                  variant="trips"
-                  onPress={() =>
-                    router.push({
-                      pathname: "/(tabs)/trips/[tripId]",
-                      params: { tripId: heroTrip.id },
-                    })
-                  }
-                />
+              {activeFilteredTrips.length > 0 ? (
+                <>
+                  {heroTrip ? (
+                    <ActiveStashHero
+                      trip={heroTrip}
+                      variant="trips"
+                      onPress={() =>
+                        router.push({
+                          pathname: "/(tabs)/trips/[tripId]",
+                          params: { tripId: heroTrip.id },
+                        })
+                      }
+                    />
+                  ) : null}
+                  <View style={{ height: spacing.md }} />
+                  {listSection}
+                </>
               ) : null}
-              <View style={{ height: spacing.md }} />
-              {listSection}
+              {archivedSection}
             </>
           )}
         </View>
@@ -278,6 +351,21 @@ const styles = StyleSheet.create({
   },
 
   sectionTitle: { ...typography.sectionTitle, marginBottom: spacing.sm },
+
+  // Checkpoint 4B.5B: deliberately compact/subdued - title + chevron
+  // only, no thumbnail/progress - this is a status list distinguishing
+  // itself visually from the rich Active trip cards above, not a second
+  // set of them.
+  archivedRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    borderWidth: 1,
+    borderRadius: radii.md,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+  },
+  archivedRowTitle: { ...typography.body, flex: 1, fontWeight: "700" },
 
   loadingWrap: { paddingTop: 40, alignItems: "center", gap: 10 },
   loadingText: { fontSize: 13, fontWeight: "600" },

@@ -97,6 +97,23 @@ service cloud.firestore {
         return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
       }
 
+      // Checkpoint 4B.5B (approved docs/audits/
+      // TRIP_ARCHIVE_DELETE_SAFETY_PREFLIGHT_2026-09-13.md, as hardened
+      // by its 4B.5A.1 amendment): missing-safe archive-state check.
+      // Direct `resource.data.archivedAt == null` is unsafe for a
+      // legacy Trip that has no archivedAt key at all - Firestore Rules
+      // do not treat a missing map key like a JavaScript `undefined`
+      // read the way a direct field comparison might imply, so every
+      // archive-state check in this match block goes through this one
+      // helper instead. `.get('archivedAt', null)` returns the real
+      // value when present, or the given default (null) when the key is
+      // absent - so both "no archivedAt key at all" (legacy) and
+      // "archivedAt explicitly null" (never archived) correctly read as
+      // active; only a real archivedAt timestamp reads as archived.
+      function tripIsActive() {
+        return resource.data.get('archivedAt', null) == null;
+      }
+
       // Create requires: ownerId, memberIds includes owner, title string,
       // target number, saved number, imageUrl string, tripStartDate a
       // valid canonical date. location/tripEndDate may be string or null.
@@ -181,7 +198,16 @@ service cloud.firestore {
       // neither key present, so both checks short-circuit via
       // !keys().hasAny(...) and an unrelated field-only update, like a
       // title rename, is unaffected either way).
-      allow update: if (isTripMember() || isTripOwner())
+      // Checkpoint 4B.5B: tripIsActive() is now a hard prerequisite for
+      // this ENTIRE ordinary update path - once a Trip is archived, this
+      // clause can never succeed for any field, which is exactly the
+      // "no metadata/member editing once archived" freeze the approved
+      // preflight requires (§5.E/§5.F/§11), enforced with one guard
+      // rather than per-field special-casing. This does not widen any
+      // pre-existing permission - it only narrows when the already-
+      // existing rule below may apply.
+      allow update: if tripIsActive()
+        && (isTripMember() || isTripOwner())
         && request.resource.data.ownerId == resource.data.ownerId
         && (resource.data.ownerId in request.resource.data.memberIds)
         && request.resource.data.title is string
@@ -213,8 +239,43 @@ service cloud.firestore {
                 .hasOnly(['title', 'location', 'imageUrl', 'lastUpdatedAt', 'lastUpdatedBy'])
         );
 
-      // Delete: only owner
-      allow delete: if isTripOwner();
+      // Checkpoint 4B.5B: the one-directional archive transition -
+      // owner-only, and a completely separate `allow update` clause
+      // (Firestore Rules OR's multiple `allow update` statements for the
+      // same match together) rather than folded into the giant
+      // expression above, so this narrow, security-critical branch stays
+      // easy to read and audit on its own.
+      //   - Owner-only, matching every other owner-gated Trip mutation.
+      //   - tripIsActive() means this can only ever fire ONCE per Trip -
+      //     an already-archived Trip can never archive again, and (since
+      //     this is the ONLY clause that can touch archivedAt/archivedBy
+      //     at all) can never have that metadata changed or removed
+      //     either. There is no unarchive transition anywhere in this
+      //     match block.
+      //   - affectedKeys().hasOnly(['archivedAt', 'archivedBy']) means
+      //     this transition can NEVER be combined with any other field
+      //     change in the same write - archiving never smuggles in a
+      //     title/date/membership edit alongside it.
+      //   - archivedAt must equal request.time (the standard Rules idiom
+      //     for a serverTimestamp() write) - a client can never backdate
+      //     or forward-date its own archive.
+      //   - archivedBy must equal the authenticated caller - never
+      //     forgeable to name someone else.
+      allow update: if isTripOwner()
+        && tripIsActive()
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['archivedAt', 'archivedBy'])
+        && request.resource.data.archivedAt == request.time
+        && request.resource.data.archivedBy == request.auth.uid;
+
+      // Checkpoint 4B.5B: a Trip is never client-hard-deletable (approved
+      // preflight §6) - "Delete Trip" is archiving instead (above).
+      // Archiving already satisfies the real product need without ever
+      // destroying data; see the preflight for why a conditional
+      // "delete only if no financial history" rule was rejected as
+      // fragile (every current AND future financial-child-record type
+      // would need checking, forever).
+      allow delete: if false;
     }
 
     // ---------------------------------------

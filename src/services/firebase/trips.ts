@@ -6,7 +6,6 @@
 import {
   addDoc,
   collection,
-  deleteDoc,
   doc,
   getDoc,
   getDocs,
@@ -51,6 +50,16 @@ function mapTripDocument(id: string, data: DocumentData): Trip {
     // optional/undefined here rather than defaulted.
     tripStartDate: data.tripStartDate as string | null | undefined,
     tripEndDate: data.tripEndDate as string | null | undefined,
+    // Checkpoint 4B.5B: no fabricated default - a legacy document with
+    // no archivedAt/archivedBy key maps to undefined for each, exactly
+    // matching every other optional field this mapper already handles.
+    // This is the ONE place a raw Firestore document becomes a Trip
+    // object for fetchMemberTripsOrdered/fetchMemberTrips/fetchTripById -
+    // without mapping these two fields here, nothing built on top of
+    // them (active/archived partitioning, the archived Trip Detail
+    // state) would ever see real persisted data.
+    archivedAt: data.archivedAt as PersistedTimestamp | null | undefined,
+    archivedBy: data.archivedBy as string | null | undefined,
   };
 }
 
@@ -103,8 +112,21 @@ export async function fetchTripById(tripId: string): Promise<Trip | null> {
   return mapTripDocument(snap.id, snap.data() as DocumentData);
 }
 
-export async function deleteTrip(tripId: string): Promise<void> {
-  await deleteDoc(doc(db, "trips", tripId));
+// Checkpoint 4B.5B: replaces the removed deleteTrip - per the approved
+// archive-delete-safety preflight, a Trip is never client-hard-deletable
+// (firestore.rules' `allow delete` is now unconditionally `false`).
+// "Delete Trip" is archiving instead: a one-way, owner-only field update.
+// A direct client write (not a Cloud Function - archive metadata is
+// non-financial and fully expressible/enforceable by Firestore Rules
+// alone, the same reasoning already applied to updateTripDates below).
+// There is no corresponding "unarchive" - the Rules design makes that
+// transition structurally impossible until a future checkpoint
+// deliberately adds it.
+export async function archiveTrip(tripId: string, uid: string): Promise<void> {
+  await updateDoc(doc(db, "trips", tripId), {
+    archivedAt: serverTimestamp(),
+    archivedBy: uid,
+  });
 }
 
 // Checkpoint 3F.3B.3: owner-only trip-date edit. Direct client write

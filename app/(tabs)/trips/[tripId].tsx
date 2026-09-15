@@ -22,7 +22,7 @@ import { BAR_HEIGHT, CENTER_BUTTON_SIZE } from "../../../components/navigation/B
 import { cardShadowFor, radii, spacing, typography, type SemanticColors } from "../../../src/theme/tokens";
 import { useSemanticColors } from "../../../src/theme/useSemanticColors";
 import { useAuth } from "../../../src/contexts/AuthContext";
-import { deleteTrip, fetchTripById, updateTripDates } from "../../../src/services/firebase/trips";
+import { archiveTrip, fetchTripById, updateTripDates } from "../../../src/services/firebase/trips";
 import {
   createBucket,
   fetchBucketById,
@@ -152,23 +152,26 @@ export default function TripDetails() {
     Alert.alert(title, message);
   }, []);
 
-  const confirmDelete = useCallback((onConfirm: () => void) => {
+  // Checkpoint 4B.5B: replaces the old destructive delete-confirmation
+  // copy per the approved archive-delete-safety preflight - archiving is
+  // one-way but never destroys data (Shared Stash/My Stash/history all
+  // remain intact and reachable), so the copy is deliberately truthful
+  // about what actually happens instead of implying data loss.
+  const confirmArchive = useCallback((onConfirm: () => void) => {
+    const title = "Archive trip?";
+    const body =
+      "Archive this trip and stop new shared contributions? You can still withdraw remaining Shared Stash funds and access My Stash.";
+
     if (Platform.OS === "web" && typeof window !== "undefined") {
-      const ok = window.confirm(
-        "Delete trip?\n\nThis will permanently delete this trip. This cannot be undone."
-      );
+      const ok = window.confirm(`${title}\n\n${body}`);
       if (ok) onConfirm();
       return;
     }
 
-    Alert.alert(
-      "Delete trip?",
-      "This will permanently delete this trip. This cannot be undone.",
-      [
-        { text: "Cancel", style: "cancel" },
-        { text: "Delete", style: "destructive", onPress: onConfirm },
-      ]
-    );
+    Alert.alert(title, body, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Archive", style: "default", onPress: onConfirm },
+    ]);
   }, []);
 
   const fetchTrip = useCallback(async () => {
@@ -190,19 +193,24 @@ export default function TripDetails() {
   }, [fetchTrip]);
 
   const isOwner = !!user?.uid && !!trip?.ownerId && user.uid === trip.ownerId;
+  // Checkpoint 4B.5B: archivedAt's own presence IS the archive status -
+  // no separate status field exists (see src/types/domain/trip.ts). A
+  // legacy Trip with no archivedAt key maps to undefined here, which is
+  // correctly falsy - legacy Trips are always active.
+  const isArchived = !!trip?.archivedAt;
 
-  const onDeleteTrip = useCallback(() => {
-    if (!tripId || !trip) return;
+  const onArchiveTrip = useCallback(() => {
+    if (!tripId || !trip || !user) return;
 
-    confirmDelete(async () => {
+    confirmArchive(async () => {
       try {
         setLoading(true);
-        await deleteTrip(tripId);
+        await archiveTrip(tripId, user.uid);
         router.replace("/(tabs)/trips");
       } catch (e: any) {
-        console.log("delete trip error:", e);
+        console.log("archive trip error:", e);
         notify(
-          "Couldn’t delete trip",
+          "Couldn’t archive trip",
           e?.message ||
             "You may not have permission, or there was a network error."
         );
@@ -210,7 +218,7 @@ export default function TripDetails() {
         setLoading(false);
       }
     });
-  }, [tripId, trip, confirmDelete, router, notify]);
+  }, [tripId, trip, user, confirmArchive, router, notify]);
 
   const startEditDates = useCallback(() => {
     if (!isOwner || !trip) return;
@@ -844,15 +852,21 @@ export default function TripDetails() {
                     service, Cloud Function, or Firestore rules today -
                     restoring this button requires that foundation
                     first, not a placeholder here. */}
-                {isOwner ? (
+                {/* Checkpoint 4B.5B: "Delete trip" replaced with "Archive
+                    trip" per the approved archive-delete-safety
+                    preflight - a Trip is never client-hard-deletable
+                    (firestore.rules denies it unconditionally). Hidden
+                    once already archived - there is no unarchive, so the
+                    action has nothing left to do. */}
+                {isOwner && !isArchived ? (
                   <Pressable
-                    onPress={onDeleteTrip}
+                    onPress={onArchiveTrip}
                     accessibilityRole="button"
-                    accessibilityLabel="Delete trip"
+                    accessibilityLabel="Archive trip"
                     style={({ pressed }) => [styles.iconOnlyPill, pressed && { opacity: 0.85 }]}
                     hitSlop={10}
                   >
-                    <MaterialCommunityIcons name="trash-can-outline" size={16} color="#FF8A85" />
+                    <MaterialCommunityIcons name="archive-outline" size={16} color="#FFFFFF" />
                   </Pressable>
                 ) : null}
               </View>
@@ -869,8 +883,13 @@ export default function TripDetails() {
                 {/* Checkpoint 3F.3B.3: owner-only tap-to-edit; a
                     non-owner member sees the identical text but it's
                     plain (read-only), matching "Owner may update dates;
-                    Member may NOT". */}
-                {isOwner ? (
+                    Member may NOT". Checkpoint 4B.5B: also plain/
+                    read-only once archived, for anyone - the Rules'
+                    ordinary-update path is frozen for an archived Trip
+                    (no metadata/date editing), so presenting a tap-to-
+                    edit affordance that would just fail server-side
+                    would be a confusing dead end. */}
+                {isOwner && !isArchived ? (
                   <Pressable
                     onPress={startEditDates}
                     accessibilityRole="button"
@@ -891,6 +910,17 @@ export default function TripDetails() {
                     </Text>
                   </View>
                 )}
+                {/* Checkpoint 4B.5B: a visible but restrained archived
+                    indicator (approved preflight §5/§6) - same fixed
+                    dark-on-photo pill treatment as the other hero
+                    badges, since it must stay legible over any photo
+                    regardless of theme. */}
+                {isArchived ? (
+                  <View style={styles.archivedBadge}>
+                    <MaterialCommunityIcons name="archive-outline" size={11} color="#FFFFFF" />
+                    <Text style={styles.archivedBadgeText}>Archived</Text>
+                  </View>
+                ) : null}
               </View>
 
               <View style={styles.fundedPill}>
@@ -1037,25 +1067,44 @@ export default function TripDetails() {
                   path Buckets already use. */}
               {!sharedAction.visible ? (
                 <View style={styles.actionsRow}>
-                  <Pressable
-                    onPress={() => openSharedAction("contribution")}
-                    style={({ pressed }) => [
-                      styles.primaryActionBtn,
-                      { backgroundColor: colors.mint },
-                      pressed && { opacity: 0.9 },
-                    ]}
-                  >
-                    <Text style={[styles.primaryActionText, { color: colors.onMint }]}>Add Money</Text>
-                  </Pressable>
+                  {/* Checkpoint 4B.5B: wind-down model, not a blanket
+                      freeze (approved preflight §5.C) - a new shared
+                      contribution is closed once archived, but a
+                      withdrawal stays available so a nonzero remaining
+                      balance can still be brought back down to zero.
+                      This is a UI-only guard for 4B.5B; the trusted
+                      backend enforcement of the same rule is Checkpoint
+                      4B.5C's separate, not-yet-shipped scope. */}
+                  {!isArchived ? (
+                    <Pressable
+                      onPress={() => openSharedAction("contribution")}
+                      style={({ pressed }) => [
+                        styles.primaryActionBtn,
+                        { backgroundColor: colors.mint },
+                        pressed && { opacity: 0.9 },
+                      ]}
+                    >
+                      <Text style={[styles.primaryActionText, { color: colors.onMint }]}>Add Money</Text>
+                    </Pressable>
+                  ) : null}
                   <Pressable
                     onPress={() => openSharedAction("withdrawal")}
                     style={({ pressed }) => [
-                      styles.secondaryActionBtn,
-                      { borderColor: colors.border },
+                      isArchived ? styles.primaryActionBtn : styles.secondaryActionBtn,
+                      isArchived
+                        ? { backgroundColor: colors.mint }
+                        : { borderColor: colors.border },
                       pressed && { opacity: 0.9 },
                     ]}
                   >
-                    <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Withdraw</Text>
+                    <Text
+                      style={[
+                        isArchived ? styles.primaryActionText : styles.secondaryActionText,
+                        { color: isArchived ? colors.onMint : colors.textPrimary },
+                      ]}
+                    >
+                      Withdraw
+                    </Text>
                   </Pressable>
                 </View>
               ) : (
@@ -1261,7 +1310,7 @@ export default function TripDetails() {
                       live from myStash's own real-time subscription -
                       no new listener, nothing persisted. */}
                   {personalGuidance ? (
-                    <PersonalPaceSection guidance={personalGuidance} colors={colors} />
+                    <PersonalPaceSection guidance={personalGuidance} archived={isArchived} colors={colors} />
                   ) : null}
 
                   {/* My Stash IS an ordinary Bucket - reuses the exact
@@ -1348,6 +1397,7 @@ export default function TripDetails() {
               <TripTimelineSection
                 guidance={sharedGuidance}
                 tripStartDate={trip.tripStartDate}
+                archived={isArchived}
                 colors={colors}
               />
             </View>
@@ -1415,12 +1465,35 @@ function MetricBlock({
 function TripTimelineSection({
   guidance,
   tripStartDate,
+  archived,
   colors,
 }: {
   guidance: TripSavingsGuidance;
   tripStartDate: string | null | undefined;
+  archived: boolean;
   colors: SemanticColors;
 }) {
+  // Checkpoint 4B.5B: an archived Trip never shows forward-looking
+  // savings-pace guidance (approved preflight §5/§8) - that language
+  // assumes the trip is still being actively saved toward, which is no
+  // longer true once archived (and is often exactly why it was
+  // archived). Checked FIRST, ahead of every other guidance state -
+  // archived trumps ACTIVE/GOAL_REACHED/etc. equally, since none of
+  // those distinctions matter once the trip has wound down.
+  if (archived) {
+    return (
+      <>
+        <Text style={[styles.guidanceHeadline, { color: colors.textPrimary }]}>
+          Trip archived
+        </Text>
+        <Text style={[styles.guidanceSub, { color: colors.textMuted }]}>
+          New shared contributions are closed. Remaining Shared Stash funds
+          can still be withdrawn.
+        </Text>
+      </>
+    );
+  }
+
   // Checkpoint 3F.3D.1: checked ahead of MISSING_DATE/TRIP_STARTED to
   // match computeTripSavingsGuidance's own precedence - a target that
   // was never usable is unrelated to whether the trip has a date.
@@ -1510,11 +1583,30 @@ function TripTimelineSection({
 // would just be a confusing duplicate of the same figure).
 function PersonalPaceSection({
   guidance,
+  archived,
   colors,
 }: {
   guidance: TripSavingsGuidance;
+  archived: boolean;
   colors: SemanticColors;
 }) {
+  // Checkpoint 4B.5B: matches TripTimelineSection's identical archived
+  // short-circuit (approved preflight §8) - My Stash keeps its Add
+  // Money/Withdraw controls fully operational when archived (unaffected
+  // by the Trip's lifecycle, per §5.D), but the forward-looking pace
+  // copy is still replaced with a neutral state, since "save $X/week"
+  // is no less misleading here than in the Shared section.
+  if (archived) {
+    return (
+      <View style={styles.personalPaceWrap}>
+        <Text style={[styles.paceValue, { color: colors.textPrimary }]}>Trip archived</Text>
+        <Text style={[styles.guidanceSub, { color: colors.textSecondary }]}>
+          My Stash remains fully available.
+        </Text>
+      </View>
+    );
+  }
+
   if (guidance.status === "INVALID_TARGET") {
     return (
       <Text style={[styles.guidanceMuted, { color: colors.textSecondary }]}>
@@ -1643,6 +1735,23 @@ const styles = StyleSheet.create({
   heroDateRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 4 },
   heroDate: { color: "rgba(255,255,255,0.78)", fontSize: 11, fontWeight: "600" },
   heroDateEditable: { textDecorationLine: "underline" },
+
+  // Checkpoint 4B.5B: same fixed dark-on-photo treatment as navPill -
+  // deliberately restrained (small, muted icon + label), not an alarming
+  // color, since archiving is a safe, non-destructive, reversible-in-
+  // spirit-if-not-in-Rules-yet action, not a warning.
+  archivedBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    alignSelf: "flex-start",
+    marginTop: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 3,
+    borderRadius: radii.pill,
+    backgroundColor: "rgba(9,14,26,0.55)",
+  },
+  archivedBadgeText: { color: "#FFFFFF", fontSize: 10, fontWeight: "800" },
 
   fundedPill: {
     position: "absolute",

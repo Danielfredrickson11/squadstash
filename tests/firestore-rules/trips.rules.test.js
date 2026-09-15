@@ -2,7 +2,7 @@
 // run against the local Firestore emulator using the real firestore.rules
 // file (never weakened to make a test pass - see helpers/trips.js).
 const { assertFails, assertSucceeds } = require('@firebase/rules-unit-testing');
-const { deleteField } = require('firebase/firestore');
+const { deleteField, serverTimestamp, Timestamp } = require('firebase/firestore');
 const { createTestEnv } = require('./helpers/testEnv');
 const {
   OWNER_UID,
@@ -633,13 +633,21 @@ describe('firestore.rules: trips - outsider and unauthenticated updates', () => 
   });
 });
 
-describe('firestore.rules: trips - deletes', () => {
+// Checkpoint 4B.5B: hard-delete is now permanently closed for every actor,
+// including the former owner-can-delete permission this block used to
+// assert - per the approved archive-delete-safety preflight, "Delete
+// Trip" is archiving instead (see the new archive-lifecycle describe
+// block below). This block keeps its original name/shape (all four
+// actors, one `.delete()` each) so the "nobody can hard-delete, not even
+// the owner" regression stays a single obvious diff from the pre-4B.5B
+// version rather than a rewrite.
+describe('firestore.rules: trips - deletes (hard delete permanently closed)', () => {
   beforeEach(async () => {
     await seedTrip(testEnv, TRIP_ID, validTripData());
   });
 
-  it('owner: can delete the trip', async () => {
-    await assertSucceeds(tripDoc(asOwner(), TRIP_ID).delete());
+  it('owner: can no longer hard-delete the trip', async () => {
+    await assertFails(tripDoc(asOwner(), TRIP_ID).delete());
   });
 
   it('non-owner member: cannot delete the trip', async () => {
@@ -652,5 +660,129 @@ describe('firestore.rules: trips - deletes', () => {
 
   it('unauthenticated user: cannot delete the trip', async () => {
     await assertFails(tripDoc(asUnauthenticated(), TRIP_ID).delete());
+  });
+});
+
+// Checkpoint 4B.5B: the archive transition itself, per the approved
+// docs/audits/TRIP_ARCHIVE_DELETE_SAFETY_PREFLIGHT_2026-09-13.md (as
+// hardened by its 4B.5A.1 amendment) and firestore.rules'
+// tripIsActive()/archive-transition `allow update` clause.
+describe('firestore.rules: trips - archive lifecycle', () => {
+  beforeEach(async () => {
+    await seedTrip(testEnv, TRIP_ID, validTripData());
+  });
+
+  function validArchiveUpdate(overrides = {}) {
+    return {
+      archivedAt: serverTimestamp(),
+      archivedBy: OWNER_UID,
+      ...overrides,
+    };
+  }
+
+  it('owner: can archive an active trip', async () => {
+    await assertSucceeds(tripDoc(asOwner(), TRIP_ID).update(validArchiveUpdate()));
+  });
+
+  it('non-owner member: cannot archive the trip', async () => {
+    await assertFails(
+      tripDoc(asMember(), TRIP_ID).update(validArchiveUpdate({ archivedBy: MEMBER_UID }))
+    );
+  });
+
+  it('outsider: cannot archive the trip', async () => {
+    await assertFails(
+      tripDoc(asOutsider(), TRIP_ID).update(validArchiveUpdate({ archivedBy: OUTSIDER_UID }))
+    );
+  });
+
+  it('unauthenticated user: cannot archive the trip', async () => {
+    await assertFails(tripDoc(asUnauthenticated(), TRIP_ID).update(validArchiveUpdate()));
+  });
+
+  it('owner: cannot forge archivedBy as someone else', async () => {
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update(validArchiveUpdate({ archivedBy: MEMBER_UID }))
+    );
+  });
+
+  it('owner: cannot set an arbitrary archivedAt timestamp instead of the server time', async () => {
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update(
+        validArchiveUpdate({ archivedAt: Timestamp.fromDate(new Date('2020-01-01')) })
+      )
+    );
+  });
+
+  it('owner: archiving cannot be combined with any other field change in the same write', async () => {
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update(validArchiveUpdate({ title: 'Sneaky rename' }))
+    );
+  });
+
+  describe('once already archived', () => {
+    beforeEach(async () => {
+      await seedTrip(
+        testEnv,
+        TRIP_ID,
+        validTripData({ archivedAt: Timestamp.now(), archivedBy: OWNER_UID })
+      );
+    });
+
+    it('owner: cannot archive an already-archived trip again', async () => {
+      await assertFails(tripDoc(asOwner(), TRIP_ID).update(validArchiveUpdate()));
+    });
+
+    it('owner: cannot remove archivedAt once archived', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ archivedAt: deleteField() })
+      );
+    });
+
+    it('owner: cannot change archivedBy once archived', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ archivedBy: MEMBER_UID })
+      );
+    });
+
+    it('owner: cannot update title on an archived trip', async () => {
+      await assertFails(tripDoc(asOwner(), TRIP_ID).update({ title: 'Renamed' }));
+    });
+
+    it('owner: cannot update trip dates on an archived trip', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ tripStartDate: '2028-01-01' })
+      );
+    });
+
+    it('owner: cannot update memberIds on an archived trip', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ memberIds: [OWNER_UID, MEMBER_UID, OUTSIDER_UID] })
+      );
+    });
+
+    it('non-owner member: cannot update an archived trip either', async () => {
+      await assertFails(tripDoc(asMember(), TRIP_ID).update({ location: 'New Place' }));
+    });
+  });
+
+  describe('legacy trip with no archivedAt key at all', () => {
+    beforeEach(async () => {
+      // withoutLocation-style: seedTrip/validTripData already omit
+      // archivedAt/archivedBy entirely by default (validTripData has no
+      // such keys) - this describe block exists just to make that
+      // legacy-document assumption explicit and independently verified,
+      // matching the missing-safe tripIsActive() `.get('archivedAt', null)`
+      // check in firestore.rules.
+      await seedTrip(testEnv, TRIP_ID, validTripData());
+    });
+
+    it('a legacy trip with no archivedAt key can still be updated normally', async () => {
+      await assertSucceeds(tripDoc(asOwner(), TRIP_ID).update({ title: 'Still active' }));
+    });
+
+    it('a legacy trip with no archivedAt key can be archived', async () => {
+      await assertSucceeds(tripDoc(asOwner(), TRIP_ID).update(validArchiveUpdate()));
+    });
   });
 });
