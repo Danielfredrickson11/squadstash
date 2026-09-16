@@ -4,6 +4,7 @@ import {
     ActivityIndicator,
     Alert,
     Image,
+    Modal,
     Platform,
     Pressable,
     SafeAreaView,
@@ -152,28 +153,6 @@ export default function TripDetails() {
     Alert.alert(title, message);
   }, []);
 
-  // Checkpoint 4B.5B: replaces the old destructive delete-confirmation
-  // copy per the approved archive-delete-safety preflight - archiving is
-  // one-way but never destroys data (Shared Stash/My Stash/history all
-  // remain intact and reachable), so the copy is deliberately truthful
-  // about what actually happens instead of implying data loss.
-  const confirmArchive = useCallback((onConfirm: () => void) => {
-    const title = "Archive trip?";
-    const body =
-      "Archive this trip and stop new shared contributions? You can still withdraw remaining Shared Stash funds and access My Stash.";
-
-    if (Platform.OS === "web" && typeof window !== "undefined") {
-      const ok = window.confirm(`${title}\n\n${body}`);
-      if (ok) onConfirm();
-      return;
-    }
-
-    Alert.alert(title, body, [
-      { text: "Cancel", style: "cancel" },
-      { text: "Archive", style: "default", onPress: onConfirm },
-    ]);
-  }, []);
-
   const fetchTrip = useCallback(async () => {
     if (!tripId) return;
     setLoading(true);
@@ -199,26 +178,61 @@ export default function TripDetails() {
   // correctly falsy - legacy Trips are always active.
   const isArchived = !!trip?.archivedAt;
 
+  // Checkpoint 4B.5B.1: replaces window.confirm/Alert.alert with an
+  // in-app confirmation dialog (ArchiveConfirmDialog below) - the browser-
+  // native "localhost:8081 says" prompt those produced on web was
+  // functionally correct but visually inconsistent with the rest of the
+  // app's surfaces. Business behavior is unchanged: the same
+  // archiveTrip(tripId, user.uid) call, the same success navigation, the
+  // same error notify() path - only the confirmation UI itself changed.
+  const [archiveDialogVisible, setArchiveDialogVisible] = useState(false);
+  const [archiving, setArchiving] = useState(false);
+  // Synchronous serialization guard, mirroring useSavingsMoneyAction's
+  // inFlightRef pattern: a ref (not state) checked/set before any await,
+  // so a double-tap on "Archive" can't race a second archiveTrip call
+  // past this check before React re-renders. `archiving` state remains
+  // solely responsible for the visible loading/disabled UI.
+  const archivingRef = useRef(false);
+
   const onArchiveTrip = useCallback(() => {
     if (!tripId || !trip || !user) return;
+    setArchiveDialogVisible(true);
+  }, [tripId, trip, user]);
 
-    confirmArchive(async () => {
-      try {
-        setLoading(true);
-        await archiveTrip(tripId, user.uid);
-        router.replace("/(tabs)/trips");
-      } catch (e: any) {
-        console.log("archive trip error:", e);
-        notify(
-          "Couldn’t archive trip",
-          e?.message ||
-            "You may not have permission, or there was a network error."
-        );
-      } finally {
-        setLoading(false);
-      }
-    });
-  }, [tripId, trip, user, confirmArchive, router, notify]);
+  const closeArchiveDialog = useCallback(() => {
+    if (archivingRef.current) return;
+    setArchiveDialogVisible(false);
+  }, []);
+
+  // Checkpoint 4B.5B.1A: deliberately does NOT touch the page-level
+  // `loading` state - setLoading(true) here would trip TripDetails' own
+  // `if (loading) return ...` branch and unmount the entire screen
+  // (dialog included) the instant Archive is pressed, defeating the
+  // dialog's own pending UI (disabled Cancel/Archive, in-button spinner)
+  // before it could ever be seen. `archiving`/`archivingRef` are now the
+  // sole pending-state signal for this mutation; `loading` remains
+  // reserved for the initial Trip fetch only (see fetchTrip above).
+  const confirmArchiveTrip = useCallback(async () => {
+    if (!tripId || !trip || !user || archivingRef.current) return;
+    archivingRef.current = true;
+    setArchiving(true);
+    try {
+      await archiveTrip(tripId, user.uid);
+      setArchiveDialogVisible(false);
+      router.replace("/(tabs)/trips");
+    } catch (e: any) {
+      console.log("archive trip error:", e);
+      setArchiveDialogVisible(false);
+      notify(
+        "Couldn’t archive trip",
+        e?.message ||
+          "You may not have permission, or there was a network error."
+      );
+    } finally {
+      archivingRef.current = false;
+      setArchiving(false);
+    }
+  }, [tripId, trip, user, router, notify]);
 
   const startEditDates = useCallback(() => {
     if (!isOwner || !trip) return;
@@ -791,6 +805,7 @@ export default function TripDetails() {
   }
 
   return (
+    <>
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.colors.background }]}>
       <ScrollView
         contentContainerStyle={[styles.page, { paddingBottom: scrollBottomInset }]}
@@ -1405,6 +1420,88 @@ export default function TripDetails() {
         </View>
       </ScrollView>
     </SafeAreaView>
+    <ArchiveConfirmDialog
+      visible={archiveDialogVisible}
+      archiving={archiving}
+      onCancel={closeArchiveDialog}
+      onConfirm={confirmArchiveTrip}
+      colors={colors}
+    />
+    </>
+  );
+}
+
+// Checkpoint 4B.5B.1: in-app replacement for the old window.confirm/
+// Alert.alert archive confirmation. Same RN `Modal` (transparent, fade)
+// + backdrop-Pressable-sibling + card shell already established by
+// components/buckets/MoneyActionSheet.tsx - the only difference is a
+// centered card instead of a bottom sheet, since a short confirm dialog
+// reads better centered than pinned to the bottom edge. No new
+// dependency: react-native-paper is already provided at the app root
+// (app/_layout.tsx's PaperProvider), and plain RN Modal is already the
+// established primitive for this kind of overlay in this codebase.
+// Purely presentational - all archive state/submission logic stays in
+// the parent (onArchiveTrip/closeArchiveDialog/confirmArchiveTrip above).
+function ArchiveConfirmDialog({
+  visible,
+  archiving,
+  onCancel,
+  onConfirm,
+  colors,
+}: {
+  visible: boolean;
+  archiving: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+  colors: SemanticColors;
+}) {
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>
+      <View style={styles.archiveDialogRoot}>
+        <Pressable
+          style={styles.archiveDialogBackdrop}
+          onPress={onCancel}
+          accessibilityRole="button"
+          accessibilityLabel="Close"
+        />
+        <View style={[styles.archiveDialogCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+          <Text style={[styles.archiveDialogTitle, { color: colors.textPrimary }]}>Archive trip?</Text>
+          <Text style={[styles.archiveDialogBody, { color: colors.textMuted }]}>
+            Archive this trip and stop new shared contributions? You can still withdraw remaining Shared Stash funds and access My Stash.
+          </Text>
+          <View style={styles.archiveDialogActions}>
+            <Pressable
+              onPress={onCancel}
+              disabled={archiving}
+              accessibilityRole="button"
+              style={[
+                styles.archiveDialogCancelBtn,
+                { borderColor: colors.border },
+                archiving && { opacity: 0.5 },
+              ]}
+            >
+              <Text style={[styles.archiveDialogCancelText, { color: colors.textPrimary }]}>Cancel</Text>
+            </Pressable>
+            <Pressable
+              onPress={onConfirm}
+              disabled={archiving}
+              accessibilityRole="button"
+              style={[
+                styles.archiveDialogConfirmBtn,
+                { backgroundColor: colors.mint },
+                archiving && { opacity: 0.7 },
+              ]}
+            >
+              {archiving ? (
+                <ActivityIndicator size="small" color={colors.onMint} />
+              ) : (
+                <Text style={[styles.archiveDialogConfirmText, { color: colors.onMint }]}>Archive</Text>
+              )}
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
   );
 }
 
@@ -1752,6 +1849,53 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(9,14,26,0.55)",
   },
   archivedBadgeText: { color: "#FFFFFF", fontSize: 10, fontWeight: "800" },
+
+  // Checkpoint 4B.5B.1: centered confirm-dialog shell - same
+  // backdrop-as-sibling pattern as MoneyActionSheet.tsx (see that file's
+  // module comment for why the backdrop must be a sibling, not a parent,
+  // of the interactive card), but centered rather than pinned to the
+  // bottom edge, matching a short confirm dialog rather than a form sheet.
+  archiveDialogRoot: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: spacing.lg,
+  },
+  archiveDialogBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(9,14,26,0.55)",
+  },
+  archiveDialogCard: {
+    width: "100%",
+    maxWidth: 360,
+    borderRadius: radii.xl,
+    borderWidth: 1,
+    padding: spacing.lg,
+  },
+  archiveDialogTitle: { ...typography.sectionTitle, fontSize: 18, marginBottom: spacing.sm },
+  archiveDialogBody: { fontSize: 14, lineHeight: 20 },
+  archiveDialogActions: {
+    flexDirection: "row",
+    gap: spacing.sm,
+    marginTop: spacing.lg,
+  },
+  archiveDialogCancelBtn: {
+    flex: 1,
+    height: 46,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  archiveDialogCancelText: { fontSize: 14, fontWeight: "800" },
+  archiveDialogConfirmBtn: {
+    flex: 1,
+    height: 46,
+    borderRadius: radii.md,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  archiveDialogConfirmText: { fontSize: 14, fontWeight: "800" },
 
   fundedPill: {
     position: "absolute",
