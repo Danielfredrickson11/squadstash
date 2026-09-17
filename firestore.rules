@@ -356,6 +356,93 @@ service cloud.firestore {
     }
 
     // ---------------------------------------
+    // TRIP EXPENSES / TRIP EXPENSE SPLITS (Checkpoint 4C.2B, approved
+    // docs/audits/TRIP_OUT_OF_POCKET_EXPENSE_PERSISTENCE_PREFLIGHT_
+    // 2026-09-15.md as hardened by 4C.1A/4C.1B, §13)
+    // ---------------------------------------
+    // The trusted recordTripExpense Cloud Function (Admin SDK, which
+    // bypasses these rules entirely) is the SOLE write path for both
+    // collections below - it atomically derives createdBy, computes and
+    // validates splits, and enforces creator-bound idempotency, none of
+    // which a client-facing rule could ever safely express (see
+    // functions/src/callables/recordTripExpense.ts and the preflight
+    // §6-§9). Client access here is read-only, full stop: no field-level
+    // update exceptions, no creator exception, no owner write exception,
+    // no archived-Trip write exception - mirrors savingsTransactions'
+    // identical append-only, trusted-write-only posture exactly.
+    //
+    // canAccessTripById() is declared here at the OUTER scope (matching
+    // signedIn()'s own placement above), not nested inside either match
+    // block below, because BOTH match /tripExpenses and
+    // match /tripExpenseSplits need to call it - a Firestore Rules
+    // function declared inside one match block is not visible to a
+    // sibling match block. Deliberately does NOT inspect archivedAt -
+    // per the preflight §12/§13, an archived Trip's Expense/Split
+    // history remains fully readable to its current members/owner;
+    // archiving only closes NEW Expense creation, and only through the
+    // trusted callable (Admin SDK, bypasses these Rules) - never this
+    // read-only surface. Authorization is based solely on the Trip's
+    // CURRENT memberIds/ownerId (read fresh via get(), as they stand
+    // right now) - never on createdBy, payerUid, split membership,
+    // historical membership, or clientRequestId. A member later removed
+    // from the Trip loses direct-read access to that Trip's Expense/
+    // Split history immediately, even for an Expense they personally
+    // created - the trusted callable's own idempotent-replay
+    // reconciliation for that same former member is a separate, purely
+    // server-side concern (preflight §5.1) this client-facing read rule
+    // has no bearing on and does not need to accommodate.
+    //
+    // Mirrors savingsTransactions' canAccessParent() in spirit, simplified
+    // since the parent here is always a Trip (Expenses are Trip-only,
+    // audit §1) - no bucket/trip discriminator branch is needed. Uses
+    // direct `.data.memberIds`/`.data.ownerId` access (not a `.get(...,
+    // default)` missing-safe wrapper) to match isTripMember()/isTripOwner()
+    // above exactly: a malformed (non-list) memberIds value makes the
+    // `in` check itself evaluate to an error, which Firestore Rules
+    // treats as `false` for that operand - CEL's `||` still lets the
+    // independent `ownerId == uid` check succeed on its own merits, so an
+    // owner is not accidentally locked out by a corrupted memberIds
+    // field, while a non-owner correctly fails closed (tested explicitly
+    // - see tests/firestore-rules/tripExpenses.rules.test.js).
+    function canAccessTripById(tripId) {
+      return signedIn()
+        && tripId is string
+        && exists(/databases/$(database)/documents/trips/$(tripId))
+        && (
+          request.auth.uid in
+            get(/databases/$(database)/documents/trips/$(tripId)).data.memberIds
+          || get(/databases/$(database)/documents/trips/$(tripId)).data.ownerId
+              == request.auth.uid
+        );
+    }
+
+    match /tripExpenses/{expenseId} {
+      // Document id conveys no authority whatsoever - access follows
+      // ONLY the resource's own tripId field, checked fresh against that
+      // Trip's CURRENT membership/ownership on every read.
+      allow get, list: if resource.data.tripId is string
+        && canAccessTripById(resource.data.tripId);
+
+      // No client create/update/delete, for any role, ever - see the
+      // section header above for why.
+      allow create, update, delete: if false;
+    }
+
+    match /tripExpenseSplits/{splitDocumentId} {
+      // Split documents carry their own denormalized tripId (preflight
+      // §7/§13) - this rule never looks up the parent Expense document at
+      // all, only the parent Trip, exactly as frozen in the preflight.
+      // Never inferred from userId - a current Trip member may read
+      // every split belonging to their Trip's Expenses, not only splits
+      // where they are the named participant (these are shared Trip
+      // financial records, not private-to-the-named-user documents).
+      allow get, list: if resource.data.tripId is string
+        && canAccessTripById(resource.data.tripId);
+
+      allow create, update, delete: if false;
+    }
+
+    // ---------------------------------------
     // USERS
     // ---------------------------------------
     match /users/{uid} {
