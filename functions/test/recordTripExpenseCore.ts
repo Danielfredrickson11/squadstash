@@ -17,7 +17,11 @@ import type { App } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 import type { Firestore } from "firebase-admin/firestore";
 import { HttpsError } from "firebase-functions/v2/https";
-import { recordTripExpenseCore } from "../src/callables/recordTripExpense";
+import type { CallableRequest } from "firebase-functions/v2/https";
+import {
+  recordTripExpenseCore,
+  requireAuthenticatedUid,
+} from "../src/callables/recordTripExpense";
 import { splitDocumentId } from "../src/domain/tripExpenseSplits";
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
@@ -693,5 +697,499 @@ describe("splitDocumentId - collision-safe derivation (Checkpoint 4C.1B)", () =>
     for (let i = 0; i < 5; i++) {
       assert.equal(splitDocumentId("expense-7", "uid-9"), expected);
     }
+  });
+});
+
+// Checkpoint 4C.2C: deep security/concurrency/resource-boundary hardening
+// pass - the final backend checkpoint before deployment consideration for
+// out-of-pocket Expense creation.
+describe("recordTripExpenseCore - same-id concurrency (Checkpoint 4C.2C §3)", () => {
+  it("A. concurrent identical requests from the same creator resolve to the same Expense with no duplicate writes", async () => {
+    await seedTrip();
+    const request = baseEqualRequest();
+
+    const [r1, r2] = await Promise.all([
+      recordTripExpenseCore(db, MEMBER_UID, request),
+      recordTripExpenseCore(db, MEMBER_UID, request),
+    ]);
+
+    assert.equal(r1.expenseId, r2.expenseId);
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+    assert.equal(expensesSnap.docs[0]!.data().createdBy, MEMBER_UID);
+    const splitsSnap = await db.collection("tripExpenseSplits").get();
+    assert.equal(splitsSnap.size, 3);
+  });
+
+  it("B. concurrent same-creator requests with different facts leave exactly one committed Expense; the loser sees already-exists", async () => {
+    await seedTrip();
+    const clientRequestId = randomUUID();
+    const reqA = baseEqualRequest({ clientRequestId, amountMinor: 9000 });
+    const reqB = baseEqualRequest({ clientRequestId, amountMinor: 12000 });
+
+    const results = await Promise.allSettled([
+      recordTripExpenseCore(db, MEMBER_UID, reqA),
+      recordTripExpenseCore(db, MEMBER_UID, reqB),
+    ]);
+
+    const fulfilled = results.filter(
+      (r): r is PromiseFulfilledResult<{ expenseId: string }> =>
+        r.status === "fulfilled"
+    );
+    const rejected = results.filter(
+      (r): r is PromiseRejectedResult => r.status === "rejected"
+    );
+    // Do NOT assume which request wins - only that exactly one does.
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.ok(rejected[0]!.reason instanceof HttpsError);
+    assert.equal((rejected[0]!.reason as HttpsError).code, "already-exists");
+
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+    const winningAmount = expensesSnap.docs[0]!.data().amountMinor;
+    assert.ok(winningAmount === 9000 || winningAmount === 12000);
+
+    // Final Split records must exactly match the winning Expense, never a
+    // mix of both versions.
+    const splitsSnap = await db.collection("tripExpenseSplits").get();
+    assert.equal(splitsSnap.size, 3);
+    const splitTotal = splitsSnap.docs.reduce(
+      (sum, d) => sum + (d.data().amountMinor as number),
+      0
+    );
+    assert.equal(splitTotal, winningAmount);
+  });
+
+  it("C. concurrent identical-fact requests from two DIFFERENT creators leave exactly one canonical Expense; the loser sees already-exists", async () => {
+    await seedTrip();
+    const clientRequestId = randomUUID();
+    const request = baseEqualRequest({ clientRequestId });
+
+    const results = await Promise.allSettled([
+      recordTripExpenseCore(db, MEMBER_UID, request),
+      recordTripExpenseCore(db, OTHER_MEMBER_UID, request),
+    ]);
+
+    const fulfilled = results.filter(
+      (r): r is PromiseFulfilledResult<{ expenseId: string }> =>
+        r.status === "fulfilled"
+    );
+    const rejected = results.filter(
+      (r): r is PromiseRejectedResult => r.status === "rejected"
+    );
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.ok(rejected[0]!.reason instanceof HttpsError);
+    assert.equal((rejected[0]!.reason as HttpsError).code, "already-exists");
+    assert.equal(fulfilled[0]!.value.expenseId, clientRequestId);
+
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+    const winningCreatedBy = expensesSnap.docs[0]!.data().createdBy;
+    assert.ok(
+      winningCreatedBy === MEMBER_UID || winningCreatedBy === OTHER_MEMBER_UID
+    );
+    const splitsSnap = await db.collection("tripExpenseSplits").get();
+    assert.equal(splitsSnap.size, 3);
+  });
+
+  it("D. reusing the same clientRequestId for a DIFFERENT Trip is already-exists, never a second Expense (the id namespace is global by design)", async () => {
+    await seedTrip();
+    const secondTripId = "test-trip-2";
+    await db
+      .collection("trips")
+      .doc(secondTripId)
+      .set({
+        ownerId: OWNER_UID,
+        memberIds: [OWNER_UID, MEMBER_UID],
+        title: "Second Trip",
+        location: "Elsewhere",
+        target: 500,
+        saved: 0,
+        imageUrl: "https://example.com/trip2.jpg",
+        tripStartDate: "2027-07-01",
+      });
+
+    const clientRequestId = randomUUID();
+    await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({ clientRequestId })
+    );
+
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseEqualRequest({ clientRequestId, tripId: secondTripId })
+      ),
+      "already-exists"
+    );
+
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+    assert.equal(expensesSnap.docs[0]!.data().tripId, TRIP_ID);
+  });
+});
+
+// Checkpoint 4C.2C §4: the Trip document is read INSIDE the same
+// transaction that writes the Expense/Splits (recordTripExpenseCore's own
+// db.runTransaction body). Firestore's transaction semantics guarantee
+// that if the Trip document this transaction already read is modified by
+// another COMMITTED write before this transaction itself commits,
+// Firestore aborts and transparently retries the transaction body - which
+// re-reads the Trip fresh and re-evaluates membership/archive state
+// against the NEW data before ever attempting to commit again. This makes
+// a stale-authorization commit structurally impossible: by the time an
+// Expense transaction actually commits, it has necessarily read a Trip
+// state that was still current at commit time, never a state a
+// concurrent write later invalidated out from under it.
+//
+// No production test hook was added to manufacture a deterministic
+// winner (the checkpoint explicitly forbids that) - each test below
+// fires the Expense transaction and the conflicting Trip mutation via
+// Promise.allSettled (both start in the same tick, genuinely
+// concurrently) and asserts the INVARIANT that holds under EITHER
+// acceptable linearization, never a specific winner. This is why these
+// assertions are not flaky despite the real nondeterministic timing:
+// nothing here depends on knowing in advance which operation "wins".
+describe("recordTripExpenseCore - Trip-state concurrency (Checkpoint 4C.2C §4)", () => {
+  it("archive race: an Expense either commits while the Trip was still active, or is rejected failed-precondition - never a stale-active commit", async () => {
+    await seedTrip();
+    const request = baseEqualRequest();
+
+    const [expenseResult, archiveResult] = await Promise.allSettled([
+      recordTripExpenseCore(db, MEMBER_UID, request),
+      db
+        .collection("trips")
+        .doc(TRIP_ID)
+        .update({ archivedAt: new Date(), archivedBy: OWNER_UID }),
+    ]);
+
+    // The archive update itself is an unconditional Admin SDK write - it
+    // always succeeds regardless of how the race resolves.
+    assert.equal(archiveResult.status, "fulfilled");
+
+    if (expenseResult.status === "fulfilled") {
+      const snap = await db
+        .collection("tripExpenses")
+        .doc(expenseResult.value.expenseId)
+        .get();
+      assert.equal(snap.exists, true);
+      assert.equal(snap.data()!.status, "active");
+    } else {
+      assert.ok(expenseResult.reason instanceof HttpsError);
+      assert.equal(
+        (expenseResult.reason as HttpsError).code,
+        "failed-precondition"
+      );
+      const expensesSnap = await db.collection("tripExpenses").get();
+      assert.equal(expensesSnap.size, 0);
+    }
+
+    const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.ok(tripSnap.data()!.archivedAt);
+  });
+
+  it("creator-membership-removal race: an Expense either commits while the creator was still a member, or is rejected permission-denied", async () => {
+    await seedTrip();
+    const request = baseEqualRequest();
+
+    const [expenseResult] = await Promise.allSettled([
+      recordTripExpenseCore(db, MEMBER_UID, request),
+      db
+        .collection("trips")
+        .doc(TRIP_ID)
+        .update({ memberIds: [OWNER_UID, OTHER_MEMBER_UID] }),
+    ]);
+
+    if (expenseResult.status === "fulfilled") {
+      const snap = await db
+        .collection("tripExpenses")
+        .doc(expenseResult.value.expenseId)
+        .get();
+      assert.equal(snap.exists, true);
+    } else {
+      assert.ok(expenseResult.reason instanceof HttpsError);
+      assert.equal(
+        (expenseResult.reason as HttpsError).code,
+        "permission-denied"
+      );
+      const expensesSnap = await db.collection("tripExpenses").get();
+      assert.equal(expensesSnap.size, 0);
+    }
+  });
+
+  it("payer-membership-removal race: an Expense either commits with a payer who was still a member, or is rejected failed-precondition", async () => {
+    await seedTrip();
+    const request = baseEqualRequest({ payerUid: OTHER_MEMBER_UID });
+
+    const [expenseResult] = await Promise.allSettled([
+      recordTripExpenseCore(db, MEMBER_UID, request),
+      db
+        .collection("trips")
+        .doc(TRIP_ID)
+        .update({ memberIds: [OWNER_UID, MEMBER_UID] }), // OTHER_MEMBER_UID removed
+    ]);
+
+    if (expenseResult.status === "fulfilled") {
+      const snap = await db
+        .collection("tripExpenses")
+        .doc(expenseResult.value.expenseId)
+        .get();
+      assert.equal(snap.data()!.payerUid, OTHER_MEMBER_UID);
+    } else {
+      assert.ok(expenseResult.reason instanceof HttpsError);
+      assert.equal(
+        (expenseResult.reason as HttpsError).code,
+        "failed-precondition"
+      );
+      const expensesSnap = await db.collection("tripExpenses").get();
+      assert.equal(expensesSnap.size, 0);
+    }
+  });
+
+  it("participant-removal race: an Expense either commits with its original participant set intact, or is rejected failed-precondition with zero Splits written", async () => {
+    await seedTrip();
+    const request = baseEqualRequest();
+
+    const [expenseResult] = await Promise.allSettled([
+      recordTripExpenseCore(db, MEMBER_UID, request),
+      db
+        .collection("trips")
+        .doc(TRIP_ID)
+        .update({ memberIds: [OWNER_UID, MEMBER_UID] }), // OTHER_MEMBER_UID (a participant) removed
+    ]);
+
+    if (expenseResult.status === "fulfilled") {
+      const splitsSnap = await db.collection("tripExpenseSplits").get();
+      assert.equal(splitsSnap.size, 3);
+    } else {
+      assert.ok(expenseResult.reason instanceof HttpsError);
+      assert.equal(
+        (expenseResult.reason as HttpsError).code,
+        "failed-precondition"
+      );
+      const expensesSnap = await db.collection("tripExpenses").get();
+      assert.equal(expensesSnap.size, 0);
+      const splitsSnap = await db.collection("tripExpenseSplits").get();
+      assert.equal(splitsSnap.size, 0);
+    }
+  });
+});
+
+describe("recordTripExpenseCore - authorization-order information-leak hardening (Checkpoint 4C.2C §5)", () => {
+  it("normal Trip + outsider -> permission-denied", async () => {
+    await seedTrip();
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, OUTSIDER_UID, baseEqualRequest()),
+      "permission-denied"
+    );
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 0);
+  });
+
+  it("archived Trip + outsider -> permission-denied, not failed-precondition (archive state not disclosed to an unauthorized caller)", async () => {
+    await seedTrip({ archivedAt: new Date(), archivedBy: OWNER_UID });
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, OUTSIDER_UID, baseEqualRequest()),
+      "permission-denied"
+    );
+  });
+
+  it("malformed (non-list) memberIds + outsider -> permission-denied, not failed-precondition (data-corruption state not disclosed to an unauthorized caller)", async () => {
+    await seedTrip({ memberIds: "not-a-list" });
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, OUTSIDER_UID, baseEqualRequest()),
+      "permission-denied"
+    );
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 0);
+  });
+
+  it("malformed (non-list) memberIds + the Trip's actual owner -> failed-precondition (the owner may learn their own Trip is corrupt)", async () => {
+    await seedTrip({ memberIds: "not-a-list" });
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, OWNER_UID, baseEqualRequest()),
+      "failed-precondition"
+    );
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 0);
+  });
+});
+
+describe('requireAuthenticatedUid - the production auth boundary (Checkpoint 4C.2C §6)', () => {
+  it('throws HttpsError("unauthenticated") when auth is missing', () => {
+    assert.throws(
+      () => requireAuthenticatedUid(undefined),
+      (err: unknown) => {
+        assert.ok(err instanceof HttpsError, "expected an HttpsError");
+        assert.equal((err as HttpsError).code, "unauthenticated");
+        return true;
+      }
+    );
+  });
+
+  it("returns the exact uid when auth is present", () => {
+    const auth = { uid: MEMBER_UID } as CallableRequest["auth"];
+    assert.equal(requireAuthenticatedUid(auth), MEMBER_UID);
+  });
+});
+
+describe("recordTripExpenseCore - participant count bound (Checkpoint 4C.2C §7, MAX_EXPENSE_PARTICIPANTS = 100)", () => {
+  it("exactly 100 participants passes the count bound (fails later for an unrelated, expected reason - never the count itself)", async () => {
+    await seedTrip();
+    const participants = Array.from({ length: 100 }, (_, i) => ({
+      uid: `fake-uid-${i}`,
+    }));
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseEqualRequest({ participants })
+      ),
+      "failed-precondition"
+    );
+  });
+
+  it("101 participants is rejected invalid-argument before ever touching Firestore", async () => {
+    await seedTrip();
+    const participants = Array.from({ length: 101 }, (_, i) => ({
+      uid: `fake-uid-${i}`,
+    }));
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseEqualRequest({ participants })
+      ),
+      "invalid-argument"
+    );
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 0);
+  });
+});
+
+describe("recordTripExpenseCore - tripId Firestore document-id safety (Checkpoint 4C.2C §8)", () => {
+  it("tripId containing \"/\" is invalid-argument, not an uncaught Admin SDK exception", async () => {
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseEqualRequest({ tripId: "a/b" })
+      ),
+      "invalid-argument"
+    );
+  });
+
+  it('tripId === "." is invalid-argument', async () => {
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, MEMBER_UID, baseEqualRequest({ tripId: "." })),
+      "invalid-argument"
+    );
+  });
+
+  it('tripId === ".." is invalid-argument', async () => {
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseEqualRequest({ tripId: ".." })
+      ),
+      "invalid-argument"
+    );
+  });
+
+  it("an oversized tripId (over Firestore's 1500-byte document-id limit) is invalid-argument", async () => {
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseEqualRequest({ tripId: "a".repeat(1501) })
+      ),
+      "invalid-argument"
+    );
+  });
+});
+
+describe("recordTripExpenseCore - idempotency normalization edge cases (Checkpoint 4C.2C §12)", () => {
+  it('paymentSource omitted, then replayed with it explicit "member_out_of_pocket" -> exact replay success', async () => {
+    await seedTrip();
+    const clientRequestId = randomUUID();
+    const first = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({ clientRequestId }) // no paymentSource key at all
+    );
+    const replay = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({
+        clientRequestId,
+        paymentSource: "member_out_of_pocket",
+      })
+    );
+    assert.equal(replay.expenseId, first.expenseId);
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+  });
+
+  it("a description with surrounding whitespace replays as identical to its already-trimmed form", async () => {
+    await seedTrip();
+    const clientRequestId = randomUUID();
+    await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({ clientRequestId, description: "Cabin rental" })
+    );
+    const replay = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({ clientRequestId, description: "  Cabin rental  " })
+    );
+    assert.equal(replay.expenseId, clientRequestId);
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+    assert.equal(expensesSnap.docs[0]!.data().description, "Cabin rental");
+  });
+
+  it("category omitted on both requests -> exact replay success", async () => {
+    await seedTrip();
+    const clientRequestId = randomUUID();
+    const first = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({ clientRequestId })
+    );
+    const replay = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({ clientRequestId })
+    );
+    assert.equal(replay.expenseId, first.expenseId);
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+  });
+
+  it("category changed on replay -> already-exists, original category unchanged", async () => {
+    await seedTrip();
+    const clientRequestId = randomUUID();
+    await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({ clientRequestId, category: "Food" })
+    );
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseEqualRequest({ clientRequestId, category: "Lodging" })
+      ),
+      "already-exists"
+    );
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+    assert.equal(expensesSnap.docs[0]!.data().category, "Food");
   });
 });

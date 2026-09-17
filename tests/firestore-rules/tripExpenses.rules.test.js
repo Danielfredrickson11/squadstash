@@ -470,3 +470,96 @@ describe('firestore.rules: tripExpenses/tripExpenseSplits - security edge cases 
     await assertSucceeds(expenseDoc(asOwner(), EXPENSE_ID).get());
   });
 });
+
+// Checkpoint 4C.2C §10: "Firestore Rules are not filters." A query's own
+// WHERE constraints, not the rule alone, must prove every possible
+// returned document belongs to a Trip the caller is authorized for -
+// Firestore evaluates `list` against each candidate document using the
+// same `allow get, list` predicate, so a query that could return an
+// unauthorized Trip's documents is rejected outright, never silently
+// filtered down to only the authorized subset.
+describe('firestore.rules: tripExpenses/tripExpenseSplits - query isolation (Rules are not filters, §10)', () => {
+  beforeEach(async () => {
+    await seedTrip(testEnv, TRIP_ID, validTripData());
+    // Trip B: MEMBER_UID (Trip A's member) has NO relationship to Trip B
+    // at all - neither a member nor its owner.
+    await seedTrip(
+      testEnv,
+      TRIP_B_ID,
+      validTripData({ ownerId: OWNER_B_UID, memberIds: [OWNER_B_UID, MEMBER_B_UID] })
+    );
+    await seedExpense(EXPENSE_ID, validExpenseData());
+    await seedSplit(SPLIT_ID, validSplitData());
+    // A second Expense/Split pair belonging to Trip B, with payerUid/
+    // userId deliberately naming MEMBER_UID (Trip A's member) even
+    // though MEMBER_UID has no access to Trip B - tests D/I below prove
+    // that naming alone never grants a query result across the Trip
+    // boundary.
+    await seedExpense('expense-b', validExpenseData({ tripId: TRIP_B_ID, payerUid: MEMBER_UID }));
+    await seedSplit('split-b', validSplitData({ tripId: TRIP_B_ID, userId: MEMBER_UID }));
+  });
+
+  it('A. member A: where(tripId == TripA) succeeds and returns only TripA documents', async () => {
+    const snap = await assertSucceeds(
+      expensesCollection(asMember()).where('tripId', '==', TRIP_ID).get()
+    );
+    expect(snap.docs.map((d) => d.id)).toEqual([EXPENSE_ID]);
+  });
+
+  it('B. member A: an unscoped tripExpenses collection query is denied', async () => {
+    await assertFails(expensesCollection(asMember()).get());
+  });
+
+  it("C. member A: where('tripId', 'in', [TripA, TripB]) is denied - the query itself could return TripB's data", async () => {
+    await assertFails(
+      expensesCollection(asMember())
+        .where('tripId', 'in', [TRIP_ID, TRIP_B_ID])
+        .get()
+    );
+  });
+
+  it('D. member A: querying only by payerUid, with no tripId constraint, is denied even though every result happens to name them as payer', async () => {
+    await assertFails(
+      expensesCollection(asMember()).where('payerUid', '==', MEMBER_UID).get()
+    );
+  });
+
+  it('E. a member removed from Trip A can no longer perform the Trip-scoped query', async () => {
+    await seedTrip(testEnv, TRIP_ID, validTripData({ memberIds: [OWNER_UID] }));
+    await assertFails(
+      expensesCollection(asMember()).where('tripId', '==', TRIP_ID).get()
+    );
+  });
+
+  it('F. member A: where(tripId == TripA) succeeds for Splits and returns only TripA documents', async () => {
+    const snap = await assertSucceeds(
+      splitsCollection(asMember()).where('tripId', '==', TRIP_ID).get()
+    );
+    expect(snap.docs.map((d) => d.id)).toEqual([SPLIT_ID]);
+  });
+
+  it('G. member A: an unscoped tripExpenseSplits collection query is denied', async () => {
+    await assertFails(splitsCollection(asMember()).get());
+  });
+
+  it("H. member A: where('tripId', 'in', [TripA, TripB]) is denied for Splits", async () => {
+    await assertFails(
+      splitsCollection(asMember())
+        .where('tripId', 'in', [TRIP_ID, TRIP_B_ID])
+        .get()
+    );
+  });
+
+  it('I. member A: querying Splits only by userId, with no tripId constraint, is denied even though every result happens to name them', async () => {
+    await assertFails(
+      splitsCollection(asMember()).where('userId', '==', MEMBER_UID).get()
+    );
+  });
+
+  it('J. a member removed from Trip A can no longer perform the Trip-scoped Split query', async () => {
+    await seedTrip(testEnv, TRIP_ID, validTripData({ memberIds: [OWNER_UID] }));
+    await assertFails(
+      splitsCollection(asMember()).where('tripId', '==', TRIP_ID).get()
+    );
+  });
+});

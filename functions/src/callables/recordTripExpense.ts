@@ -102,6 +102,16 @@ const MAX_DESCRIPTION_LENGTH = 500;
 // realistic category name approaches even a fraction of that length; this
 // is a defensive upper bound, not a meaningful UX constraint.
 const MAX_CATEGORY_LENGTH = 100;
+// Checkpoint 4C.2C (§7): no existing Trip/group membership cap exists
+// anywhere in this repository to reuse, so this is a new, explicit
+// backend bound. 100 is far above any realistic group-trip participant
+// count, bounds the number of transaction writes (1 Expense + up to N
+// Split documents, all inside one Firestore transaction, §8 of the
+// preflight), bounds the CPU/memory cost of split computation, and turns
+// a pathological/malicious request into a deterministic invalid-argument
+// rather than an unbounded amount of work inside the trusted transaction.
+// Never silently truncated - exceeding it is a hard rejection.
+const MAX_EXPENSE_PARTICIPANTS = 100;
 
 // Checkpoint 4C.2A.1 (§4): the documented contract is "an ISO 8601 date-
 // time string", but bare Date.parse accepts many non-ISO/locale formats
@@ -116,6 +126,37 @@ const MAX_CATEGORY_LENGTH = 100;
 // never supply sub-millisecond precision that would silently be dropped.
 const ISO_INSTANT_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
+
+// Checkpoint 4C.2C (§8): tripId is passed directly to
+// db.collection("trips").doc(tripId) - a malformed value (one containing
+// "/", exactly "." or "..", or exceeding Firestore's own maximum document
+// id length) makes the Admin SDK's own `.doc()` call throw a raw,
+// synchronous, uncaught exception rather than a clean HttpsError. These
+// are FIRESTORE's own real document-id constraints (not a product-
+// invented restriction) - enforced here, before that call, so a malformed
+// tripId is always surfaced as an ordinary invalid-argument. payerUid/
+// participant uids never need this check: they are only ever used as
+// FIELD VALUES or hashed (via splitDocumentId's SHA-256) into an opaque
+// id, never passed directly to `.doc(...)` themselves.
+const MAX_FIRESTORE_DOCUMENT_ID_BYTES = 1500;
+
+/**
+ * True if id satisfies Firestore's own document-id constraints (never
+ * empty, never exactly "." or "..", never containing "/", and never
+ * exceeding Firestore's maximum document-id byte length) - the exact set
+ * of shapes that would otherwise make `.doc(id)` throw synchronously.
+ * @param {string} id The candidate document id.
+ * @return {boolean} True if id is safe to pass to `.doc(id)`.
+ */
+function isValidFirestoreDocumentId(id: string): boolean {
+  if (id.length === 0 || id === "." || id === "..") {
+    return false;
+  }
+  if (id.includes("/")) {
+    return false;
+  }
+  return Buffer.byteLength(id, "utf8") <= MAX_FIRESTORE_DOCUMENT_ID_BYTES;
+}
 
 const ALLOWED_TOP_LEVEL_KEYS = new Set([
   "tripId",
@@ -277,20 +318,34 @@ export async function recordTripExpenseCore(
       return {expenseId: input.clientRequestId};
     }
 
-    // C. For a NEW Expense: validate caller is a current Trip member.
-    // This is the real authorization boundary and must resolve before any
-    // Trip-state fact (e.g. archive status) is ever revealed to the
-    // caller (preflight §7 step 4/§15 information-leakage analysis).
-    if (!Array.isArray(tripData.memberIds)) {
-      throw new HttpsError(
-        "failed-precondition",
-        "Trip has malformed memberIds."
-      );
-    }
+    // C. For a NEW Expense: validate caller is a current Trip member,
+    // using isCurrentTripMember()'s own missing-safe/malformed-safe
+    // check (it already treats a non-array memberIds as empty, so only
+    // the independent ownerId fallback can authorize in that case) -
+    // Checkpoint 4C.2C (§5) hardening: this MUST run and reject BEFORE
+    // any structural-integrity fact about the Trip is disclosed, so an
+    // outsider learns nothing about whether the Trip's own memberIds
+    // happens to be malformed. This is the real authorization boundary
+    // and must resolve before any Trip-state fact (e.g. archive status,
+    // or data corruption) is ever revealed to the caller (preflight §7
+    // step 4/§15 information-leakage analysis).
     if (!isCurrentTripMember(tripData, authUid)) {
       throw new HttpsError(
         "permission-denied",
         "You must be a current member of this Trip to record an expense."
+      );
+    }
+
+    // C2. Only for an AUTHORIZED caller (reached this line only because
+    // isCurrentTripMember returned true - i.e. the caller is either a
+    // genuine list member or, when memberIds is malformed, the Trip's
+    // own owner): now it's safe to disclose that the Trip's own data is
+    // structurally corrupt. An unauthorized caller never reaches this
+    // check at all, by construction.
+    if (!Array.isArray(tripData.memberIds)) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Trip has malformed memberIds."
       );
     }
 
@@ -562,8 +617,14 @@ function validateInput(raw: unknown): ValidatedInput {
     }
   }
 
-  if (typeof data.tripId !== "string" || data.tripId.length === 0) {
-    throw new HttpsError("invalid-argument", "tripId is required.");
+  if (
+    typeof data.tripId !== "string" ||
+    !isValidFirestoreDocumentId(data.tripId)
+  ) {
+    throw new HttpsError(
+      "invalid-argument",
+      "tripId must be a non-empty, valid Firestore document id."
+    );
   }
   if (typeof data.payerUid !== "string" || data.payerUid.length === 0) {
     throw new HttpsError("invalid-argument", "payerUid is required.");
@@ -627,6 +688,12 @@ function validateInput(raw: unknown): ValidatedInput {
     throw new HttpsError(
       "invalid-argument",
       "participants must be a non-empty array."
+    );
+  }
+  if (data.participants.length > MAX_EXPENSE_PARTICIPANTS) {
+    throw new HttpsError(
+      "invalid-argument",
+      `participants must contain at most ${MAX_EXPENSE_PARTICIPANTS} entries.`
     );
   }
   const participants = data.participants.map((raw, index) =>
