@@ -12,6 +12,15 @@
 // leaving the caller (a later checkpoint's trusted callable) responsible
 // for attaching expenseId/tripId and persisting the result as real
 // ExpenseSplit documents (src/types/domain/expense.ts).
+//
+// Checkpoint 4C.2A: this file's equal/percentage/custom split math is
+// DUPLICATED at functions/src/domain/tripExpenseSplits.ts (a separate
+// compiled TypeScript project with no shared import path - the same
+// constraint already documented for tripPersonalBucketId in
+// src/domain/tripPersonalFund.ts). Keep both in sync manually if this
+// ever changes. The trusted recordTripExpense callable
+// (functions/src/callables/recordTripExpense.ts) calls its own local
+// copy, never this one directly.
 
 // The result of any split calculation - deliberately lighter than the
 // persisted ExpenseSplit type (src/types/domain/expense.ts), which also
