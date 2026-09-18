@@ -6,3 +6,4 @@ export {createBucket} from "./callables/createBucket";
 export {lookupUserByEmail} from "./callables/lookupUserByEmail";
 export {recordSavingsTransaction} from "./callables/recordSavingsTransaction";
 export {recordTripExpense} from "./callables/recordTripExpense";
+export {reverseTripExpense} from "./callables/reverseTripExpense";
