@@ -674,22 +674,3 @@ Four small checkpoints, continuing the exact rhythm already established for crea
 **DO NOT PUSH.**
 **DO NOT DEPLOY.**
 **STOP.**
-
----
-
-### Validation
-
-```
-git diff --check     -> no output (no whitespace/conflict issues)
-git status --short   -> ?? docs/audits/TRIP_EXPENSE_REVERSAL_CORRECTION_PREFLIGHT_2026-09-17.md
-```
-
-No production code, Firestore Rules, Cloud Functions, tests, or dependencies were modified. Only this markdown file was edited, and it was not staged.
-
-CHECKPOINT 4C.3A EXPENSE REVERSAL/CORRECTION PREFLIGHT READY FOR REVIEW (hardened by 4C.3A.1)
-
-DO NOT IMPLEMENT.
-DO NOT COMMIT.
-DO NOT PUSH.
-DO NOT DEPLOY.
-STOP.
