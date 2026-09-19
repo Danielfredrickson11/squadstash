@@ -19,42 +19,42 @@ import { useTheme } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 
-import { BAR_HEIGHT, CENTER_BUTTON_SIZE } from "../../../components/navigation/BottomNav";
-import { cardShadowFor, radii, spacing, typography, type SemanticColors } from "../../../src/theme/tokens";
-import { useSemanticColors } from "../../../src/theme/useSemanticColors";
-import { useAuth } from "../../../src/contexts/AuthContext";
-import { archiveTrip, fetchTripById, updateTripDates } from "../../../src/services/firebase/trips";
+import { BAR_HEIGHT, CENTER_BUTTON_SIZE } from "../../../../components/navigation/BottomNav";
+import { cardShadowFor, radii, spacing, typography, type SemanticColors } from "../../../../src/theme/tokens";
+import { useSemanticColors } from "../../../../src/theme/useSemanticColors";
+import { useAuth } from "../../../../src/contexts/AuthContext";
+import { archiveTrip, fetchTripById, updateTripDates } from "../../../../src/services/firebase/trips";
 import {
   createBucket,
   fetchBucketById,
   generateBucketClientRequestId,
   subscribeToBucketById,
-} from "../../../src/services/firebase/buckets";
+} from "../../../../src/services/firebase/buckets";
 import {
   generateSavingsClientRequestId,
   MAX_TRANSACTION_NOTE_LENGTH,
   recordSavingsTransaction,
-} from "../../../src/services/firebase/savingsTransactions";
+} from "../../../../src/services/firebase/savingsTransactions";
 import {
   formatCanonicalDateShort,
   formatTripDates,
   isValidCanonicalDate,
   todayCanonicalDate,
-} from "../../../src/domain/tripDates";
+} from "../../../../src/domain/tripDates";
 import {
   computeTripSavingsGuidance,
   formatTripHorizonText,
   type TripSavingsGuidance,
-} from "../../../src/domain/tripSavingsGuidance";
-import { isMatchingTripPersonalBucket, tripPersonalBucketId } from "../../../src/domain/tripPersonalFund";
+} from "../../../../src/domain/tripSavingsGuidance";
+import { isMatchingTripPersonalBucket, tripPersonalBucketId } from "../../../../src/domain/tripPersonalFund";
 import {
   normalizeTransactionNote,
   resolveAmountMinor,
   resolveMoneyActionClientRequestId,
   type PendingMoneyActionRequest,
-} from "../../../src/domain/savingsMoneyAction";
-import { useSavingsMoneyAction } from "../../../src/hooks/useSavingsMoneyAction";
-import type { Bucket, SavingsTransactionType, Trip } from "../../../src/types/domain";
+} from "../../../../src/domain/savingsMoneyAction";
+import { useSavingsMoneyAction } from "../../../../src/hooks/useSavingsMoneyAction";
+import type { Bucket, SavingsTransactionType, Trip } from "../../../../src/types/domain";
 
 const FALLBACK_IMAGE =
   "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=60";
