@@ -178,6 +178,31 @@ async function assertRejectsWithCode(
   });
 }
 
+async function getExpenseData(): Promise<
+  FirebaseFirestore.DocumentData | undefined
+> {
+  const snap = await db.collection("tripExpenses").doc(EXPENSE_ID).get();
+  return snap.data();
+}
+
+// Checkpoint 4C.3B.1, hoisted to module scope in 4C.3C so every hardening
+// describe block below can reuse it: compares the persisted Expense before
+// vs. after a rejected attempt - proving zero mutation, not merely
+// asserting the error code.
+async function expectNoMutation(
+  setup: () => Promise<unknown>,
+  attempt: () => Promise<unknown>,
+  expectedCode: string
+): Promise<void> {
+  await setup();
+  const before = await getExpenseData();
+
+  await assertRejectsWithCode(attempt(), expectedCode);
+
+  const after = await getExpenseData();
+  assert.deepEqual(after, before);
+}
+
 describe("reverseTripExpenseCore - authorized reversal", () => {
   it("1. Trip owner reverses an active Expense successfully", async () => {
     await seedTrip();
@@ -472,25 +497,8 @@ describe("reverseTripExpenseCore - zero writes on rejected NEW reversal attempts
   // Checkpoint 4C.3B.1: expanded from one combined test into individual,
   // separately-failing tests, each comparing the persisted Expense before
   // vs. after - proving zero mutation, not merely asserting the error
-  // code.
-  async function expectNoMutation(
-    setup: () => Promise<unknown>,
-    attempt: () => Promise<unknown>,
-    expectedCode: string
-  ): Promise<void> {
-    await setup();
-    const before = (
-      await db.collection("tripExpenses").doc(EXPENSE_ID).get()
-    ).data();
-
-    await assertRejectsWithCode(attempt(), expectedCode);
-
-    const after = (
-      await db.collection("tripExpenses").doc(EXPENSE_ID).get()
-    ).data();
-    assert.deepEqual(after, before);
-  }
-
+  // code. expectNoMutation is now a module-level helper (Checkpoint
+  // 4C.3C) so the hardening blocks below can reuse it too.
   it("20a. permission-denied leaves the Expense unchanged", async () => {
     await expectNoMutation(
       async () => {
@@ -728,4 +736,581 @@ describe("reverseTripExpenseCore - production auth boundary", () => {
       }
     );
   });
+
+  it("returns the exact uid when auth is present", () => {
+    const auth = {uid: MEMBER_UID} as Parameters<
+      typeof requireAuthenticatedUid
+    >[0];
+    assert.equal(requireAuthenticatedUid(auth), MEMBER_UID);
+  });
+
+  it("reverseTripExpenseCore acts as the explicit authUid parameter, never any identity-shaped field inside rawInput (the strict top-level allowlist already rejects every attempt to smuggle one in - §11/§11b)", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID});
+
+    // The ONLY way to make this callable act as MEMBER_UID is to pass
+    // MEMBER_UID as the authUid parameter itself - there is no field in
+    // rawInput this core function ever reads for identity.
+    const result = await reverseTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseReversalRequest()
+    );
+    assert.equal(result.expenseId, EXPENSE_ID);
+
+    const data = await getExpenseData();
+    assert.equal(data?.reversedBy, MEMBER_UID);
+  });
+});
+
+// Checkpoint 4C.3C: security/concurrency hardening pass. The transaction
+// order (A-I) and authorization model are NOT redesigned here - every test
+// below is either a genuine concurrency/race proof (mirroring
+// recordTripExpenseCore's own Checkpoint 4C.2C §3/§4 style: Promise.all/
+// Promise.allSettled with an INVARIANT assertion that holds under either
+// acceptable linearization, never a specific asserted winner - no
+// production test hooks are added to manufacture determinism) or an
+// explicit regression/matrix test proving an already-frozen property.
+describe("reverseTripExpenseCore - concurrent identical reversal (Checkpoint 4C.3C §3)", () => {
+  it("two simultaneous identical reversal requests both observe success; the Expense is reversed exactly once; Splits are untouched", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID});
+    await seedSplit();
+    const request = baseReversalRequest({reversalReason: "Wrong amount"});
+
+    const [r1, r2] = await Promise.all([
+      reverseTripExpenseCore(db, OWNER_UID, request),
+      reverseTripExpenseCore(db, OWNER_UID, request),
+    ]);
+    assert.equal(r1.expenseId, EXPENSE_ID);
+    assert.equal(r2.expenseId, EXPENSE_ID);
+
+    const data = await getExpenseData();
+    assert.equal(data?.status, "reversed");
+    assert.equal(data?.reversedBy, OWNER_UID);
+    assert.equal(data?.reversalReason, "Wrong amount");
+    assert.equal(
+      data?.reversalRequest.clientRequestId,
+      request.clientRequestId
+    );
+
+    // Exactly one Expense document exists - no secondary/duplicate
+    // record was ever created by either call.
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+
+    const splitAfter = (
+      await db.collection("tripExpenseSplits").doc(SPLIT_ID).get()
+    ).data();
+    assert.ok(splitAfter);
+    assert.equal(splitAfter?.amountMinor, 9000);
+  });
+});
+
+describe("reverseTripExpenseCore - concurrent same-reverser, different request (Checkpoint 4C.3C §4)", () => {
+  it("exactly one of two concurrent different reversal requests from the SAME reverser succeeds; the loser fails failed-precondition; the final document reflects only the winner", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID});
+    const reqA = baseReversalRequest({reversalReason: "Reason A"});
+    const reqB = baseReversalRequest({reversalReason: "Reason B"});
+
+    const results = await Promise.allSettled([
+      reverseTripExpenseCore(db, OWNER_UID, reqA),
+      reverseTripExpenseCore(db, OWNER_UID, reqB),
+    ]);
+
+    const fulfilled = results.filter(
+      (r): r is PromiseFulfilledResult<{expenseId: string}> =>
+        r.status === "fulfilled"
+    );
+    const rejected = results.filter(
+      (r): r is PromiseRejectedResult => r.status === "rejected"
+    );
+    // Do NOT assert which request wins - only that exactly one does.
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.ok(rejected[0]!.reason instanceof HttpsError);
+    assert.equal((rejected[0]!.reason as HttpsError).code, "failed-precondition");
+
+    const data = await getExpenseData();
+    assert.equal(data?.status, "reversed");
+    assert.ok(data?.reversedAt);
+    const winningClientRequestId = data?.reversalRequest.clientRequestId;
+    assert.ok(
+      winningClientRequestId === reqA.clientRequestId ||
+        winningClientRequestId === reqB.clientRequestId
+    );
+    const winningReason =
+      winningClientRequestId === reqA.clientRequestId ?
+        "Reason A" :
+        "Reason B";
+    // The final document is never a MIX of the two requests' facts.
+    assert.equal(data?.reversalReason, winningReason);
+  });
+});
+
+describe("reverseTripExpenseCore - concurrent different authorized reversers (Checkpoint 4C.3C §5)", () => {
+  it("exactly one of two concurrent reversals from DIFFERENT authorized reversers (owner vs. current-member original creator) succeeds; the final document belongs entirely to the winner", async () => {
+    await seedTrip();
+    // Both the owner AND MEMBER_UID (createdBy, still a current member)
+    // independently qualify under §5's authorization model.
+    await seedExpense({createdBy: MEMBER_UID});
+    const ownerRequest = baseReversalRequest({reversalReason: "Owner reason"});
+    const creatorRequest = baseReversalRequest({
+      reversalReason: "Creator reason",
+    });
+
+    const results = await Promise.allSettled([
+      reverseTripExpenseCore(db, OWNER_UID, ownerRequest),
+      reverseTripExpenseCore(db, MEMBER_UID, creatorRequest),
+    ]);
+
+    const fulfilled = results.filter(
+      (r): r is PromiseFulfilledResult<{expenseId: string}> =>
+        r.status === "fulfilled"
+    );
+    const rejected = results.filter(
+      (r): r is PromiseRejectedResult => r.status === "rejected"
+    );
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.equal((rejected[0]!.reason as HttpsError).code, "failed-precondition");
+
+    const data = await getExpenseData();
+    assert.ok(data?.reversedBy === OWNER_UID || data?.reversedBy === MEMBER_UID);
+    const isOwnerWinner = data?.reversedBy === OWNER_UID;
+    assert.equal(
+      data?.reversalReason,
+      isOwnerWinner ? "Owner reason" : "Creator reason"
+    );
+    assert.equal(
+      data?.reversalRequest.clientRequestId,
+      isOwnerWinner ? ownerRequest.clientRequestId : creatorRequest.clientRequestId
+    );
+  });
+});
+
+describe("reverseTripExpenseCore - membership-removal race (Checkpoint 4C.3C §6)", () => {
+  it("a creator's NEW reversal either commits while they were still a current member, or is rejected permission-denied - never a stale-membership commit", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID});
+    const request = baseReversalRequest();
+
+    const [reversalResult] = await Promise.allSettled([
+      reverseTripExpenseCore(db, MEMBER_UID, request),
+      db
+        .collection("trips")
+        .doc(TRIP_ID)
+        .update({memberIds: [OWNER_UID, OTHER_MEMBER_UID]}),
+    ]);
+
+    if (reversalResult.status === "fulfilled") {
+      const data = await getExpenseData();
+      assert.equal(data?.status, "reversed");
+      assert.equal(data?.reversedBy, MEMBER_UID);
+    } else {
+      assert.ok(reversalResult.reason instanceof HttpsError);
+      assert.equal(
+        (reversalResult.reason as HttpsError).code,
+        "permission-denied"
+      );
+      const data = await getExpenseData();
+      assert.equal(data?.status, "active");
+    }
+  });
+});
+
+describe("reverseTripExpenseCore - owner authority / malformed memberIds (Checkpoint 4C.3C §7)", () => {
+  it("owner reversal succeeds even when the Trip's memberIds is malformed (non-array)", async () => {
+    await seedTrip({memberIds: "not-a-list"});
+    await seedExpense({createdBy: MEMBER_UID});
+
+    const result = await reverseTripExpenseCore(
+      db,
+      OWNER_UID,
+      baseReversalRequest()
+    );
+    assert.equal(result.expenseId, EXPENSE_ID);
+  });
+
+  it("a non-owner createdBy cannot fall back on creator-based authority when memberIds is malformed", async () => {
+    await seedTrip({memberIds: "not-a-list"});
+    await seedExpense({createdBy: MEMBER_UID});
+
+    await assertRejectsWithCode(
+      reverseTripExpenseCore(db, MEMBER_UID, baseReversalRequest()),
+      "permission-denied"
+    );
+  });
+});
+
+describe("reverseTripExpenseCore - removed creator: replay vs. new request (Checkpoint 4C.3C §8)", () => {
+  it("exact replay of the creator's own already-committed reversal still succeeds after they are removed from the Trip", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID});
+    const request = baseReversalRequest({reversalReason: "Wrong amount"});
+    await reverseTripExpenseCore(db, MEMBER_UID, request);
+
+    await db
+      .collection("trips")
+      .doc(TRIP_ID)
+      .update({memberIds: [OWNER_UID, OTHER_MEMBER_UID]});
+
+    const result = await reverseTripExpenseCore(db, MEMBER_UID, request);
+    assert.equal(result.expenseId, EXPENSE_ID);
+  });
+
+  it("a DIFFERENT reversal request from the same (now-removed) creator is denied permission-denied, never conflated with replay", async () => {
+    await expectNoMutation(
+      async () => {
+        await seedTrip();
+        await seedExpense({createdBy: MEMBER_UID});
+        await reverseTripExpenseCore(
+          db,
+          MEMBER_UID,
+          baseReversalRequest({reversalReason: "First"})
+        );
+        await db
+          .collection("trips")
+          .doc(TRIP_ID)
+          .update({memberIds: [OWNER_UID, OTHER_MEMBER_UID]});
+      },
+      () =>
+        reverseTripExpenseCore(
+          db,
+          MEMBER_UID,
+          baseReversalRequest({reversalReason: "Different"})
+        ),
+      "permission-denied"
+    );
+  });
+});
+
+describe("reverseTripExpenseCore - parent-independent replay (Checkpoint 4C.3C §9)", () => {
+  it("A. exact replay succeeds even after the parent Trip document is deleted entirely", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID});
+    const request = baseReversalRequest({reversalReason: "Wrong amount"});
+    await reverseTripExpenseCore(db, MEMBER_UID, request);
+
+    await db.collection("trips").doc(TRIP_ID).delete();
+
+    const result = await reverseTripExpenseCore(db, MEMBER_UID, request);
+    assert.equal(result.expenseId, EXPENSE_ID);
+  });
+
+  it("A2. comparison: a DIFFERENT reversal request after the parent Trip is deleted fails failed-precondition", async () => {
+    await expectNoMutation(
+      async () => {
+        await seedTrip();
+        await seedExpense({createdBy: MEMBER_UID});
+        await reverseTripExpenseCore(
+          db,
+          MEMBER_UID,
+          baseReversalRequest({reversalReason: "First"})
+        );
+        await db.collection("trips").doc(TRIP_ID).delete();
+      },
+      () =>
+        reverseTripExpenseCore(
+          db,
+          MEMBER_UID,
+          baseReversalRequest({reversalReason: "Different"})
+        ),
+      "failed-precondition"
+    );
+  });
+
+  it("B. exact replay succeeds even after the parent Trip's memberIds/ownerId become malformed", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID});
+    const request = baseReversalRequest({reversalReason: "Wrong amount"});
+    await reverseTripExpenseCore(db, MEMBER_UID, request);
+
+    await db
+      .collection("trips")
+      .doc(TRIP_ID)
+      .update({memberIds: "not-a-list", ownerId: null});
+
+    const result = await reverseTripExpenseCore(db, MEMBER_UID, request);
+    assert.equal(result.expenseId, EXPENSE_ID);
+  });
+
+  it("C. exact replay succeeds even after the parent Trip becomes archived", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID});
+    const request = baseReversalRequest({reversalReason: "Wrong amount"});
+    await reverseTripExpenseCore(db, MEMBER_UID, request);
+
+    await db.collection("trips").doc(TRIP_ID).update({archivedAt: new Date()});
+
+    const result = await reverseTripExpenseCore(db, MEMBER_UID, request);
+    assert.equal(result.expenseId, EXPENSE_ID);
+  });
+});
+
+describe("reverseTripExpenseCore - information-leak regression matrix (Checkpoint 4C.3C §10)", () => {
+  it("outsider vs. an active Expense -> permission-denied", async () => {
+    await expectNoMutation(
+      async () => {
+        await seedTrip();
+        await seedExpense({createdBy: MEMBER_UID});
+      },
+      () => reverseTripExpenseCore(db, OUTSIDER_UID, baseReversalRequest()),
+      "permission-denied"
+    );
+  });
+
+  it("outsider vs. a validly-reversed Expense -> the identical permission-denied", async () => {
+    await seedTrip();
+    await seedReversedExpense({createdBy: MEMBER_UID, reversedBy: OWNER_UID});
+
+    await assertRejectsWithCode(
+      reverseTripExpenseCore(db, OUTSIDER_UID, baseReversalRequest()),
+      "permission-denied"
+    );
+  });
+
+  it("outsider vs. a reversed Expense with a malformed reversalRequest -> the identical permission-denied", async () => {
+    await seedTrip();
+    await seedReversedExpense({
+      createdBy: MEMBER_UID,
+      reversalRequest: {clientRequestId: "canonical-id", extra: true},
+    });
+
+    await assertRejectsWithCode(
+      reverseTripExpenseCore(db, OUTSIDER_UID, baseReversalRequest()),
+      "permission-denied"
+    );
+  });
+
+  it("outsider vs. a reversed Expense with a malformed reversedBy -> the identical permission-denied", async () => {
+    await seedTrip();
+    await seedReversedExpense({createdBy: MEMBER_UID, reversedBy: ""});
+
+    await assertRejectsWithCode(
+      reverseTripExpenseCore(db, OUTSIDER_UID, baseReversalRequest()),
+      "permission-denied"
+    );
+  });
+
+  it("outsider vs. an Expense with a malformed status -> the identical permission-denied", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID, status: "corrupted-value"});
+
+    await assertRejectsWithCode(
+      reverseTripExpenseCore(db, OUTSIDER_UID, baseReversalRequest()),
+      "permission-denied"
+    );
+  });
+
+  it("outsider vs. an active Expense on an archived Trip -> the identical permission-denied, archive state not disclosed", async () => {
+    await seedTrip({archivedAt: new Date()});
+    await seedExpense({createdBy: MEMBER_UID});
+
+    await assertRejectsWithCode(
+      reverseTripExpenseCore(db, OUTSIDER_UID, baseReversalRequest()),
+      "permission-denied"
+    );
+  });
+
+  // The two unavoidable, frozen, pre-authorization exceptions (§4.4 step
+  // C/D) - deliberately NOT "fixed" here, already covered by tests 16/17.
+});
+
+describe("reverseTripExpenseCore - already-reversed authorized matrix (Checkpoint 4C.3C §11)", () => {
+  it("A. exact original reverser + exact request -> success", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID});
+    const request = baseReversalRequest({reversalReason: "Wrong amount"});
+    await reverseTripExpenseCore(db, MEMBER_UID, request);
+
+    const result = await reverseTripExpenseCore(db, MEMBER_UID, request);
+    assert.equal(result.expenseId, EXPENSE_ID);
+  });
+
+  it("B. original reverser + different clientRequestId -> failed-precondition, Expense unchanged", async () => {
+    await expectNoMutation(
+      async () => {
+        await seedTrip();
+        await seedExpense({createdBy: MEMBER_UID});
+        await reverseTripExpenseCore(db, MEMBER_UID, baseReversalRequest());
+      },
+      () => reverseTripExpenseCore(db, MEMBER_UID, baseReversalRequest()),
+      "failed-precondition"
+    );
+  });
+
+  it("C. original reverser + same clientRequestId + changed reason -> failed-precondition, Expense unchanged", async () => {
+    const clientRequestId = randomUUID();
+    await expectNoMutation(
+      async () => {
+        await seedTrip();
+        await seedExpense({createdBy: MEMBER_UID});
+        await reverseTripExpenseCore(
+          db,
+          MEMBER_UID,
+          baseReversalRequest({clientRequestId, reversalReason: "First"})
+        );
+      },
+      () =>
+        reverseTripExpenseCore(
+          db,
+          MEMBER_UID,
+          baseReversalRequest({clientRequestId, reversalReason: "Different"})
+        ),
+      "failed-precondition"
+    );
+  });
+
+  it("D. a different authorized actor attempting an Expense already reversed by someone else -> failed-precondition, Expense unchanged", async () => {
+    await expectNoMutation(
+      async () => {
+        await seedTrip();
+        await seedExpense({createdBy: MEMBER_UID});
+        await reverseTripExpenseCore(db, MEMBER_UID, baseReversalRequest());
+      },
+      () => reverseTripExpenseCore(db, OWNER_UID, baseReversalRequest()),
+      "failed-precondition"
+    );
+  });
+
+  it("E. malformed stored reversalRequest -> failed-precondition for the authorized original reverser, Expense unchanged", async () => {
+    await expectNoMutation(
+      async () => {
+        await seedTrip();
+        await seedReversedExpense({
+          createdBy: MEMBER_UID,
+          reversedBy: MEMBER_UID,
+          reversalRequest: {clientRequestId: "canonical-id", extra: true},
+        });
+      },
+      () => reverseTripExpenseCore(db, MEMBER_UID, baseReversalRequest()),
+      "failed-precondition"
+    );
+  });
+
+  it("F. malformed stored reversedBy -> failed-precondition for an authorized caller, Expense unchanged", async () => {
+    await expectNoMutation(
+      async () => {
+        await seedTrip();
+        await seedReversedExpense({createdBy: MEMBER_UID, reversedBy: ""});
+      },
+      () => reverseTripExpenseCore(db, OWNER_UID, baseReversalRequest()),
+      "failed-precondition"
+    );
+  });
+});
+
+describe("reverseTripExpenseCore - reversal reason idempotency equivalence (Checkpoint 4C.3C §12)", () => {
+  it("an omitted reversalReason, replayed with a whitespace-only reason, is an exact match", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID});
+    const clientRequestId = randomUUID();
+    await reverseTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseReversalRequest({clientRequestId})
+    );
+
+    const result = await reverseTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseReversalRequest({clientRequestId, reversalReason: "   "})
+    );
+    assert.equal(result.expenseId, EXPENSE_ID);
+  });
+
+  it("an untrimmed reversalReason, replayed with its trimmed equivalent, is an exact match", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID});
+    const clientRequestId = randomUUID();
+    await reverseTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseReversalRequest({
+        clientRequestId,
+        reversalReason: "  Wrong amount  ",
+      })
+    );
+
+    const result = await reverseTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseReversalRequest({clientRequestId, reversalReason: "Wrong amount"})
+    );
+    assert.equal(result.expenseId, EXPENSE_ID);
+  });
+
+  it("a genuinely changed normalized reason under the same clientRequestId fails failed-precondition", async () => {
+    const clientRequestId = randomUUID();
+    await expectNoMutation(
+      async () => {
+        await seedTrip();
+        await seedExpense({createdBy: MEMBER_UID});
+        await reverseTripExpenseCore(
+          db,
+          MEMBER_UID,
+          baseReversalRequest({clientRequestId, reversalReason: "Wrong amount"})
+        );
+      },
+      () =>
+        reverseTripExpenseCore(
+          db,
+          MEMBER_UID,
+          baseReversalRequest({
+            clientRequestId,
+            reversalReason: "Totally different reason",
+          })
+        ),
+      "failed-precondition"
+    );
+  });
+});
+
+describe("reverseTripExpenseCore - input/document-id hardening regression (Checkpoint 4C.3C §13)", () => {
+  const invalidExpenseIdCases: Array<[string, string]> = [
+    ["empty string", ""],
+    ['"."', "."],
+    ['".."', ".."],
+    ['contains "/"', "a/b"],
+    ["exceeds 1500 UTF-8 bytes", "x".repeat(1501)],
+  ];
+  for (const [label, badId] of invalidExpenseIdCases) {
+    it(`expenseId (${label}) is rejected invalid-argument before any transaction mutation`, async () => {
+      await assertRejectsWithCode(
+        reverseTripExpenseCore(
+          db,
+          OWNER_UID,
+          baseReversalRequest({expenseId: badId})
+        ),
+        "invalid-argument"
+      );
+    });
+  }
+
+  const invalidClientRequestIdCases: Array<[string, string]> = [
+    ["empty string", ""],
+    ["contains a space", "has space"],
+    ["contains a slash", "has/slash"],
+    ["exceeds 128 characters", "x".repeat(129)],
+    ["unsupported punctuation", "bad!id"],
+  ];
+  for (const [label, badId] of invalidClientRequestIdCases) {
+    it(`clientRequestId (${label}) is rejected invalid-argument before any transaction mutation`, async () => {
+      await expectNoMutation(
+        async () => {
+          await seedTrip();
+          await seedExpense({createdBy: MEMBER_UID});
+        },
+        () =>
+          reverseTripExpenseCore(
+            db,
+            OWNER_UID,
+            baseReversalRequest({clientRequestId: badId})
+          ),
+        "invalid-argument"
+      );
+    });
+  }
 });
