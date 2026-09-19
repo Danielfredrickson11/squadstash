@@ -45,6 +45,13 @@ interface RecordTripExpenseInput {
   // shape and why plain Date.parse alone is looser than this contract.
   occurredAt?: string;
   clientRequestId: string;
+  // Checkpoint 4C.3D, per the frozen docs/audits/
+  // TRIP_EXPENSE_REVERSAL_CORRECTION_PREFLIGHT_2026-09-17.md §9: when
+  // present, identifies the OLD (already-reversed) Expense this new
+  // Expense is a correction/replacement for. Omitted for ordinary
+  // creation. Validated as an ordinary Firestore document id, never a new
+  // id format (§9.3/§17).
+  replacesExpenseId?: string;
 }
 
 // A single participant, narrowed and shape-validated against its
@@ -65,15 +72,26 @@ type NormalizedParticipant = {
 // occurredAtTimestamp are computed once, in validateInput, per Checkpoint
 // 4C.2A.1 (§4) - never re-parsed downstream.
 interface ValidatedInput
-  extends Omit<RecordTripExpenseInput, "participants" | "occurredAt"> {
+  extends Omit<
+    RecordTripExpenseInput,
+    "participants" | "occurredAt" | "replacesExpenseId"
+  > {
   participants: NormalizedParticipant[];
   occurredAtInstantMs: number | null;
   occurredAtTimestamp: Timestamp | undefined;
+  // Checkpoint 4C.3D: normalized from the raw optional wire field -
+  // omitted always normalizes to null, never left undefined (matching
+  // category's own null-vs-undefined convention throughout this file).
+  replacesExpenseId: string | null;
 }
 
 // The server-normalized creationRequest snapshot compared on replay
 // (preflight §5.2). Deliberately does NOT include createdBy - that stays
 // a separate, top-level persisted field compared independently (§5.1).
+// Checkpoint 4C.3D (preflight §9.3): replacesExpenseId is now part of
+// this exact creation identity, exactly like every other field here - a
+// same-clientRequestId request that changes only its correction target is
+// a genuine conflict (already-exists), never an exact replay.
 interface NormalizedCreationRequest {
   tripId: string;
   payerUid: string;
@@ -85,6 +103,7 @@ interface NormalizedCreationRequest {
   participants: NormalizedParticipant[];
   paymentSource: "member_out_of_pocket";
   occurredAtInstantMs: number | null;
+  replacesExpenseId: string | null;
 }
 
 interface RecordTripExpenseResult {
@@ -170,6 +189,7 @@ const ALLOWED_TOP_LEVEL_KEYS = new Set([
   "paymentSource",
   "occurredAt",
   "clientRequestId",
+  "replacesExpenseId",
 ]);
 
 /**
@@ -183,11 +203,16 @@ const ALLOWED_TOP_LEVEL_KEYS = new Set([
  *   paymentSource?: "member_out_of_pocket" (only accepted value - absent
  *   is normalized to it, anything else including "shared_stash" is
  *   invalid-argument), occurredAt?: string, clientRequestId: string,
+ *   replacesExpenseId?: string (Checkpoint 4C.3D - identifies the OLD,
+ *   already-reversed Expense this new Expense corrects/replaces; omitted
+ *   for ordinary creation),
  * }
  * Output: { expenseId: string }
  *
  * Security (docs/audits/TRIP_OUT_OF_POCKET_EXPENSE_PERSISTENCE_PREFLIGHT_
- * 2026-09-15.md, as hardened by 4C.1A/4C.1B):
+ * 2026-09-15.md, as hardened by 4C.1A/4C.1B; correction linking per
+ * docs/audits/TRIP_EXPENSE_REVERSAL_CORRECTION_PREFLIGHT_2026-09-17.md §9,
+ * Checkpoint 4C.3D):
  * - Requires caller to be signed in.
  * - Caller must be a current Trip member (memberIds or ownerId) - any
  *   member may record an expense paid by ANOTHER member (createdBy !=
@@ -207,6 +232,17 @@ const ALLOWED_TOP_LEVEL_KEYS = new Set([
  * - This is the sole trusted write path for tripExpenses/
  *   tripExpenseSplits; direct client creation is closed by Firestore
  *   Rules in a later checkpoint (4C.2B).
+ * - When replacesExpenseId is supplied: it is part of exact creation
+ *   identity (a same-clientRequestId request with a different
+ *   replacesExpenseId is already-exists, never a replay). Claiming the
+ *   correction slot requires a narrower authorization than ordinary
+ *   creation (Trip owner, OR the old Expense's createdBy/reversedBy while
+ *   still a current member) - old Expense state (active/reversed/already-
+ *   replaced) is never inspected or disclosed until that authorization
+ *   succeeds. Both link fields (new.replacesExpenseId,
+ *   old.replacedByExpenseId) are written atomically in this same
+ *   transaction, enforcing at most one direct replacement per reversed
+ *   Expense.
  */
 export const recordTripExpense = onCall(async (request) => {
   const authUid = requireAuthenticatedUid(request.auth);
@@ -274,6 +310,7 @@ export async function recordTripExpenseCore(
     participants: normalizedParticipants,
     paymentSource: "member_out_of_pocket",
     occurredAtInstantMs,
+    replacesExpenseId: input.replacesExpenseId,
   };
 
   const expenseRef = db.collection("tripExpenses").doc(input.clientRequestId);
@@ -367,6 +404,89 @@ export async function recordTripExpenseCore(
       );
     }
 
+    // D2. Checkpoint 4C.3D (preflight §9.5): correction-target validation,
+    // ONLY on this genuinely-new-Expense path, ONLY when replacesExpenseId
+    // was supplied, and ONLY after the ordinary Trip-membership/archive
+    // authorization above already succeeded - this is ADDITIONAL
+    // authorization/state validation layered on top of ordinary creation
+    // authority, never a replacement for it. The old Expense is read here
+    // (still before any write in this transaction), then evaluated in
+    // this exact decision/disclosure order: existence -> same-Trip ->
+    // correction-link authorization -> ONLY THEN old status/
+    // already-replaced state (preflight §9.4/§9.5 - "reading data is not
+    // equivalent to disclosing it").
+    let oldExpenseRef: FirebaseFirestore.DocumentReference | null = null;
+    if (input.replacesExpenseId !== null) {
+      oldExpenseRef = db
+        .collection("tripExpenses")
+        .doc(input.replacesExpenseId);
+      const oldExpenseSnap = await tx.get(oldExpenseRef);
+
+      // 5A. The referenced old Expense must exist. Unavoidable minimal
+      // disclosure - the same "must read to know anything" constraint
+      // reverseTripExpense itself has (preflight §9.5 step 5a).
+      if (!oldExpenseSnap.exists) {
+        throw new HttpsError(
+          "failed-precondition",
+          "replacesExpenseId does not reference an existing expense."
+        );
+      }
+      const oldExpenseData =
+        oldExpenseSnap.data() as FirebaseFirestore.DocumentData;
+
+      // 5B. Structural/routing requirement, resolved before correction-
+      // link authority is evaluated - authority over a DIFFERENT Trip's
+      // record is not a question THIS Trip's membership can even answer.
+      if (oldExpenseData.tripId !== input.tripId) {
+        throw new HttpsError(
+          "failed-precondition",
+          "replacesExpenseId must reference an expense on the same trip."
+        );
+      }
+
+      // 5C. Correction-link authorization (preflight §9.4) - narrower
+      // than, and layered on top of, ordinary creation authority: the
+      // Trip's current owner, OR the old Expense's createdBy (still a
+      // current member), OR the old Expense's reversedBy (still a
+      // current member). payerUid and mere participant status grant NO
+      // correction-link authority. Reached WITHOUT yet inspecting or
+      // disclosing whether the old Expense is active/reversed or already
+      // replaced.
+      const isOwner = tripData.ownerId === authUid;
+      const isOldCreatorStillMember =
+        oldExpenseData.createdBy === authUid &&
+        isCurrentTripMember(tripData, authUid);
+      const isOldReverserStillMember =
+        oldExpenseData.reversedBy === authUid &&
+        isCurrentTripMember(tripData, authUid);
+      if (!isOwner && !isOldCreatorStillMember && !isOldReverserStillMember) {
+        throw new HttpsError(
+          "permission-denied",
+          "You are not authorized to claim this expense's correction slot."
+        );
+      }
+
+      // 5D. NOW, for an authorized caller only: the old Expense must
+      // actually be reversed - safe to disclose now.
+      if (oldExpenseData.status !== "reversed") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Only a reversed expense can be replaced."
+        );
+      }
+
+      // 5E. At most one direct replacement, enforced by construction: if
+      // replacedByExpenseId is already present in ANY non-absent form
+      // (including a malformed value), fail closed rather than silently
+      // overwriting it.
+      if (oldExpenseData.replacedByExpenseId !== undefined) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This expense has already been replaced."
+        );
+      }
+    }
+
     // E. Validate payerUid is a current Trip member. Not permission-
     // denied - the CALLER is authorized; it is the referenced payer that
     // fails a data-integrity condition (mirrors the failed-precondition/
@@ -428,6 +548,15 @@ export async function recordTripExpenseCore(
     if (occurredAtTimestamp !== undefined) {
       expenseData.occurredAt = occurredAtTimestamp;
     }
+    // Checkpoint 4C.3D (preflight §9.7): top-level replacesExpenseId is
+    // optional correction/audit metadata, only ever persisted for a
+    // correction creation - mirrors category's own conditional-write
+    // convention exactly. creationRequest.replacesExpenseId (above) is
+    // the one field that ALWAYS exists on every new write, explicit null
+    // for ordinary creation.
+    if (input.replacesExpenseId !== null) {
+      expenseData.replacesExpenseId = input.replacesExpenseId;
+    }
     tx.set(expenseRef, expenseData);
 
     for (const allocation of allocations) {
@@ -445,6 +574,14 @@ export async function recordTripExpenseCore(
         splitData.percentageBasisPoints = allocation.percentageBasisPoints;
       }
       tx.set(splitRef, splitData);
+    }
+
+    // Checkpoint 4C.3D (preflight §9.1/§9.5): the ONE new write against
+    // the OLD Expense document, in the SAME transaction as everything
+    // else above - both directional link fields commit together or
+    // neither does. No other field on the old Expense is ever touched.
+    if (oldExpenseRef !== null) {
+      tx.update(oldExpenseRef, {replacedByExpenseId: input.clientRequestId});
     }
 
     return {expenseId: input.clientRequestId};
@@ -521,6 +658,52 @@ function buildSplitStrategyInput(
   };
 }
 
+// Checkpoint 4C.3D: a guaranteed-never-equal sentinel for a STORED
+// replacesExpenseId that is present but malformed (non-string, non-null,
+// or a string that isn't itself a valid Firestore document id) - see
+// normalizeStoredReplacesExpenseId below. A Symbol can never === any
+// string or null, so a malformed stored value can never accidentally
+// match either an ordinary incoming replay (null) or a correction
+// incoming replay (a validated, non-empty string).
+const INVALID_STORED_REPLACES_EXPENSE_ID = Symbol(
+  "invalid-stored-replacesExpenseId"
+);
+
+/**
+ * Normalizes a STORED creationRequest's replacesExpenseId for comparison
+ * purposes only - never used to decide what gets WRITTEN (every new write
+ * always persists an explicit `string | null`, §9.3). Checkpoint 4C.3D
+ * legacy-replay compatibility: recordTripExpense is already deployed in
+ * production, so Expense documents created before this checkpoint may
+ * have a creationRequest with NO replacesExpenseId key at all - that
+ * absence must compare as null (an ordinary pre-4C.3D Expense IS an
+ * ordinary, non-correction Expense), without ever rewriting the stored
+ * document to add the key. A PRESENT but malformed value (wrong type, or
+ * a string that isn't a valid Firestore document id) is different from
+ * absence and must NEVER be coerced to null - it resolves to a sentinel
+ * that cannot equal any legitimate incoming value, so a malformed stored
+ * value always falls through to the generic already-exists mismatch path,
+ * never an accidental successful replay.
+ * @param {Record<string, unknown>} stored The persisted creationRequest
+ *   map, as read back from Firestore.
+ * @return {string|null|symbol} The normalized-for-comparison value.
+ */
+function normalizeStoredReplacesExpenseId(
+  stored: Record<string, unknown>
+): string | null | typeof INVALID_STORED_REPLACES_EXPENSE_ID {
+  if (!Object.prototype.hasOwnProperty.call(stored, "replacesExpenseId")) {
+    return null;
+  }
+  const v = stored.replacesExpenseId;
+  if (v === null) {
+    return null;
+  }
+  if (typeof v === "string" && isValidFirestoreDocumentId(v)) {
+    return v;
+  }
+  return INVALID_STORED_REPLACES_EXPENSE_ID;
+}
+
 /**
  * True if a previously-stored creationRequest snapshot exactly matches an
  * incoming normalized snapshot. Explicit field-by-field comparison (never
@@ -555,6 +738,7 @@ function creationRequestsMatch(
     (typeof s.occurredAtInstantMs === "number" ?
       s.occurredAtInstantMs :
       null) === incoming.occurredAtInstantMs &&
+    normalizeStoredReplacesExpenseId(s) === incoming.replacesExpenseId &&
     participantsMatch(s.participants, incoming.participants)
   );
 }
@@ -750,6 +934,25 @@ function validateInput(raw: unknown): ValidatedInput {
     );
   }
 
+  // Checkpoint 4C.3D (preflight §9.3/§17): replacesExpenseId, when
+  // supplied, is validated with the exact same isValidFirestoreDocumentId
+  // helper already hardened for tripId/expenseId - no new id format, no
+  // weaker check. Omitted normalizes to null, never left undefined.
+  let replacesExpenseId: string | null = null;
+  if (data.replacesExpenseId !== undefined) {
+    if (
+      typeof data.replacesExpenseId !== "string" ||
+      !isValidFirestoreDocumentId(data.replacesExpenseId)
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        "replacesExpenseId must be a non-empty, valid Firestore " +
+          "document id."
+      );
+    }
+    replacesExpenseId = data.replacesExpenseId;
+  }
+
   return {
     tripId: data.tripId,
     payerUid: data.payerUid,
@@ -762,6 +965,7 @@ function validateInput(raw: unknown): ValidatedInput {
     occurredAtInstantMs,
     occurredAtTimestamp,
     clientRequestId: data.clientRequestId,
+    replacesExpenseId,
   };
 }
 

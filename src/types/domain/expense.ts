@@ -85,6 +85,33 @@ export type Expense = {
   reversedAt?: PersistedTimestamp;
   reversedBy?: string;
   reversalReason?: string;
+
+  // Checkpoint 4C.3D, per the frozen docs/audits/
+  // TRIP_EXPENSE_REVERSAL_CORRECTION_PREFLIGHT_2026-09-17.md §9: a
+  // two-way, one-to-one correction link between an already-reversed
+  // Expense and its (at most one) direct replacement. Both fields are
+  // correction/audit metadata only - like status/reversedAt/reversedBy
+  // above, they never change any original financial fact (amountMinor,
+  // payerUid, splitStrategy, etc. on either document remain immutable).
+  // Both are trusted, server-computed output, written atomically by the
+  // SAME recordTripExpense transaction that creates the replacement -
+  // never independently client-suppliable, and never two independently-
+  // settable sources of truth for the same fact (§9.1).
+  //
+  // replacesExpenseId: present on the NEW (replacement) Expense only -
+  // identifies the OLD Expense this one corrects. Set once, at creation,
+  // from the client's own recordTripExpense call; absent for an ordinary
+  // (non-correction) Expense.
+  replacesExpenseId?: string;
+  // replacedByExpenseId: present on the OLD (now-reversed) Expense only,
+  // once a replacement has been created - identifies the single canonical
+  // direct replacement. Set exactly once, atomically, by the
+  // recordTripExpense transaction that successfully creates that
+  // replacement; absent until (and unless) that happens. A replacement
+  // may itself later be reversed and replaced, producing a chain
+  // (A -> B -> C) - never multiple sibling replacements of the same
+  // original (§9.2).
+  replacedByExpenseId?: string;
 };
 
 // Checkpoint 4B: reshaped to match the audit's approved flat top-level
@@ -158,6 +185,12 @@ export type CreateExpenseInput = {
   paymentSource: ExpensePaymentSource;
   sharedStashTransactionId?: string;
   occurredAt?: Date;
+  // Checkpoint 4C.3D: identifies the OLD, already-reversed Expense this
+  // new Expense corrects/replaces (see Expense.replacesExpenseId above).
+  // Omitted for ordinary (non-correction) creation. NOT
+  // replacedByExpenseId - that field is trusted server output only and is
+  // never client-suppliable on either the old or the new document.
+  replacesExpenseId?: string;
 };
 
 // Checkpoint 4B: the previous CreateExpenseSplitInput (participantUid/

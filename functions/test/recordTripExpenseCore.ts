@@ -14,7 +14,7 @@ import { randomUUID } from "node:crypto";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { deleteApp, initializeApp } from "firebase-admin/app";
 import type { App } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
+import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import type { Firestore } from "firebase-admin/firestore";
 import { HttpsError } from "firebase-functions/v2/https";
 import type { CallableRequest } from "firebase-functions/v2/https";
@@ -117,6 +117,75 @@ async function assertRejectsWithCode(
     assert.equal((err as HttpsError).code, code);
     return true;
   });
+}
+
+// Checkpoint 4C.3D helpers - correction-link (replacesExpenseId /
+// replacedByExpenseId) test fixtures.
+const FOURTH_MEMBER_UID = "fourth-member-uid";
+const SECOND_TRIP_ID = "test-trip-2";
+
+function seedSecondTrip(
+  overrides: Record<string, unknown> = {}
+): Promise<FirebaseFirestore.WriteResult> {
+  return db
+    .collection("trips")
+    .doc(SECOND_TRIP_ID)
+    .set({
+      ownerId: OWNER_UID,
+      memberIds: [OWNER_UID, MEMBER_UID],
+      title: "Second Trip",
+      location: "Elsewhere",
+      target: 500,
+      saved: 0,
+      imageUrl: "https://example.com/trip2.jpg",
+      tripStartDate: "2027-07-01",
+      ...overrides,
+    });
+}
+
+// Builds an ordinary Expense via the real recordTripExpenseCore (so its
+// creationRequest/financial facts are fully realistic), then directly
+// flips it to "reversed" via the Admin SDK - reverseTripExpense.ts itself
+// is deliberately NOT touched or imported in this checkpoint, so this is
+// the self-contained way to construct a correction TARGET fixture.
+async function createAndReverseExpense(
+  creatorUid: string,
+  reverserUid: string,
+  requestOverrides: Record<string, unknown> = {}
+): Promise<string> {
+  const result = await recordTripExpenseCore(
+    db,
+    creatorUid,
+    baseEqualRequest(requestOverrides)
+  );
+  await db
+    .collection("tripExpenses")
+    .doc(result.expenseId)
+    .update({
+      status: "reversed",
+      reversedAt: new Date(),
+      reversedBy: reverserUid,
+      reversalRequest: {clientRequestId: randomUUID(), reversalReason: null},
+    });
+  return result.expenseId;
+}
+
+function baseCorrectionRequest(
+  oldExpenseId: string,
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return baseEqualRequest({
+    replacesExpenseId: oldExpenseId,
+    clientRequestId: randomUUID(),
+    ...overrides,
+  });
+}
+
+async function getExpense(
+  expenseId: string
+): Promise<FirebaseFirestore.DocumentData | undefined> {
+  const snap = await db.collection("tripExpenses").doc(expenseId).get();
+  return snap.data();
 }
 
 describe("recordTripExpenseCore - persisted Expense/Split shape", () => {
@@ -1313,5 +1382,774 @@ describe("recordTripExpenseCore - idempotency normalization edge cases (Checkpoi
     const expensesSnap = await db.collection("tripExpenses").get();
     assert.equal(expensesSnap.size, 1);
     assert.equal(expensesSnap.docs[0]!.data().category, "Food");
+  });
+});
+
+// Checkpoint 4C.3D: replacesExpenseId / replacedByExpenseId two-way
+// correction-link addition to recordTripExpense, per docs/audits/
+// TRIP_EXPENSE_REVERSAL_CORRECTION_PREFLIGHT_2026-09-17.md §9. The frozen
+// 19-item test matrix from the checkpoint's own §20, numbered to match.
+describe("recordTripExpenseCore - correction linking, frozen 19-item matrix (Checkpoint 4C.3D §20)", () => {
+  it("1. ordinary Expense creation with NO replacesExpenseId remains fully unaffected", async () => {
+    await seedTrip();
+    const result = await recordTripExpenseCore(db, MEMBER_UID, baseEqualRequest());
+
+    const data = await getExpense(result.expenseId);
+    assert.equal("replacesExpenseId" in (data ?? {}), false);
+    assert.equal(data?.creationRequest.replacesExpenseId, null);
+  });
+
+  it("2. old Expense's original creator, still a current member, creates the replacement -> SUCCESS", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+
+    const result = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseCorrectionRequest(oldId)
+    );
+    assert.ok(result.expenseId.length > 0);
+  });
+
+  it("3. current Trip owner, not the original creator/reverser -> SUCCESS", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OTHER_MEMBER_UID);
+
+    const result = await recordTripExpenseCore(
+      db,
+      OWNER_UID,
+      baseCorrectionRequest(oldId)
+    );
+    assert.ok(result.expenseId.length > 0);
+  });
+
+  it("4. oldExpense.reversedBy, still a current member and not the original creator -> SUCCESS", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OTHER_MEMBER_UID);
+
+    const result = await recordTripExpenseCore(
+      db,
+      OTHER_MEMBER_UID,
+      baseCorrectionRequest(oldId)
+    );
+    assert.ok(result.expenseId.length > 0);
+  });
+
+  it("5. an unrelated current Trip member with NO role on the old Expense -> permission-denied before old state disclosure", async () => {
+    await seedTrip({
+      memberIds: [OWNER_UID, MEMBER_UID, OTHER_MEMBER_UID, FOURTH_MEMBER_UID],
+    });
+    const oldId = await createAndReverseExpense(OWNER_UID, OWNER_UID, {
+      payerUid: MEMBER_UID,
+      participants: [{uid: OWNER_UID}, {uid: MEMBER_UID}],
+    });
+    const oldBefore = await getExpense(oldId);
+
+    const request = baseCorrectionRequest(oldId);
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, FOURTH_MEMBER_UID, request),
+      "permission-denied"
+    );
+
+    const oldAfter = await getExpense(oldId);
+    assert.deepEqual(oldAfter, oldBefore);
+    const newSnap = await db
+      .collection("tripExpenses")
+      .doc(request.clientRequestId as string)
+      .get();
+    assert.equal(newSnap.exists, false);
+  });
+
+  it("6. the old Expense's payerUid ALONE, with no other qualifying role -> permission-denied", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(OWNER_UID, OWNER_UID, {
+      payerUid: MEMBER_UID,
+      participants: [{uid: OWNER_UID}, {uid: OTHER_MEMBER_UID}],
+    });
+    const oldBefore = await getExpense(oldId);
+
+    const request = baseCorrectionRequest(oldId);
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, MEMBER_UID, request),
+      "permission-denied"
+    );
+
+    const oldAfter = await getExpense(oldId);
+    assert.deepEqual(oldAfter, oldBefore);
+  });
+
+  it("7. a MERE participant alone, with no other qualifying role -> permission-denied", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(OWNER_UID, OWNER_UID, {
+      payerUid: MEMBER_UID,
+      participants: [
+        {uid: OWNER_UID},
+        {uid: MEMBER_UID},
+        {uid: OTHER_MEMBER_UID},
+      ],
+    });
+    const oldBefore = await getExpense(oldId);
+
+    const request = baseCorrectionRequest(oldId);
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, OTHER_MEMBER_UID, request),
+      "permission-denied"
+    );
+
+    const oldAfter = await getExpense(oldId);
+    assert.deepEqual(oldAfter, oldBefore);
+  });
+
+  it("8. both directional link fields persist atomically", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+
+    const result = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseCorrectionRequest(oldId)
+    );
+
+    const newData = await getExpense(result.expenseId);
+    const oldData = await getExpense(oldId);
+    assert.equal(newData?.replacesExpenseId, oldId);
+    assert.equal(oldData?.replacedByExpenseId, result.expenseId);
+  });
+
+  it("9. an ACTIVE old Expense cannot be replaced -> failed-precondition, only after correction authorization succeeds", async () => {
+    await seedTrip();
+    const first = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest()
+    );
+    // Deliberately never reversed - still "active".
+
+    const request = baseCorrectionRequest(first.expenseId);
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, MEMBER_UID, request), // MEMBER_UID is createdBy - authorized
+      "failed-precondition"
+    );
+
+    const oldAfter = await getExpense(first.expenseId);
+    assert.equal(oldAfter?.status, "active");
+    assert.equal("replacedByExpenseId" in (oldAfter ?? {}), false);
+  });
+
+  it("10. a cross-Trip replacement target -> failed-precondition", async () => {
+    await seedTrip();
+    await seedSecondTrip();
+    const oldIdOnSecondTrip = await createAndReverseExpense(
+      OWNER_UID,
+      OWNER_UID,
+      {
+        tripId: SECOND_TRIP_ID,
+        // SECOND_TRIP_ID's own membership is only OWNER_UID/MEMBER_UID -
+        // the default participants list (which includes OTHER_MEMBER_UID)
+        // would otherwise fail this fixture's own setup.
+        payerUid: MEMBER_UID,
+        participants: [{uid: OWNER_UID}, {uid: MEMBER_UID}],
+      }
+    );
+    const oldBefore = await getExpense(oldIdOnSecondTrip);
+
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        OWNER_UID,
+        baseCorrectionRequest(oldIdOnSecondTrip)
+      ), // tripId defaults to TRIP_ID, old Expense belongs to SECOND_TRIP_ID
+      "failed-precondition"
+    );
+
+    const oldAfter = await getExpense(oldIdOnSecondTrip);
+    assert.deepEqual(oldAfter, oldBefore);
+  });
+
+  it("11. a nonexistent old Expense reference -> failed-precondition", async () => {
+    await seedTrip();
+    const request = baseCorrectionRequest("nonexistent-old-expense-id");
+
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, MEMBER_UID, request),
+      "failed-precondition"
+    );
+
+    const newSnap = await db
+      .collection("tripExpenses")
+      .doc(request.clientRequestId as string)
+      .get();
+    assert.equal(newSnap.exists, false);
+  });
+
+  it("12. an already-replaced old Expense cannot receive a second replacement -> failed-precondition", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+    await recordTripExpenseCore(db, MEMBER_UID, baseCorrectionRequest(oldId));
+    const oldAfterFirst = await getExpense(oldId);
+
+    const secondRequest = baseCorrectionRequest(oldId);
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, MEMBER_UID, secondRequest),
+      "failed-precondition"
+    );
+
+    const oldAfterSecond = await getExpense(oldId);
+    assert.deepEqual(oldAfterSecond, oldAfterFirst);
+    const secondNewSnap = await db
+      .collection("tripExpenses")
+      .doc(secondRequest.clientRequestId as string)
+      .get();
+    assert.equal(secondNewSnap.exists, false);
+  });
+
+  it("13. two concurrent DIFFERENT replacement attempts targeting the same reversed Expense: exactly one winner, zero loser artifacts", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+    const requestA = baseCorrectionRequest(oldId);
+    const requestB = baseCorrectionRequest(oldId);
+
+    const results = await Promise.allSettled([
+      recordTripExpenseCore(db, MEMBER_UID, requestA),
+      recordTripExpenseCore(db, OWNER_UID, requestB),
+    ]);
+
+    const fulfilled = results.filter(
+      (r): r is PromiseFulfilledResult<{expenseId: string}> =>
+        r.status === "fulfilled"
+    );
+    const rejected = results.filter(
+      (r): r is PromiseRejectedResult => r.status === "rejected"
+    );
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.ok(rejected[0]!.reason instanceof HttpsError);
+    assert.equal((rejected[0]!.reason as HttpsError).code, "failed-precondition");
+
+    const winnerId = fulfilled[0]!.value.expenseId;
+    const loserRequest = winnerId === requestA.clientRequestId ? requestB : requestA;
+
+    const oldData = await getExpense(oldId);
+    assert.equal(oldData?.replacedByExpenseId, winnerId);
+    const winnerData = await getExpense(winnerId);
+    assert.equal(winnerData?.replacesExpenseId, oldId);
+
+    const loserSnap = await db
+      .collection("tripExpenses")
+      .doc(loserRequest.clientRequestId as string)
+      .get();
+    assert.equal(loserSnap.exists, false);
+    const loserSplitsSnap = await db
+      .collection("tripExpenseSplits")
+      .where("expenseId", "==", loserRequest.clientRequestId as string)
+      .get();
+    assert.equal(loserSplitsSnap.size, 0);
+  });
+
+  it("14. exact replacement replay: success, no duplicate Splits, no rewrite of either link field", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+    const request = baseCorrectionRequest(oldId);
+    const first = await recordTripExpenseCore(db, MEMBER_UID, request);
+
+    const oldBefore = await getExpense(oldId);
+    const newBefore = await getExpense(first.expenseId);
+    const splitsBefore = (
+      await db
+        .collection("tripExpenseSplits")
+        .where("expenseId", "==", first.expenseId)
+        .get()
+    ).size;
+
+    const replay = await recordTripExpenseCore(db, MEMBER_UID, request);
+    assert.equal(replay.expenseId, first.expenseId);
+
+    const oldAfter = await getExpense(oldId);
+    const newAfter = await getExpense(first.expenseId);
+    assert.deepEqual(oldAfter, oldBefore);
+    assert.deepEqual(newAfter, newBefore);
+    const splitsAfter = (
+      await db
+        .collection("tripExpenseSplits")
+        .where("expenseId", "==", first.expenseId)
+        .get()
+    ).size;
+    assert.equal(splitsAfter, splitsBefore);
+  });
+
+  it("15. same new clientRequestId + same ordinary facts + DIFFERENT replacesExpenseId -> already-exists, through the generic conflicting-request path", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(OTHER_MEMBER_UID, OWNER_UID);
+    const clientRequestId = randomUUID();
+    await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({clientRequestId})
+    );
+
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseEqualRequest({clientRequestId, replacesExpenseId: oldId})
+      ),
+      "already-exists"
+    );
+
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(
+      expensesSnap.docs.filter((d) => d.id === clientRequestId).length,
+      1
+    );
+    const stored = await getExpense(clientRequestId);
+    assert.equal("replacesExpenseId" in (stored ?? {}), false);
+  });
+
+  it("16. omitted replacesExpenseId stores creationRequest.replacesExpenseId === null; ordinary replay remains successful", async () => {
+    await seedTrip();
+    const request = baseEqualRequest();
+    const first = await recordTripExpenseCore(db, MEMBER_UID, request);
+
+    const data = await getExpense(first.expenseId);
+    assert.equal(data?.creationRequest.replacesExpenseId, null);
+
+    const replay = await recordTripExpenseCore(db, MEMBER_UID, request);
+    assert.equal(replay.expenseId, first.expenseId);
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+  });
+
+  it("17. archived Trip replacement attempt -> failed-precondition through the existing, unmodified archive gate", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+    await db
+      .collection("trips")
+      .doc(TRIP_ID)
+      .update({archivedAt: new Date(), archivedBy: OWNER_UID});
+
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, OWNER_UID, baseCorrectionRequest(oldId)),
+      "failed-precondition"
+    );
+
+    const oldAfter = await getExpense(oldId);
+    assert.equal("replacedByExpenseId" in (oldAfter ?? {}), false);
+  });
+
+  it("18. old.createdBy removed from the Trip before replacement loses creator-based authority unless independently owner or current-member reversedBy", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OTHER_MEMBER_UID);
+    await db
+      .collection("trips")
+      .doc(TRIP_ID)
+      .update({memberIds: [OWNER_UID, OTHER_MEMBER_UID]}); // MEMBER_UID removed
+
+    const request = baseCorrectionRequest(oldId);
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, MEMBER_UID, request),
+      "permission-denied"
+    );
+  });
+
+  it("19. old.reversedBy removed from the Trip before replacement loses reverser-based authority unless independently owner or current-member createdBy", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(OTHER_MEMBER_UID, MEMBER_UID);
+    await db
+      .collection("trips")
+      .doc(TRIP_ID)
+      .update({memberIds: [OWNER_UID, OTHER_MEMBER_UID]}); // MEMBER_UID removed
+
+    const request = baseCorrectionRequest(oldId);
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, MEMBER_UID, request),
+      "permission-denied"
+    );
+  });
+});
+
+describe("recordTripExpenseCore - legacy replay compatibility (Checkpoint 4C.3D §21)", () => {
+  it("LEGACY A: a pre-4C.3D Expense with NO stored replacesExpenseId key replays successfully with an omitted (null) incoming value, zero rewrite", async () => {
+    await seedTrip();
+    const clientRequestId = randomUUID();
+    const first = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({clientRequestId})
+    );
+    // Simulate a document created before this checkpoint - no
+    // replacesExpenseId key at all in the stored creationRequest.
+    await db
+      .collection("tripExpenses")
+      .doc(first.expenseId)
+      .update({"creationRequest.replacesExpenseId": FieldValue.delete()});
+
+    const beforeExpense = await getExpense(first.expenseId);
+    assert.equal("replacesExpenseId" in beforeExpense!.creationRequest, false);
+    const beforeSplits = (
+      await db
+        .collection("tripExpenseSplits")
+        .where("expenseId", "==", first.expenseId)
+        .get()
+    ).size;
+
+    const replay = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({clientRequestId})
+    );
+    assert.equal(replay.expenseId, first.expenseId);
+
+    const afterExpense = await getExpense(first.expenseId);
+    assert.deepEqual(afterExpense, beforeExpense);
+    // No migration/rewrite - the key is still absent, not backfilled.
+    assert.equal("replacesExpenseId" in afterExpense!.creationRequest, false);
+    const afterSplits = (
+      await db
+        .collection("tripExpenseSplits")
+        .where("expenseId", "==", first.expenseId)
+        .get()
+    ).size;
+    assert.equal(afterSplits, beforeSplits);
+  });
+
+  it("LEGACY B: the same legacy stored Expense with a NON-NULL incoming replacesExpenseId is already-exists, never a replay", async () => {
+    await seedTrip();
+    const clientRequestId = randomUUID();
+    const first = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({clientRequestId})
+    );
+    await db
+      .collection("tripExpenses")
+      .doc(first.expenseId)
+      .update({"creationRequest.replacesExpenseId": FieldValue.delete()});
+    const before = await getExpense(first.expenseId);
+
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseEqualRequest({
+          clientRequestId,
+          replacesExpenseId: "some-old-expense-id",
+        })
+      ),
+      "already-exists"
+    );
+
+    const after = await getExpense(first.expenseId);
+    assert.deepEqual(after, before);
+  });
+
+  it("LEGACY C: a malformed stored replacesExpenseId is NEVER normalized to null and always fails exact-match -> already-exists", async () => {
+    await seedTrip();
+    const malformedValues: unknown[] = [123, {nested: true}, "a/b"];
+    for (const malformed of malformedValues) {
+      const clientRequestId = randomUUID();
+      const first = await recordTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseEqualRequest({clientRequestId})
+      );
+      await db
+        .collection("tripExpenses")
+        .doc(first.expenseId)
+        .update({"creationRequest.replacesExpenseId": malformed});
+      const before = await getExpense(first.expenseId);
+
+      // Ordinary (omitted -> null) replay must NOT match a malformed
+      // stored value.
+      await assertRejectsWithCode(
+        recordTripExpenseCore(
+          db,
+          MEMBER_UID,
+          baseEqualRequest({clientRequestId})
+        ),
+        "already-exists"
+      );
+
+      const after = await getExpense(first.expenseId);
+      assert.deepEqual(after, before);
+    }
+  });
+});
+
+describe("recordTripExpenseCore - correction-link information-leak matrix (Checkpoint 4C.3D §22)", () => {
+  it("unrelated current member vs. an ACTIVE old target -> permission-denied", async () => {
+    await seedTrip({
+      memberIds: [OWNER_UID, MEMBER_UID, OTHER_MEMBER_UID, FOURTH_MEMBER_UID],
+    });
+    const first = await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest()
+    );
+
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        FOURTH_MEMBER_UID,
+        baseCorrectionRequest(first.expenseId)
+      ),
+      "permission-denied"
+    );
+  });
+
+  it("unrelated current member vs. a validly-REVERSED old target -> the identical permission-denied", async () => {
+    await seedTrip({
+      memberIds: [OWNER_UID, MEMBER_UID, OTHER_MEMBER_UID, FOURTH_MEMBER_UID],
+    });
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        FOURTH_MEMBER_UID,
+        baseCorrectionRequest(oldId)
+      ),
+      "permission-denied"
+    );
+  });
+
+  it("unrelated current member vs. an ALREADY-REPLACED old target -> the identical permission-denied", async () => {
+    await seedTrip({
+      memberIds: [OWNER_UID, MEMBER_UID, OTHER_MEMBER_UID, FOURTH_MEMBER_UID],
+    });
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+    await recordTripExpenseCore(db, MEMBER_UID, baseCorrectionRequest(oldId));
+
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        FOURTH_MEMBER_UID,
+        baseCorrectionRequest(oldId)
+      ),
+      "permission-denied"
+    );
+  });
+
+  it("a nonexistent target and a cross-Trip target remain failed-precondition per the frozen 5A/5B ordering, regardless of caller authorization", async () => {
+    await seedTrip();
+    await seedSecondTrip();
+    const crossTripOldId = await createAndReverseExpense(
+      OWNER_UID,
+      OWNER_UID,
+      {
+        tripId: SECOND_TRIP_ID,
+        payerUid: MEMBER_UID,
+        participants: [{uid: OWNER_UID}, {uid: MEMBER_UID}],
+      }
+    );
+
+    // OWNER_UID is the Trip's own owner - fully authorized for ordinary
+    // creation, and would even qualify for correction-link authority on
+    // SECOND_TRIP_ID's own Expense - yet 5A/5B still reject first.
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        OWNER_UID,
+        baseCorrectionRequest("nonexistent-old-expense-id")
+      ),
+      "failed-precondition"
+    );
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        OWNER_UID,
+        baseCorrectionRequest(crossTripOldId)
+      ),
+      "failed-precondition"
+    );
+  });
+});
+
+describe("recordTripExpenseCore - replacesExpenseId input validation (Checkpoint 4C.3D §24)", () => {
+  const invalidCases: Array<[string, unknown]> = [
+    ["empty string", ""],
+    ['"."', "."],
+    ['".."', ".."],
+    ['contains "/"', "a/b"],
+    ["exceeds 1500 UTF-8 bytes", "x".repeat(1501)],
+    ["non-string (number)", 123],
+    ["non-string (object)", {foo: "bar"}],
+  ];
+  for (const [label, badValue] of invalidCases) {
+    it(`replacesExpenseId (${label}) is rejected invalid-argument before any transaction mutation`, async () => {
+      await seedTrip();
+      const request = baseEqualRequest({replacesExpenseId: badValue});
+
+      await assertRejectsWithCode(
+        recordTripExpenseCore(db, MEMBER_UID, request),
+        "invalid-argument"
+      );
+
+      const snap = await db
+        .collection("tripExpenses")
+        .doc(request.clientRequestId as string)
+        .get();
+      assert.equal(snap.exists, false);
+    });
+  }
+});
+
+// Checkpoint 4C.3D.1: test-fidelity follow-up only - proves that exact
+// replay of an ALREADY-CREATED replacement Expense is entirely
+// self-contained, exactly like ordinary (non-correction) replay already
+// is. The replay branch (recordTripExpenseCore's existing-Expense check)
+// runs BEFORE the D2 correction-target block is ever reached, so none of
+// these state changes to the old correction target or the Trip should be
+// able to affect a caller reconciling their own already-committed
+// replacement request.
+describe("recordTripExpenseCore - exact replacement replay independence (Checkpoint 4C.3D.1)", () => {
+  it("A. exact replay succeeds even after the old correction target is deleted entirely", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+    const request = baseCorrectionRequest(oldId);
+    const first = await recordTripExpenseCore(db, MEMBER_UID, request);
+
+    const oldAfterCreate = await getExpense(oldId);
+    assert.equal(oldAfterCreate?.replacedByExpenseId, first.expenseId);
+    const newBefore = await getExpense(first.expenseId);
+    assert.equal(newBefore?.replacesExpenseId, oldId);
+    const splitsBefore = (
+      await db
+        .collection("tripExpenseSplits")
+        .where("expenseId", "==", first.expenseId)
+        .get()
+    ).size;
+
+    // TEST-ONLY: delete the old correction target entirely. A genuinely
+    // NEW request against this same replacesExpenseId would now fail
+    // failed-precondition at step 5A - but this is a replay, which must
+    // never reach 5A at all.
+    await db.collection("tripExpenses").doc(oldId).delete();
+
+    const replay = await recordTripExpenseCore(db, MEMBER_UID, request);
+    assert.equal(replay.expenseId, first.expenseId);
+
+    const newAfter = await getExpense(first.expenseId);
+    assert.deepEqual(newAfter, newBefore);
+    const splitsAfter = (
+      await db
+        .collection("tripExpenseSplits")
+        .where("expenseId", "==", first.expenseId)
+        .get()
+    ).size;
+    assert.equal(splitsAfter, splitsBefore);
+    const expensesSnap = await db.collection("tripExpenses").get();
+    // Only B remains - A was deleted, and no duplicate/second B exists.
+    assert.equal(expensesSnap.size, 1);
+    assert.equal(expensesSnap.docs[0]!.id, first.expenseId);
+  });
+
+  it("B. exact replay succeeds even after the Trip becomes archived", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+    const request = baseCorrectionRequest(oldId);
+    const first = await recordTripExpenseCore(db, MEMBER_UID, request);
+
+    const newBefore = await getExpense(first.expenseId);
+    const oldBefore = await getExpense(oldId);
+    const splitsBefore = (
+      await db
+        .collection("tripExpenseSplits")
+        .where("expenseId", "==", first.expenseId)
+        .get()
+    ).size;
+
+    await db
+      .collection("trips")
+      .doc(TRIP_ID)
+      .update({archivedAt: new Date(), archivedBy: OWNER_UID});
+
+    const replay = await recordTripExpenseCore(db, MEMBER_UID, request);
+    assert.equal(replay.expenseId, first.expenseId);
+
+    const newAfter = await getExpense(first.expenseId);
+    const oldAfter = await getExpense(oldId);
+    assert.deepEqual(newAfter, newBefore);
+    assert.deepEqual(oldAfter, oldBefore);
+    assert.equal(oldAfter?.replacedByExpenseId, first.expenseId);
+    const splitsAfter = (
+      await db
+        .collection("tripExpenseSplits")
+        .where("expenseId", "==", first.expenseId)
+        .get()
+    ).size;
+    assert.equal(splitsAfter, splitsBefore);
+  });
+
+  it("C. exact replay succeeds even after the replacement's own creator is removed from the Trip", async () => {
+    await seedTrip();
+    // MEMBER_UID's authority to claim the correction slot comes from
+    // being the OLD Expense's createdBy while still a current member -
+    // exactly the kind of authority the checkpoint asks to prove does
+    // NOT get re-evaluated on replay.
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+    const request = baseCorrectionRequest(oldId);
+    const first = await recordTripExpenseCore(db, MEMBER_UID, request);
+
+    const newBefore = await getExpense(first.expenseId);
+    const oldBefore = await getExpense(oldId);
+
+    await db
+      .collection("trips")
+      .doc(TRIP_ID)
+      .update({memberIds: [OWNER_UID, OTHER_MEMBER_UID]}); // MEMBER_UID removed
+
+    const replay = await recordTripExpenseCore(db, MEMBER_UID, request);
+    assert.equal(replay.expenseId, first.expenseId);
+
+    const newAfter = await getExpense(first.expenseId);
+    const oldAfter = await getExpense(oldId);
+    assert.deepEqual(newAfter, newBefore);
+    assert.deepEqual(oldAfter, oldBefore);
+  });
+
+  it("comparison: after Trip archive, a NON-EXACT request against the same replacement does NOT inherit replay behavior", async () => {
+    await seedTrip();
+    const oldId = await createAndReverseExpense(MEMBER_UID, OWNER_UID);
+    // A second, independent reversed Expense to serve as a DIFFERENT
+    // correction target - created before archiving, since ordinary
+    // creation (inside createAndReverseExpense) is itself blocked on an
+    // archived Trip.
+    const oldId2 = await createAndReverseExpense(OWNER_UID, OWNER_UID, {
+      payerUid: MEMBER_UID,
+      participants: [
+        {uid: OWNER_UID},
+        {uid: MEMBER_UID},
+        {uid: OTHER_MEMBER_UID},
+      ],
+    });
+    const request = baseCorrectionRequest(oldId);
+    const first = await recordTripExpenseCore(db, MEMBER_UID, request);
+
+    await db
+      .collection("trips")
+      .doc(TRIP_ID)
+      .update({archivedAt: new Date(), archivedBy: OWNER_UID});
+
+    // Same creator, same clientRequestId, same ordinary facts, but a
+    // DIFFERENT replacesExpenseId - a genuine conflict, never a replay -
+    // resolved through the existing generic already-exists path.
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, MEMBER_UID, {
+        ...request,
+        replacesExpenseId: oldId2,
+      }),
+      "already-exists"
+    );
+
+    // A genuinely NEW clientRequestId against the archived Trip remains
+    // blocked by the existing, unmodified archive gate - replay's own
+    // narrowness never leaks into ordinary new-request handling.
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, MEMBER_UID, baseCorrectionRequest(oldId)),
+      "failed-precondition"
+    );
+
+    const bAfter = await getExpense(first.expenseId);
+    assert.equal(bAfter?.replacesExpenseId, oldId);
   });
 });
