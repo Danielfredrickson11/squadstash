@@ -794,7 +794,7 @@ export default function TripDetails() {
           </Text>
 
           <Pressable
-            onPress={() => router.back()}
+            onPress={() => router.replace("/(tabs)/trips")}
             style={[styles.primaryBtn, { backgroundColor: theme.colors.primary }]}
           >
             <Text style={styles.primaryBtnText}>Go back</Text>
@@ -847,7 +847,7 @@ export default function TripDetails() {
                   photo regardless of the active app theme. */}
               <View style={styles.heroTopRow}>
                 <Pressable
-                  onPress={() => router.back()}
+                  onPress={() => router.replace("/(tabs)/trips")}
                   accessibilityRole="button"
                   accessibilityLabel="Back"
                   style={({ pressed }) => [styles.navPill, pressed && { opacity: 0.85 }]}
@@ -1284,7 +1284,6 @@ export default function TripDetails() {
                       onPress={startCreateStash}
                       style={({ pressed }) => [
                         styles.primaryActionBtn,
-                        styles.inlinePrimaryBtn,
                         { backgroundColor: colors.mintDark },
                         pressed && { opacity: 0.9 },
                       ]}
@@ -1940,7 +1939,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   secondaryActionText: { fontSize: 13, fontWeight: "800" },
-  inlinePrimaryBtn: { flex: undefined, alignSelf: "flex-start", paddingHorizontal: spacing.lg, marginTop: spacing.sm },
 
   // --- Cards ------------------------------------------------------------
   card: {
@@ -1984,7 +1982,7 @@ const styles = StyleSheet.create({
   remainingText: { marginTop: spacing.sm, fontSize: 12, fontWeight: "700" },
 
   stashLoadingWrap: { paddingVertical: spacing.md, alignItems: "center" },
-  stashEmptyWrap: { marginTop: spacing.xs },
+  stashEmptyWrap: { marginTop: spacing.xs, gap: spacing.sm },
 
   // --- Quick Analysis -----------------------------------------------
   groupLabel: {
