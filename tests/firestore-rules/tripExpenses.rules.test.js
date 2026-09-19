@@ -563,3 +563,64 @@ describe('firestore.rules: tripExpenses/tripExpenseSplits - query isolation (Rul
     );
   });
 });
+
+// Checkpoint 4D.1B: proves the EXACT two-filter query shape
+// src/services/firebase/expenses.ts's own fetchExpenseSplitsForExpense
+// issues - where("tripId","==",tripId).where("expenseId","==",expenseId) -
+// is itself Rules-compatible against the real, unmodified firestore.rules
+// (Splits are authorized strictly via resource.data.tripId, never
+// expenseId alone, so the tripId filter is what the Rules engine actually
+// checks; the expenseId filter narrows the result set but contributes no
+// authority of its own). This is a Rules-compatibility/query-isolation
+// proof only, NOT a production composite-index proof - a query combining
+// only equality filters (no orderBy on a different field, no inequality)
+// never requires a manual composite index, but this suite does not run
+// against production index configuration and firestore.indexes.json is
+// intentionally left untouched by this checkpoint.
+describe('firestore.rules: tripExpenseSplits - two-filter (tripId + expenseId) query shape (Checkpoint 4D.1B)', () => {
+  const OTHER_EXPENSE_ID = 'other-expense';
+  const OTHER_SPLIT_ID = 'other-split';
+
+  beforeEach(async () => {
+    await seedTrip(testEnv, TRIP_ID, validTripData());
+    await seedSplit(SPLIT_ID, validSplitData());
+    // A second Split for a DIFFERENT Expense, in the SAME Trip - proves
+    // the query's own expenseId filter (not just the Rule) isolates
+    // results to the requested Expense.
+    await seedSplit(
+      OTHER_SPLIT_ID,
+      validSplitData({ expenseId: OTHER_EXPENSE_ID })
+    );
+  });
+
+  it('A. current Trip member: the exact two-filter query succeeds', async () => {
+    const snap = await assertSucceeds(
+      splitsCollection(asMember())
+        .where('tripId', '==', TRIP_ID)
+        .where('expenseId', '==', EXPENSE_ID)
+        .get()
+    );
+    expect(snap.docs.map((d) => d.id)).toEqual([SPLIT_ID]);
+  });
+
+  it('B. outsider: the exact two-filter query is denied', async () => {
+    await assertFails(
+      splitsCollection(asOutsider())
+        .where('tripId', '==', TRIP_ID)
+        .where('expenseId', '==', EXPENSE_ID)
+        .get()
+    );
+  });
+
+  it("C. the query returns only the requested Expense's Split(s), excluding another Split for a different Expense in the same Trip", async () => {
+    const snap = await assertSucceeds(
+      splitsCollection(asMember())
+        .where('tripId', '==', TRIP_ID)
+        .where('expenseId', '==', EXPENSE_ID)
+        .get()
+    );
+    const ids = snap.docs.map((d) => d.id);
+    expect(ids).toContain(SPLIT_ID);
+    expect(ids).not.toContain(OTHER_SPLIT_ID);
+  });
+});
