@@ -490,6 +490,122 @@ describe("recordTripExpenseCore - archive interaction (Checkpoint 4C.1A/4C.1B or
   });
 });
 
+// Checkpoint 4C.2D: the previous transaction ordering required
+// tripSnap.exists UNCONDITIONALLY, before the existing-Expense replay/
+// collision branch was ever evaluated - so a caller reconciling their own
+// already-committed request against an unexpectedly missing parent Trip
+// incorrectly received not-found instead of their own successful replay
+// (or the generic already-exists a facts/creator mismatch already
+// produces). Corrected: the existing-Expense branch now runs first,
+// unconditionally on parent Trip existence; only a GENUINELY NEW Expense
+// (no existing document for this clientRequestId) requires the parent
+// Trip to exist at all.
+describe("recordTripExpenseCore - parent-independent replay (Checkpoint 4C.2D)", () => {
+  it("A. exact replay succeeds even after the parent Trip document is deleted entirely", async () => {
+    await seedTrip();
+    const request = baseEqualRequest();
+    const first = await recordTripExpenseCore(db, MEMBER_UID, request);
+
+    const expenseBefore = (
+      await db.collection("tripExpenses").doc(first.expenseId).get()
+    ).data();
+    const splitsBefore = (await db.collection("tripExpenseSplits").get()).docs
+      .map((d) => ({id: d.id, data: d.data()}))
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
+    await db.collection("trips").doc(TRIP_ID).delete();
+
+    const replay = await recordTripExpenseCore(db, MEMBER_UID, request);
+    assert.equal(replay.expenseId, first.expenseId);
+
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+    const expenseAfter = (
+      await db.collection("tripExpenses").doc(first.expenseId).get()
+    ).data();
+    assert.deepEqual(expenseAfter, expenseBefore);
+
+    const splitsAfter = (await db.collection("tripExpenseSplits").get()).docs
+      .map((d) => ({id: d.id, data: d.data()}))
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    assert.deepEqual(splitsAfter, splitsBefore);
+  });
+
+  it("B. same creator + same clientRequestId + a changed normalized fact, after the parent Trip is deleted, is already-exists (never not-found), and writes nothing", async () => {
+    await seedTrip();
+    const clientRequestId = randomUUID();
+    await recordTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseEqualRequest({clientRequestId})
+    );
+    const expenseBefore = (
+      await db.collection("tripExpenses").doc(clientRequestId).get()
+    ).data();
+    const splitsBefore = (await db.collection("tripExpenseSplits").get())
+      .size;
+
+    await db.collection("trips").doc(TRIP_ID).delete();
+
+    await assertRejectsWithCode(
+      recordTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseEqualRequest({clientRequestId, amountMinor: 12000})
+      ),
+      "already-exists"
+    );
+
+    const expenseAfter = (
+      await db.collection("tripExpenses").doc(clientRequestId).get()
+    ).data();
+    assert.deepEqual(expenseAfter, expenseBefore);
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+    const splitsAfter = (await db.collection("tripExpenseSplits").get())
+      .size;
+    assert.equal(splitsAfter, splitsBefore);
+  });
+
+  it("C. a DIFFERENT creator submitting the same clientRequestId and otherwise identical facts, after the parent Trip is deleted, is already-exists (never not-found), disclosing nothing about which fact mismatched", async () => {
+    await seedTrip();
+    const clientRequestId = randomUUID();
+    const request = baseEqualRequest({clientRequestId});
+    await recordTripExpenseCore(db, MEMBER_UID, request);
+    const expenseBefore = (
+      await db.collection("tripExpenses").doc(clientRequestId).get()
+    ).data();
+
+    await db.collection("trips").doc(TRIP_ID).delete();
+
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, OTHER_MEMBER_UID, request),
+      "already-exists"
+    );
+
+    const expenseAfter = (
+      await db.collection("tripExpenses").doc(clientRequestId).get()
+    ).data();
+    assert.deepEqual(expenseAfter, expenseBefore);
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 1);
+  });
+
+  it("D. a genuinely NEW Expense (no existing document for this clientRequestId) against a missing parent Trip is still not-found, with zero Expense/Split writes - the fix does not make new creation tolerant of a missing parent", async () => {
+    // Deliberately no seedTrip() at all - the Trip never existed, and no
+    // Expense with this clientRequestId exists either.
+    await assertRejectsWithCode(
+      recordTripExpenseCore(db, MEMBER_UID, baseEqualRequest()),
+      "not-found"
+    );
+
+    const expensesSnap = await db.collection("tripExpenses").get();
+    assert.equal(expensesSnap.size, 0);
+    const splitsSnap = await db.collection("tripExpenseSplits").get();
+    assert.equal(splitsSnap.size, 0);
+  });
+});
+
 describe("recordTripExpenseCore - membership validation", () => {
   it("15. non-member payer -> rejected", async () => {
     await seedTrip();
@@ -697,6 +813,12 @@ describe("splitDocumentId - collision-safe derivation (Checkpoint 4C.1B)", () =>
     for (let i = 0; i < 5; i++) {
       assert.equal(splitDocumentId("expense-7", "uid-9"), expected);
     }
+  });
+
+  it("25. the SAME participant uid across two DIFFERENT Expense ids produces two DIFFERENT split document ids (Checkpoint 4C.2D evidence gap)", () => {
+    const idOnExpenseA = splitDocumentId("expense-A", "member-1");
+    const idOnExpenseB = splitDocumentId("expense-B", "member-1");
+    assert.notEqual(idOnExpenseA, idOnExpenseB);
   });
 });
 

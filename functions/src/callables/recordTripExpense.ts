@@ -285,24 +285,25 @@ export async function recordTripExpenseCore(
     const existingExpenseSnap = await tx.get(expenseRef);
     const tripSnap = await tx.get(tripRef);
 
-    // A. Trip existence handling.
-    if (!tripSnap.exists) {
-      throw new HttpsError("not-found", "No trip found for the given tripId.");
-    }
-    const tripData = tripSnap.data() as FirebaseFirestore.DocumentData;
-
-    // B. Existing Expense / idempotent replay FIRST (preflight §5.1/§7
+    // A. Existing Expense / idempotent replay FIRST (preflight §5.1/§7
     // step 3) - evaluated entirely from data already loaded above, no
     // additional read. Bound to BOTH the original creator and an exact
     // normalized-facts match; a mismatch on either produces the identical
     // already-exists outcome (no way for a caller to distinguish "someone
     // else already used this id" from "you used this id for something
-    // different" - a deliberate anti-enumeration property). This branch
-    // deliberately runs BEFORE any membership/archive check: the original
-    // creator must be able to reconcile their own already-committed
-    // request even if the Trip was later archived or they were later
-    // removed from Trip membership - that is historical reconciliation,
-    // not a fresh authorization decision.
+    // different" - a deliberate anti-enumeration property). Checkpoint
+    // 4C.2D correction: this branch must run BEFORE the parent Trip's own
+    // EXISTENCE is even required, not merely before its membership/archive
+    // state is consulted (the previous ordering here required
+    // tripSnap.exists unconditionally, ahead of this branch, which broke
+    // parent-independent replay for a caller reconciling their own
+    // already-committed request against an unexpectedly missing parent
+    // Trip). The original creator must be able to reconcile their own
+    // already-committed request even if the Trip was later archived, they
+    // were later removed from Trip membership, or the parent Trip document
+    // itself is unexpectedly missing - that is historical reconciliation,
+    // not a fresh authorization decision, and must not depend on current
+    // parent state (including its mere existence) at all.
     if (existingExpenseSnap.exists) {
       const stored =
         existingExpenseSnap.data() as FirebaseFirestore.DocumentData;
@@ -317,6 +318,15 @@ export async function recordTripExpenseCore(
       }
       return {expenseId: input.clientRequestId};
     }
+
+    // B. Only for a GENUINELY NEW Expense (no existing document with this
+    // clientRequestId): the parent Trip must exist. Checkpoint 4C.2D:
+    // evaluated strictly AFTER the replay/collision branch above, never
+    // before it.
+    if (!tripSnap.exists) {
+      throw new HttpsError("not-found", "No trip found for the given tripId.");
+    }
+    const tripData = tripSnap.data() as FirebaseFirestore.DocumentData;
 
     // C. For a NEW Expense: validate caller is a current Trip member,
     // using isCurrentTripMember()'s own missing-safe/malformed-safe
