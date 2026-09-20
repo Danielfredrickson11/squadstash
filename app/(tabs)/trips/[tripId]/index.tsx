@@ -30,6 +30,8 @@ import {
   generateBucketClientRequestId,
   subscribeToBucketById,
 } from "../../../../src/services/firebase/buckets";
+import { subscribeToExpensesForTrip } from "../../../../src/services/firebase/expenses";
+import { subscribeToPublicUsersByIdsChunked } from "../../../../src/services/firebase/users";
 import {
   generateSavingsClientRequestId,
   MAX_TRANSACTION_NOTE_LENGTH,
@@ -54,7 +56,9 @@ import {
   type PendingMoneyActionRequest,
 } from "../../../../src/domain/savingsMoneyAction";
 import { useSavingsMoneyAction } from "../../../../src/hooks/useSavingsMoneyAction";
-import type { Bucket, SavingsTransactionType, Trip } from "../../../../src/types/domain";
+import type { Bucket, Expense, PublicProfile, SavingsTransactionType, Trip } from "../../../../src/types/domain";
+import { initialsFromName } from "../../../../components/buckets/AvatarCircle";
+import { ExpenseRow, type ExpenseRowPayer } from "../../../../components/expenses/ExpenseRow";
 
 const FALLBACK_IMAGE =
   "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=60";
@@ -769,6 +773,165 @@ export default function TripDetails() {
       })
     : null;
 
+  // ==========================================================================
+  // Checkpoint 4D.2: EXPENSES summary card. Independent of the Trip fetch
+  // above (fetchTrip/loading) - the rest of Trip Detail never waits on
+  // Expense loading, per the checkpoint's own frozen requirement.
+  // subscribeToExpensesForTrip is LIVE (Checkpoint 4D.1B) and already
+  // returns history in frozen order (occurredAt ?? createdAt descending,
+  // id tie-break) - never re-sorted here. Reversed/correction records are
+  // never filtered out - history stays historical truth.
+  //
+  // Retry (terminal onSnapshot error): a `expenseRetryNonce` bump tears
+  // down the dead listener (via the ref) and re-runs this effect, which
+  // attaches a genuinely NEW subscribeToExpensesForTrip listener - never
+  // assumes Firestore silently recovers a terminal listener error on its
+  // own.
+  // ==========================================================================
+  type ExpenseHistoryState =
+    | { status: "loading" }
+    | { status: "error" }
+    | { status: "ready"; expenses: Expense[] };
+
+  const [expenseState, setExpenseState] = useState<ExpenseHistoryState>({ status: "loading" });
+  const expenseUnsubRef = useRef<(() => void) | null>(null);
+  const [expenseRetryNonce, setExpenseRetryNonce] = useState(0);
+  const retryExpenses = useCallback(() => setExpenseRetryNonce((n) => n + 1), []);
+
+  useEffect(() => {
+    expenseUnsubRef.current?.();
+    expenseUnsubRef.current = null;
+    if (!tripId) return undefined;
+    setExpenseState({ status: "loading" });
+    expenseUnsubRef.current = subscribeToExpensesForTrip(
+      tripId,
+      (expenses) => setExpenseState({ status: "ready", expenses }),
+      (err) => {
+        console.error("Expense history subscription error:", err);
+        setExpenseState({ status: "error" });
+      }
+    );
+    return () => {
+      expenseUnsubRef.current?.();
+      expenseUnsubRef.current = null;
+    };
+  }, [tripId, expenseRetryNonce]);
+
+  // Summary card only ever shows the 3 most recent - deriving the payer
+  // uid set from exactly this rendered slice (not the whole subscribed
+  // list) avoids resolving profiles for rows never shown. Wrapped in its
+  // own useMemo so its identity is stable across renders that don't
+  // actually change it (a plain conditional would produce a new []
+  // literal on every non-"ready" render, which would make the payerUids
+  // useMemo below think its dependency changed every time).
+  const recentExpenses = useMemo(
+    () => (expenseState.status === "ready" ? expenseState.expenses.slice(0, 3) : []),
+    [expenseState]
+  );
+
+  // Checkpoint 4D.2 §18/§19/§20: payer-profile resolution. Derived from
+  // currently-RENDERED member_out_of_pocket Expenses' payerUid, never
+  // from Trip.memberIds (a former member may still appear in historical
+  // Expense facts). A profile failure never hides Expense rows - it only
+  // degrades to generic "Trip member" labels + a small, independent
+  // Retry, per §20.
+  type PayerProfileState =
+    | { status: "loading" }
+    | { status: "error" }
+    | { status: "ready"; profiles: Map<string, PublicProfile> };
+
+  const payerUids = useMemo(() => {
+    const uids = new Set<string>();
+    recentExpenses.forEach((expense) => {
+      if (expense.paymentSource === "member_out_of_pocket" && expense.payerUid) {
+        uids.add(expense.payerUid);
+      }
+    });
+    return Array.from(uids).sort();
+  }, [recentExpenses]);
+  const payerUidsKey = payerUids.join("|");
+
+  const [profileState, setProfileState] = useState<PayerProfileState>({ status: "loading" });
+  const profileUnsubRef = useRef<(() => void) | null>(null);
+  const [profileRetryNonce, setProfileRetryNonce] = useState(0);
+  const retryPayerProfiles = useCallback(() => setProfileRetryNonce((n) => n + 1), []);
+
+  useEffect(() => {
+    profileUnsubRef.current?.();
+    profileUnsubRef.current = null;
+    setProfileState({ status: "loading" });
+    if (payerUids.length === 0) {
+      setProfileState({ status: "ready", profiles: new Map() });
+      return undefined;
+    }
+    profileUnsubRef.current = subscribeToPublicUsersByIdsChunked(
+      payerUids,
+      (profiles) => setProfileState({ status: "ready", profiles: new Map(profiles.map((p) => [p.uid, p])) }),
+      (err) => {
+        console.error("Expense payer profile subscription error:", err);
+        setProfileState({ status: "error" });
+      }
+    );
+    return () => {
+      profileUnsubRef.current?.();
+      profileUnsubRef.current = null;
+    };
+    // payerUidsKey is the real dependency (a stable primitive derived from
+    // payerUids' content) - payerUids itself is included so the effect
+    // body always closes over the exact array that produced the key.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [payerUidsKey, profileRetryNonce]);
+
+  // Disambiguates multiple simultaneously-missing profiles ("Trip member
+  // 1", "Trip member 2", …) in stable (sorted-uid) order, per §19 - never
+  // all rendered as the identical unlabeled "Trip member" with no way to
+  // tell them apart. Only meaningful once profiles have actually
+  // resolved; empty otherwise (the loading/error states never consult
+  // this map - see resolvePayer below).
+  const missingPayerLabels = useMemo(() => {
+    const labels = new Map<string, string>();
+    if (profileState.status !== "ready") return labels;
+    const missing = payerUids.filter((uid) => !profileState.profiles.get(uid)?.displayName?.trim());
+    missing.forEach((uid, i) => {
+      labels.set(uid, missing.length > 1 ? `Trip member ${i + 1}` : "Trip member");
+    });
+    return labels;
+  }, [profileState, payerUids]);
+
+  const resolvePayer = useCallback(
+    (expense: Expense): ExpenseRowPayer => {
+      if (expense.paymentSource === "shared_stash") return { kind: "shared_stash" };
+
+      const uid = expense.payerUid;
+      if (!uid) return { kind: "member", avatarLabel: "Trip member", nameLabel: "Trip member" };
+
+      if (profileState.status === "loading") {
+        // Checkpoint 4D.2 §21: AvatarCircle's own `label` prop takes the
+        // frozen "Loading member"/"Trip member" copy directly (never a
+        // UID-derived initials fallback) - the circle's own overflow:
+        // hidden clips it exactly like a normal short label would.
+        return { kind: "member", avatarLabel: "Loading member", nameLabel: "Loading member…" };
+      }
+      if (profileState.status === "error") {
+        return { kind: "member", avatarLabel: "Trip member", nameLabel: "Trip member" };
+      }
+
+      const profile = profileState.profiles.get(uid);
+      const name = profile?.displayName?.trim();
+      if (name) {
+        return {
+          kind: "member",
+          avatarLabel: initialsFromName(name),
+          nameLabel: name,
+          photoURL: profile?.photoURL?.trim() || undefined,
+        };
+      }
+      const fallback = missingPayerLabels.get(uid) ?? "Trip member";
+      return { kind: "member", avatarLabel: fallback, nameLabel: fallback };
+    },
+    [profileState, missingPayerLabels]
+  );
+
   const dangerText = theme.colors.onErrorContainer ?? "#991B1B";
 
   if (loading) {
@@ -1363,6 +1526,114 @@ export default function TripDetails() {
                       <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Withdraw</Text>
                     </Pressable>
                   </View>
+                </>
+              )}
+            </View>
+
+            {/* Checkpoint 4D.2: EXPENSES summary card - immediately after
+                My Stash, same card/cardHeaderRow/iconBubble shell as
+                every card above. "Add Expense" is deliberately NOT
+                offered here yet (4D.3 sequencing - see the checkpoint
+                report); "View all expenses" is always available,
+                including in the empty state, so the full list route
+                itself remains reachable/reviewable. */}
+            <View
+              style={[
+                styles.card,
+                { backgroundColor: theme.colors.surface, borderColor: colors.border },
+                cardShadowFor(theme.dark),
+              ]}
+            >
+              <View style={styles.cardHeaderRow}>
+                <View style={[styles.iconBubble, { backgroundColor: colors.bluePale }]}>
+                  <MaterialCommunityIcons name="receipt-text-outline" size={18} color={colors.blue} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.cardTitle, { color: colors.textPrimary }]}>Expenses</Text>
+                  <Text style={[styles.cardSub, { color: colors.textMuted }]}>
+                    Recent activity for this trip
+                  </Text>
+                </View>
+              </View>
+
+              {expenseState.status === "loading" ? (
+                <View style={styles.stashLoadingWrap}>
+                  <ActivityIndicator size="small" />
+                  <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                    Loading expenses…
+                  </Text>
+                </View>
+              ) : expenseState.status === "error" ? (
+                <View style={styles.expenseErrorWrap}>
+                  <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                    We couldn’t load expenses.
+                  </Text>
+                  <Pressable
+                    onPress={retryExpenses}
+                    accessibilityRole="button"
+                    accessibilityLabel="Retry loading expenses"
+                    style={({ pressed }) => [
+                      styles.secondaryActionBtn,
+                      styles.inlineRetryBtn,
+                      { borderColor: colors.border },
+                      pressed && { opacity: 0.9 },
+                    ]}
+                  >
+                    <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Retry</Text>
+                  </Pressable>
+                </View>
+              ) : (
+                <>
+                  {expenseState.expenses.length === 0 ? (
+                    <View style={styles.stashEmptyWrap}>
+                      <Text style={[styles.cardSub, { color: colors.textSecondary }]}>
+                        No expenses yet.
+                      </Text>
+                      <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                        Trip expenses will appear here.
+                      </Text>
+                    </View>
+                  ) : (
+                    <>
+                      <View style={styles.expenseListWrap}>
+                        {recentExpenses.map((expense) => (
+                          <ExpenseRow key={expense.id} expense={expense} payer={resolvePayer(expense)} />
+                        ))}
+                      </View>
+
+                      {profileState.status === "error" ? (
+                        <View style={styles.profileErrorRow}>
+                          <Text style={[styles.profileErrorText, { color: colors.textMuted }]}>
+                            Some member names couldn’t be loaded.
+                          </Text>
+                          <Pressable
+                            onPress={retryPayerProfiles}
+                            accessibilityRole="button"
+                            accessibilityLabel="Retry loading member names"
+                          >
+                            <Text style={[styles.profileErrorRetryText, { color: colors.blue }]}>
+                              Retry
+                            </Text>
+                          </Pressable>
+                        </View>
+                      ) : null}
+                    </>
+                  )}
+
+                  <Pressable
+                    onPress={() =>
+                      router.push({
+                        pathname: "/(tabs)/trips/[tripId]/expenses",
+                        params: { tripId },
+                      })
+                    }
+                    accessibilityRole="button"
+                    accessibilityLabel="View all expenses"
+                    style={({ pressed }) => [styles.viewAllRow, pressed && { opacity: 0.85 }]}
+                  >
+                    <Text style={[styles.viewAllText, { color: colors.blue }]}>View all expenses</Text>
+                    <MaterialCommunityIcons name="chevron-right" size={16} color={colors.blue} />
+                  </Pressable>
                 </>
               )}
             </View>
@@ -1983,6 +2254,29 @@ const styles = StyleSheet.create({
 
   stashLoadingWrap: { paddingVertical: spacing.md, alignItems: "center" },
   stashEmptyWrap: { marginTop: spacing.xs, gap: spacing.sm },
+
+  // --- Expenses summary card (Checkpoint 4D.2) -----------------------
+  expenseStateText: { fontSize: 12, fontWeight: "600", marginTop: spacing.xs },
+  expenseErrorWrap: { marginTop: spacing.xs, gap: spacing.sm, alignItems: "flex-start" },
+  inlineRetryBtn: { flex: undefined, alignSelf: "flex-start", paddingHorizontal: spacing.lg },
+  expenseListWrap: { marginTop: spacing.xs },
+  profileErrorRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginTop: spacing.sm,
+  },
+  profileErrorText: { fontSize: 11, fontWeight: "600", flex: 1, marginRight: spacing.sm },
+  profileErrorRetryText: { fontSize: 12, fontWeight: "800" },
+  viewAllRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 2,
+    marginTop: spacing.md,
+    paddingVertical: spacing.xs,
+  },
+  viewAllText: { fontSize: 13, fontWeight: "800" },
 
   // --- Quick Analysis -----------------------------------------------
   groupLabel: {
