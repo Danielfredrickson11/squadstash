@@ -250,13 +250,39 @@ export default function TripExpensesScreen() {
             </Pressable>
           </View>
 
-          <Text style={[styles.h1, { color: colors.textPrimary }]}>Expenses</Text>
-          {tripTitle ? (
-            <Text style={[styles.sub, { color: colors.textMuted }]} numberOfLines={1}>
-              {tripTitle}
-              {isArchived ? " · Archived" : ""}
-            </Text>
-          ) : null}
+          <View style={styles.titleRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.h1, { color: colors.textPrimary }]}>Expenses</Text>
+              {tripTitle ? (
+                <Text style={[styles.sub, { color: colors.textMuted }]} numberOfLines={1}>
+                  {tripTitle}
+                  {isArchived ? " · Archived" : ""}
+                </Text>
+              ) : null}
+            </View>
+            {/* Checkpoint 4D.3 §6: exactly ONE Add Expense action on this
+                screen - never a second one duplicated in the empty
+                state below (that state shows informational copy only). */}
+            {tripState.status === "ready" && !isArchived ? (
+              <Pressable
+                onPress={() =>
+                  router.push({
+                    pathname: "/(tabs)/trips/[tripId]/expenses/create",
+                    params: { tripId },
+                  })
+                }
+                accessibilityRole="button"
+                accessibilityLabel="Add Expense"
+                style={({ pressed }) => [
+                  styles.addExpenseBtn,
+                  { backgroundColor: colors.mint },
+                  pressed && { opacity: 0.9 },
+                ]}
+              >
+                <Text style={[styles.addExpenseBtnText, { color: colors.onMint }]}>Add Expense</Text>
+              </Pressable>
+            ) : null}
+          </View>
 
           <View
             style={[
@@ -315,7 +341,7 @@ export default function TripExpensesScreen() {
               <View style={styles.stateWrap}>
                 <Text style={[styles.stateTitle, { color: colors.textPrimary }]}>No expenses yet.</Text>
                 <Text style={[styles.stateSub, { color: colors.textMuted }]}>
-                  Trip expenses will appear here.
+                  {isArchived ? "Trip expenses will appear here." : "Add the first one."}
                 </Text>
               </View>
             ) : (
@@ -365,8 +391,23 @@ const styles = StyleSheet.create({
   },
   backPillText: { fontSize: 12, fontWeight: "700" },
 
+  titleRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: spacing.sm,
+  },
   h1: { ...typography.pageTitle, marginTop: spacing.md },
   sub: { ...typography.body, marginTop: spacing.xs },
+  addExpenseBtn: {
+    marginTop: spacing.md,
+    height: 38,
+    paddingHorizontal: spacing.lg,
+    borderRadius: radii.md,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  addExpenseBtnText: { fontSize: 13, fontWeight: "800" },
 
   card: {
     marginTop: spacing.lg,

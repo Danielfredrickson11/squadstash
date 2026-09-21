@@ -1530,13 +1530,13 @@ export default function TripDetails() {
               )}
             </View>
 
-            {/* Checkpoint 4D.2: EXPENSES summary card - immediately after
-                My Stash, same card/cardHeaderRow/iconBubble shell as
-                every card above. "Add Expense" is deliberately NOT
-                offered here yet (4D.3 sequencing - see the checkpoint
-                report); "View all expenses" is always available,
-                including in the empty state, so the full list route
-                itself remains reachable/reviewable. */}
+            {/* Checkpoint 4D.2/4D.3: EXPENSES summary card - immediately
+                after My Stash, same card/cardHeaderRow/iconBubble shell
+                as every card above. "Add Expense" is hidden on an
+                archived Trip (mirrors the existing "Add Money" hide-
+                when-archived precedent above) - "View all expenses"
+                remains available regardless, including in the empty
+                state, so history stays reachable. */}
             <View
               style={[
                 styles.card,
@@ -1590,7 +1590,7 @@ export default function TripDetails() {
                         No expenses yet.
                       </Text>
                       <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
-                        Trip expenses will appear here.
+                        {isArchived ? "Trip expenses will appear here." : "Add the first one."}
                       </Text>
                     </View>
                   ) : (
@@ -1620,20 +1620,61 @@ export default function TripDetails() {
                     </>
                   )}
 
-                  <Pressable
-                    onPress={() =>
-                      router.push({
-                        pathname: "/(tabs)/trips/[tripId]/expenses",
-                        params: { tripId },
-                      })
-                    }
-                    accessibilityRole="button"
-                    accessibilityLabel="View all expenses"
-                    style={({ pressed }) => [styles.viewAllRow, pressed && { opacity: 0.85 }]}
-                  >
-                    <Text style={[styles.viewAllText, { color: colors.blue }]}>View all expenses</Text>
-                    <MaterialCommunityIcons name="chevron-right" size={16} color={colors.blue} />
-                  </Pressable>
+                  {!isArchived ? (
+                    <View style={styles.actionsRow}>
+                      <Pressable
+                        onPress={() =>
+                          router.push({
+                            pathname: "/(tabs)/trips/[tripId]/expenses/create",
+                            params: { tripId },
+                          })
+                        }
+                        accessibilityRole="button"
+                        accessibilityLabel="Add Expense"
+                        style={({ pressed }) => [
+                          styles.primaryActionBtn,
+                          { backgroundColor: colors.mint },
+                          pressed && { opacity: 0.9 },
+                        ]}
+                      >
+                        <Text style={[styles.primaryActionText, { color: colors.onMint }]}>Add Expense</Text>
+                      </Pressable>
+                      <Pressable
+                        onPress={() =>
+                          router.push({
+                            pathname: "/(tabs)/trips/[tripId]/expenses",
+                            params: { tripId },
+                          })
+                        }
+                        accessibilityRole="button"
+                        accessibilityLabel="View all expenses"
+                        style={({ pressed }) => [
+                          styles.secondaryActionBtn,
+                          { borderColor: colors.border },
+                          pressed && { opacity: 0.9 },
+                        ]}
+                      >
+                        <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>
+                          View all
+                        </Text>
+                      </Pressable>
+                    </View>
+                  ) : (
+                    <Pressable
+                      onPress={() =>
+                        router.push({
+                          pathname: "/(tabs)/trips/[tripId]/expenses",
+                          params: { tripId },
+                        })
+                      }
+                      accessibilityRole="button"
+                      accessibilityLabel="View all expenses"
+                      style={({ pressed }) => [styles.viewAllRow, pressed && { opacity: 0.85 }]}
+                    >
+                      <Text style={[styles.viewAllText, { color: colors.blue }]}>View all expenses</Text>
+                      <MaterialCommunityIcons name="chevron-right" size={16} color={colors.blue} />
+                    </Pressable>
+                  )}
                 </>
               )}
             </View>
