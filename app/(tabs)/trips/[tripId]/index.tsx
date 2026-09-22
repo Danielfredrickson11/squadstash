@@ -1597,7 +1597,17 @@ export default function TripDetails() {
                     <>
                       <View style={styles.expenseListWrap}>
                         {recentExpenses.map((expense) => (
-                          <ExpenseRow key={expense.id} expense={expense} payer={resolvePayer(expense)} />
+                          <ExpenseRow
+                            key={expense.id}
+                            expense={expense}
+                            payer={resolvePayer(expense)}
+                            onPress={() =>
+                              router.push({
+                                pathname: "/(tabs)/trips/[tripId]/expenses/[expenseId]",
+                                params: { tripId, expenseId: expense.id },
+                              })
+                            }
+                          />
                         ))}
                       </View>
 
