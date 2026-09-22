@@ -1,12 +1,13 @@
-// Add Expense form presentation (Checkpoint 4D.3), per the frozen
-// docs/audits/TRIP_EXPENSE_UI_UX_PREFLIGHT_2026-09-18.md §11-§18/§21.
-// Presentation/member-controls/preview ONLY - no Firebase reads/writes,
-// no navigation, no idempotency refs. The route/controller
+// Add Expense form presentation (Checkpoint 4D.3, extended by 4D.4 for
+// percentage/custom split strategies), per the frozen docs/audits/
+// TRIP_EXPENSE_UI_UX_PREFLIGHT_2026-09-18.md §11-§18/§21. Presentation/
+// member-controls/preview ONLY - no Firebase reads/writes, no
+// navigation, no idempotency refs. The route/controller
 // (expenses/create.tsx) owns Trip loading, the profile subscription, the
-// idempotency controller, the trusted recordTripExpense call, and
-// navigation; this component receives everything it needs via props and
-// calls back up through onChange*/onSubmit/onCancel. Split strategy is
-// ALWAYS "equal" in 4D.3 - no percentage/custom selector exists here.
+// idempotency controller, all strategy-specific parsing/validation, the
+// trusted recordTripExpense call, and navigation; this component
+// receives everything it needs (including already-validated preview
+// data) via props and calls back up through onChange*/onSubmit/onCancel.
 import React, { useMemo } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from "react-native";
 import { Text, TextInput } from "react-native-paper";
@@ -15,8 +16,10 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { AvatarCircle } from "../buckets/AvatarCircle";
 import { radii, spacing, type SemanticColors } from "../../src/theme/tokens";
 import { formatCurrency } from "../../utils/format";
-import { computeEqualSplit } from "../../src/domain/tripExpenseSplits";
+import { computeCustomSplit, computeEqualSplit, computePercentageSplit } from "../../src/domain/tripExpenseSplits";
 import { MAX_EXPENSE_PARTICIPANTS } from "../../src/domain/expenseSubmission";
+import { PercentageSplitInputs } from "./PercentageSplitInputs";
+import { CustomSplitInputs } from "./CustomSplitInputs";
 
 export type MemberOption = {
   uid: string;
@@ -25,6 +28,16 @@ export type MemberOption = {
   photoURL?: string;
   isCurrentUser: boolean;
 };
+
+export type SplitStrategyValue = "equal" | "percentage" | "custom";
+
+// Real strategy names (§5 of the checkpoint prompt: never "Simple"/
+// "Advanced").
+const STRATEGY_OPTIONS: { value: SplitStrategyValue; label: string }[] = [
+  { value: "equal", label: "Equal" },
+  { value: "percentage", label: "Percentage" },
+  { value: "custom", label: "Custom" },
+];
 
 export type AddExpenseFormProps = {
   colors: SemanticColors;
@@ -60,6 +73,33 @@ export type AddExpenseFormProps = {
   // what the controller will actually submit.
   previewAmountMinor: number | null;
 
+  // Checkpoint 4D.4: strategy selection + strategy-specific per-
+  // participant state. Raw per-uid text/error maps and formatted
+  // aggregate text are all computed/validated by the controller
+  // (expenses/create.tsx) - this component only renders them and calls
+  // back up on every keystroke/selection.
+  splitStrategy: SplitStrategyValue;
+  onChangeSplitStrategy: (strategy: SplitStrategyValue) => void;
+
+  percentageValues: Record<string, string>;
+  onChangePercentageValue: (uid: string, value: string) => void;
+  percentageErrors: Record<string, string>;
+  percentageAggregateText: string | null;
+  percentageAggregateError: string | null;
+  // Pre-validated/canonicalized - null unless every selected
+  // participant's percentage parses AND the total is exactly 10000.
+  previewPercentageParticipants: { uid: string; percentageBasisPoints: number }[] | null;
+
+  customValues: Record<string, string>;
+  onChangeCustomValue: (uid: string, value: string) => void;
+  customErrors: Record<string, string>;
+  customAggregateText: string | null;
+  customAggregateError: string | null;
+  // Pre-validated/canonicalized - null unless every selected
+  // participant's share parses AND the total exactly matches the
+  // Expense amount.
+  previewCustomParticipants: { uid: string; amountMinor: number }[] | null;
+
   submitting: boolean;
   submitError: string | null;
   onSubmit: () => void;
@@ -89,6 +129,20 @@ export function AddExpenseForm({
   profileErrorVisible,
   onRetryProfiles,
   previewAmountMinor,
+  splitStrategy,
+  onChangeSplitStrategy,
+  percentageValues,
+  onChangePercentageValue,
+  percentageErrors,
+  percentageAggregateText,
+  percentageAggregateError,
+  previewPercentageParticipants,
+  customValues,
+  onChangeCustomValue,
+  customErrors,
+  customAggregateText,
+  customAggregateError,
+  previewCustomParticipants,
   submitting,
   submitError,
   onSubmit,
@@ -99,20 +153,52 @@ export function AddExpenseForm({
     () => Array.from(selectedParticipantUids).sort(),
     [selectedParticipantUids]
   );
+  const selectedMembers = useMemo(
+    () => members.filter((m) => selectedParticipantUids.has(m.uid)),
+    [members, selectedParticipantUids]
+  );
 
-  // Live equal-split preview (§21) - DISPLAY ONLY, never persisted. Fails
-  // closed: an unexpected computeEqualSplit throw simply omits the
-  // preview rather than crashing the form or influencing submit
-  // eligibility, which the controller decides independently from
-  // already-validated facts.
+  // Live split preview (§12/§18/§21) - DISPLAY ONLY, never persisted.
+  // Dispatches on splitStrategy, using only ALREADY-VALIDATED data the
+  // controller supplied (previewPercentageParticipants/
+  // previewCustomParticipants are null unless every selected
+  // participant's input parsed AND the aggregate exactly matches) - this
+  // component never re-derives validity from raw text itself. Fails
+  // closed: an unexpected compute*Split throw simply omits the preview
+  // rather than crashing the form or influencing submit eligibility,
+  // which the controller decides independently in handleSubmit.
   const preview = useMemo(() => {
-    if (previewAmountMinor === null || selectedParticipantList.length === 0) return null;
+    if (previewAmountMinor === null) return null;
     try {
-      return computeEqualSplit(previewAmountMinor, selectedParticipantList);
+      if (splitStrategy === "equal") {
+        if (selectedParticipantList.length === 0) return null;
+        return {
+          kind: "equal" as const,
+          allocations: computeEqualSplit(previewAmountMinor, selectedParticipantList),
+        };
+      }
+      if (splitStrategy === "percentage") {
+        if (!previewPercentageParticipants || previewPercentageParticipants.length === 0) return null;
+        return {
+          kind: "percentage" as const,
+          allocations: computePercentageSplit(previewAmountMinor, previewPercentageParticipants),
+        };
+      }
+      if (!previewCustomParticipants || previewCustomParticipants.length === 0) return null;
+      return {
+        kind: "custom" as const,
+        allocations: computeCustomSplit(previewAmountMinor, previewCustomParticipants),
+      };
     } catch {
       return null;
     }
-  }, [previewAmountMinor, selectedParticipantList]);
+  }, [
+    splitStrategy,
+    previewAmountMinor,
+    selectedParticipantList,
+    previewPercentageParticipants,
+    previewCustomParticipants,
+  ]);
 
   const payerMember = memberByUid.get(payerUid);
 
@@ -194,7 +280,7 @@ export function AddExpenseForm({
 
       <View style={styles.participantsHeaderRow}>
         <Text style={[styles.sectionLabel, { color: colors.textSecondary }]}>
-          Split equally between
+          Participants
         </Text>
         {!isOverCapacity ? (
           <View style={styles.selectorActionsRow}>
@@ -254,13 +340,78 @@ export function AddExpenseForm({
         <Text style={[styles.errorText, { color: colors.coral }]}>{participantsError}</Text>
       ) : null}
 
+      {/* Checkpoint 4D.4 §5: strategy selector, after participant
+          selection and before the preview. Selection is conveyed by more
+          than color - a check icon plus a distinct border/tint. */}
+      <Text style={[styles.sectionLabel, { color: colors.textSecondary, marginTop: spacing.lg }]}>
+        Split strategy
+      </Text>
+      <View style={styles.strategyRow}>
+        {STRATEGY_OPTIONS.map(({ value, label }) => {
+          const selected = splitStrategy === value;
+          return (
+            <Pressable
+              key={value}
+              onPress={() => onChangeSplitStrategy(value)}
+              disabled={submitting}
+              accessibilityRole="button"
+              accessibilityLabel={label}
+              accessibilityState={{ selected }}
+              style={({ pressed }) => [
+                styles.strategyPill,
+                { borderColor: selected ? colors.blue : colors.border },
+                selected && { backgroundColor: colors.bluePale },
+                pressed && !submitting && { opacity: 0.85 },
+              ]}
+            >
+              {selected ? <MaterialCommunityIcons name="check" size={14} color={colors.blue} /> : null}
+              <Text
+                style={[styles.strategyPillText, { color: selected ? colors.blue : colors.textPrimary }]}
+              >
+                {label}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {splitStrategy === "percentage" ? (
+        <PercentageSplitInputs
+          colors={colors}
+          participants={selectedMembers}
+          values={percentageValues}
+          errors={percentageErrors}
+          onChangeValue={onChangePercentageValue}
+          aggregateText={percentageAggregateText}
+          aggregateError={percentageAggregateError}
+          disabled={submitting}
+        />
+      ) : splitStrategy === "custom" ? (
+        <CustomSplitInputs
+          colors={colors}
+          participants={selectedMembers}
+          values={customValues}
+          errors={customErrors}
+          onChangeValue={onChangeCustomValue}
+          aggregateText={customAggregateText}
+          aggregateError={customAggregateError}
+          disabled={submitting}
+        />
+      ) : null}
+
       {preview && payerMember ? (
         <View style={[styles.previewCard, { backgroundColor: colors.bluePale }]}>
           <Text style={[styles.previewHeadline, { color: colors.textPrimary }]}>
             Paid by {payerMember.nameLabel}
           </Text>
-          <Text style={[styles.previewSub, { color: colors.textSecondary }]}>Split equally between:</Text>
-          {preview.map((allocation) => {
+          <Text style={[styles.previewSub, { color: colors.textSecondary }]}>
+            {preview.kind === "equal"
+              ? "Split equally between:"
+              : preview.kind === "percentage"
+                ? "Split by percentage:"
+                : "Custom split:"}
+          </Text>
+          {preview.allocations.map((allocation) => {
             const member = memberByUid.get(allocation.uid);
             const label = member?.nameLabel ?? "Trip member";
             return (
@@ -268,6 +419,11 @@ export function AddExpenseForm({
                 <Text style={[styles.previewName, { color: colors.textPrimary }]} numberOfLines={1}>
                   {label}
                 </Text>
+                {preview.kind === "percentage" && allocation.percentageBasisPoints !== undefined ? (
+                  <Text style={[styles.previewPercent, { color: colors.textSecondary }]}>
+                    {(allocation.percentageBasisPoints / 100).toFixed(2)}%
+                  </Text>
+                ) : null}
                 <Text style={[styles.previewAmount, { color: colors.textPrimary }]}>
                   {formatCurrency(allocation.amountMinor / 100)}
                 </Text>
@@ -421,7 +577,21 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
   },
   previewName: { flex: 1, fontSize: 13, fontWeight: "700", marginRight: spacing.sm },
+  previewPercent: { fontSize: 12, fontWeight: "700", marginRight: spacing.sm },
   previewAmount: { fontSize: 13, fontWeight: "800" },
+
+  strategyRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.xs },
+  strategyPill: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
+    height: 38,
+    borderWidth: 1.5,
+    borderRadius: radii.md,
+  },
+  strategyPillText: { fontSize: 12, fontWeight: "800" },
 
   actionsRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.lg },
   primaryActionBtn: {

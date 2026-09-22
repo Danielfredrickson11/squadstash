@@ -1,11 +1,16 @@
 import {
   canSelectParticipant,
+  canonicalizeCustomParticipants,
   canonicalizeEqualParticipants,
+  canonicalizePercentageParticipants,
   defaultParticipantSelection,
   deriveCurrentMemberUids,
   expenseCreationFactsEqual,
   parseExpenseMoneyInput,
+  parseExpenseShareMoneyInput,
+  parsePercentageToBasisPoints,
   resolveExpenseClientRequestId,
+  sumSafeIntegers,
   validateExpenseCategory,
   validateExpenseDescription,
   type ExpenseCreationFacts,
@@ -434,6 +439,475 @@ describe("resolveExpenseClientRequestId", () => {
     const pendingRef: { current: PendingExpenseCreationRequest | null } = { current: null };
     const first = resolveExpenseClientRequestId(pendingRef, baseFacts(), generator);
     const second = resolveExpenseClientRequestId(pendingRef, baseFacts({ category: "Food" }), generator);
+    expect(second).not.toBe(first);
+  });
+});
+
+// =======================================================================
+// PERCENTAGE PARSER (Checkpoint 4D.4 §7/§8/§9/§36)
+// =======================================================================
+
+describe("parsePercentageToBasisPoints", () => {
+  it.each([
+    ["0", 0],
+    ["0.5", 50],
+    ["0.50", 50],
+    ["1", 100],
+    ["25", 2500],
+    ["33.33", 3333],
+    ["50", 5000],
+    ["100", 10000],
+    ["100.00", 10000],
+  ])("parses %s -> %i basis points", (input, expected) => {
+    expect(parsePercentageToBasisPoints(input)).toEqual({ ok: true, percentageBasisPoints: expected });
+  });
+
+  it("accepts surrounding whitespace", () => {
+    expect(parsePercentageToBasisPoints("  50  ")).toEqual({ ok: true, percentageBasisPoints: 5000 });
+  });
+
+  it.each(["", " ", ".5", "50%", "abc", "1..2"])(
+    "rejects malformed/unsupported input (%s) with a valid-percentage error",
+    (input) => {
+      expect(parsePercentageToBasisPoints(input)).toEqual({
+        ok: false,
+        error: "Enter a valid percentage.",
+      });
+    }
+  );
+
+  it("rejects a negative percentage", () => {
+    expect(parsePercentageToBasisPoints("-1")).toEqual({
+      ok: false,
+      error: "Enter a percentage from 0 to 100.",
+    });
+  });
+
+  it("rejects a percentage over 100", () => {
+    expect(parsePercentageToBasisPoints("100.01")).toEqual({
+      ok: false,
+      error: "Enter a percentage from 0 to 100.",
+    });
+  });
+
+  it("rejects more than 2 decimal places", () => {
+    expect(parsePercentageToBasisPoints("33.333")).toEqual({
+      ok: false,
+      error: "Use at most 2 decimal places.",
+    });
+  });
+
+  it("never accepts a literal % suffix", () => {
+    expect(parsePercentageToBasisPoints("50%").ok).toBe(false);
+  });
+});
+
+// =======================================================================
+// CUSTOM SHARE MONEY (Checkpoint 4D.4 §13/§14/§37)
+// =======================================================================
+
+describe("parseExpenseShareMoneyInput", () => {
+  it.each([
+    ["0", 0],
+    ["0.00", 0],
+    ["$0", 0],
+    ["12", 1200],
+    ["12.50", 1250],
+    ["$12.50", 1250],
+    ["1,234.56", 123456],
+  ])("parses %s -> %i minor units (zero is a valid share)", (input, expected) => {
+    expect(parseExpenseShareMoneyInput(input)).toEqual({ ok: true, amountMinor: expected });
+  });
+
+  it("rejects a blank share", () => {
+    expect(parseExpenseShareMoneyInput("")).toEqual({ ok: false, error: "Enter a valid amount." });
+  });
+
+  it("rejects a negative share with the custom-specific message", () => {
+    expect(parseExpenseShareMoneyInput("-12")).toEqual({
+      ok: false,
+      error: "Enter a non-negative amount.",
+    });
+  });
+
+  it("rejects letters", () => {
+    expect(parseExpenseShareMoneyInput("abc12")).toEqual({ ok: false, error: "Enter a valid amount." });
+  });
+
+  it("rejects malformed comma grouping", () => {
+    expect(parseExpenseShareMoneyInput("12,34")).toEqual({ ok: false, error: "Enter a valid amount." });
+  });
+
+  it("rejects more than 2 decimal places", () => {
+    expect(parseExpenseShareMoneyInput("12.555")).toEqual({
+      ok: false,
+      error: "Enter an amount with at most 2 decimal places.",
+    });
+  });
+
+  it("rejects an unsafe-large share", () => {
+    expect(parseExpenseShareMoneyInput("99999999999999999")).toEqual({
+      ok: false,
+      error: "Enter a smaller amount.",
+    });
+  });
+});
+
+describe("parseExpenseMoneyInput still rejects zero for the total Expense amount", () => {
+  it.each(["0", "0.00", "$0"])("rejects %s", (input) => {
+    expect(parseExpenseMoneyInput(input)).toEqual({
+      ok: false,
+      error: "Enter an amount greater than $0.",
+    });
+  });
+});
+
+// =======================================================================
+// PERCENTAGE / CUSTOM CANONICALIZATION (Checkpoint 4D.4 §23/§24/§38)
+// =======================================================================
+
+describe("canonicalizePercentageParticipants", () => {
+  it("sorts by ascending uid", () => {
+    expect(
+      canonicalizePercentageParticipants([
+        { uid: "b", percentageBasisPoints: 4000 },
+        { uid: "a", percentageBasisPoints: 6000 },
+      ])
+    ).toEqual([
+      { uid: "a", percentageBasisPoints: 6000 },
+      { uid: "b", percentageBasisPoints: 4000 },
+    ]);
+  });
+
+  it("retains exact integer basis points (no float conversion)", () => {
+    const result = canonicalizePercentageParticipants([{ uid: "a", percentageBasisPoints: 3333 }]);
+    expect(result[0].percentageBasisPoints).toBe(3333);
+  });
+
+  it("throws on a duplicate uid rather than silently picking one value", () => {
+    expect(() =>
+      canonicalizePercentageParticipants([
+        { uid: "a", percentageBasisPoints: 5000 },
+        { uid: "a", percentageBasisPoints: 6000 },
+      ])
+    ).toThrow(/duplicate participant uid/);
+  });
+});
+
+describe("canonicalizeCustomParticipants", () => {
+  it("sorts by ascending uid", () => {
+    expect(
+      canonicalizeCustomParticipants([
+        { uid: "b", amountMinor: 400 },
+        { uid: "a", amountMinor: 600 },
+      ])
+    ).toEqual([
+      { uid: "a", amountMinor: 600 },
+      { uid: "b", amountMinor: 400 },
+    ]);
+  });
+
+  it("retains exact integer minor units", () => {
+    const result = canonicalizeCustomParticipants([{ uid: "a", amountMinor: 0 }]);
+    expect(result[0].amountMinor).toBe(0);
+  });
+
+  it("throws on a duplicate uid rather than silently picking one value", () => {
+    expect(() =>
+      canonicalizeCustomParticipants([
+        { uid: "a", amountMinor: 500 },
+        { uid: "a", amountMinor: 600 },
+      ])
+    ).toThrow(/duplicate participant uid/);
+  });
+});
+
+// =======================================================================
+// AGGREGATES (Checkpoint 4D.4 §10/§16/§39)
+// =======================================================================
+
+describe("sumSafeIntegers (percentage/custom aggregate arithmetic)", () => {
+  it("sums an exact percentage total (5000 + 5000 = 10000)", () => {
+    expect(sumSafeIntegers([5000, 5000])).toBe(10000);
+  });
+
+  it("sums a 3-way split with a remainder (3333 + 3333 + 3334 = 10000)", () => {
+    expect(sumSafeIntegers([3333, 3333, 3334])).toBe(10000);
+  });
+
+  it("returns a total that is NOT 10000 for an under-total percentage split (9999)", () => {
+    expect(sumSafeIntegers([4999, 5000])).toBe(9999);
+  });
+
+  it("returns a total that is NOT 10000 for an over-total percentage split (10001)", () => {
+    expect(sumSafeIntegers([5001, 5000])).toBe(10001);
+  });
+
+  it("sums a matching custom split (500 + 500 = 1000)", () => {
+    expect(sumSafeIntegers([500, 500])).toBe(1000);
+  });
+
+  it("sums a $0 + full-amount custom split (0 + 1000 = 1000)", () => {
+    expect(sumSafeIntegers([0, 1000])).toBe(1000);
+  });
+
+  it("returns an under-total for a short custom split (499 + 500 = 999, not 1000)", () => {
+    expect(sumSafeIntegers([499, 500])).toBe(999);
+  });
+
+  it("returns an over-total for an excess custom split (600 + 500 = 1100, not 1000)", () => {
+    expect(sumSafeIntegers([600, 500])).toBe(1100);
+  });
+
+  it("fails closed (returns null) when the running total overflows the safe-integer range", () => {
+    expect(sumSafeIntegers([Number.MAX_SAFE_INTEGER, 1])).toBeNull();
+  });
+});
+
+// =======================================================================
+// STRATEGY IDEMPOTENCY SAFETY (Checkpoint 4D.4 §26/§40)
+// =======================================================================
+
+describe("expenseCreationFactsEqual across split strategies", () => {
+  function percentageFacts(overrides: Partial<ExpenseCreationFacts> = {}): ExpenseCreationFacts {
+    return {
+      ...baseFacts(),
+      splitStrategy: "percentage",
+      participants: canonicalizePercentageParticipants([
+        { uid: "member-1", percentageBasisPoints: 5000 },
+        { uid: "member-2", percentageBasisPoints: 5000 },
+      ]),
+      ...overrides,
+    } as ExpenseCreationFacts;
+  }
+
+  function customFacts(overrides: Partial<ExpenseCreationFacts> = {}): ExpenseCreationFacts {
+    return {
+      ...baseFacts(),
+      splitStrategy: "custom",
+      participants: canonicalizeCustomParticipants([
+        { uid: "member-1", amountMinor: 4500 },
+        { uid: "member-2", amountMinor: 4500 },
+      ]),
+      ...overrides,
+    } as ExpenseCreationFacts;
+  }
+
+  it("equal facts are NOT equal to percentage facts, even with the same amount/participants", () => {
+    expect(expenseCreationFactsEqual(baseFacts(), percentageFacts())).toBe(false);
+  });
+
+  it("equal facts are NOT equal to custom facts", () => {
+    expect(expenseCreationFactsEqual(baseFacts(), customFacts())).toBe(false);
+  });
+
+  it("percentage facts are NOT equal to custom facts", () => {
+    expect(expenseCreationFactsEqual(percentageFacts(), customFacts())).toBe(false);
+  });
+
+  it("percentage facts change when one participant's percentage changes", () => {
+    const a = percentageFacts();
+    const b = percentageFacts({
+      participants: canonicalizePercentageParticipants([
+        { uid: "member-1", percentageBasisPoints: 6000 },
+        { uid: "member-2", percentageBasisPoints: 4000 },
+      ]),
+    });
+    expect(expenseCreationFactsEqual(a, b)).toBe(false);
+  });
+
+  it("percentage facts change when participant membership changes", () => {
+    const a = percentageFacts();
+    const b = percentageFacts({
+      participants: canonicalizePercentageParticipants([
+        { uid: "member-1", percentageBasisPoints: 5000 },
+        { uid: "member-3", percentageBasisPoints: 5000 },
+      ]),
+    });
+    expect(expenseCreationFactsEqual(a, b)).toBe(false);
+  });
+
+  it("custom facts change when one participant's amount changes", () => {
+    const a = customFacts();
+    const b = customFacts({
+      participants: canonicalizeCustomParticipants([
+        { uid: "member-1", amountMinor: 9000 },
+        { uid: "member-2", amountMinor: 0 },
+      ]),
+    });
+    expect(expenseCreationFactsEqual(a, b)).toBe(false);
+  });
+
+  it("custom facts change when participant membership changes", () => {
+    const a = customFacts();
+    const b = customFacts({
+      participants: canonicalizeCustomParticipants([
+        { uid: "member-1", amountMinor: 4500 },
+        { uid: "member-3", amountMinor: 4500 },
+      ]),
+    });
+    expect(expenseCreationFactsEqual(a, b)).toBe(false);
+  });
+
+  it("canonical input order differences representing the same logical percentage split compare equal", () => {
+    const a = percentageFacts({
+      participants: canonicalizePercentageParticipants([
+        { uid: "member-2", percentageBasisPoints: 5000 },
+        { uid: "member-1", percentageBasisPoints: 5000 },
+      ]),
+    });
+    const b = percentageFacts({
+      participants: canonicalizePercentageParticipants([
+        { uid: "member-1", percentageBasisPoints: 5000 },
+        { uid: "member-2", percentageBasisPoints: 5000 },
+      ]),
+    });
+    expect(expenseCreationFactsEqual(a, b)).toBe(true);
+  });
+
+  it("canonical input order differences representing the same logical custom split compare equal", () => {
+    const a = customFacts({
+      participants: canonicalizeCustomParticipants([
+        { uid: "member-2", amountMinor: 4500 },
+        { uid: "member-1", amountMinor: 4500 },
+      ]),
+    });
+    const b = customFacts({
+      participants: canonicalizeCustomParticipants([
+        { uid: "member-1", amountMinor: 4500 },
+        { uid: "member-2", amountMinor: 4500 },
+      ]),
+    });
+    expect(expenseCreationFactsEqual(a, b)).toBe(true);
+  });
+});
+
+describe("resolveExpenseClientRequestId across split strategies", () => {
+  function makeGenerator() {
+    let counter = 0;
+    return () => `strategy-generated-${++counter}`;
+  }
+
+  it("a strategy switch (equal -> percentage) always mints a fresh id", () => {
+    const generator = makeGenerator();
+    const pendingRef: { current: PendingExpenseCreationRequest | null } = { current: null };
+    const first = resolveExpenseClientRequestId(pendingRef, baseFacts(), generator);
+    const second = resolveExpenseClientRequestId(
+      pendingRef,
+      {
+        ...baseFacts(),
+        splitStrategy: "percentage",
+        participants: canonicalizePercentageParticipants([
+          { uid: "member-1", percentageBasisPoints: 5000 },
+          { uid: "member-2", percentageBasisPoints: 5000 },
+        ]),
+      } as ExpenseCreationFacts,
+      generator
+    );
+    expect(second).not.toBe(first);
+  });
+
+  it("a strategy switch (percentage -> custom) always mints a fresh id", () => {
+    const generator = makeGenerator();
+    const pendingRef: { current: PendingExpenseCreationRequest | null } = { current: null };
+    const percentage: ExpenseCreationFacts = {
+      ...baseFacts(),
+      splitStrategy: "percentage",
+      participants: canonicalizePercentageParticipants([
+        { uid: "member-1", percentageBasisPoints: 5000 },
+        { uid: "member-2", percentageBasisPoints: 5000 },
+      ]),
+    } as ExpenseCreationFacts;
+    const custom: ExpenseCreationFacts = {
+      ...baseFacts(),
+      splitStrategy: "custom",
+      participants: canonicalizeCustomParticipants([
+        { uid: "member-1", amountMinor: 4500 },
+        { uid: "member-2", amountMinor: 4500 },
+      ]),
+    } as ExpenseCreationFacts;
+    const first = resolveExpenseClientRequestId(pendingRef, percentage, generator);
+    const second = resolveExpenseClientRequestId(pendingRef, custom, generator);
+    expect(second).not.toBe(first);
+  });
+
+  it("percentage: exact-same logical facts reuse the pending id", () => {
+    const generator = makeGenerator();
+    const pendingRef: { current: PendingExpenseCreationRequest | null } = { current: null };
+    const facts: ExpenseCreationFacts = {
+      ...baseFacts(),
+      splitStrategy: "percentage",
+      participants: canonicalizePercentageParticipants([
+        { uid: "member-1", percentageBasisPoints: 5000 },
+        { uid: "member-2", percentageBasisPoints: 5000 },
+      ]),
+    } as ExpenseCreationFacts;
+    const first = resolveExpenseClientRequestId(pendingRef, facts, generator);
+    const second = resolveExpenseClientRequestId(pendingRef, { ...facts }, generator);
+    expect(second).toBe(first);
+  });
+
+  it("percentage: a value change mints a fresh id", () => {
+    const generator = makeGenerator();
+    const pendingRef: { current: PendingExpenseCreationRequest | null } = { current: null };
+    const facts: ExpenseCreationFacts = {
+      ...baseFacts(),
+      splitStrategy: "percentage",
+      participants: canonicalizePercentageParticipants([
+        { uid: "member-1", percentageBasisPoints: 5000 },
+        { uid: "member-2", percentageBasisPoints: 5000 },
+      ]),
+    } as ExpenseCreationFacts;
+    const changed: ExpenseCreationFacts = {
+      ...baseFacts(),
+      splitStrategy: "percentage",
+      participants: canonicalizePercentageParticipants([
+        { uid: "member-1", percentageBasisPoints: 6000 },
+        { uid: "member-2", percentageBasisPoints: 4000 },
+      ]),
+    } as ExpenseCreationFacts;
+    const first = resolveExpenseClientRequestId(pendingRef, facts, generator);
+    const second = resolveExpenseClientRequestId(pendingRef, changed, generator);
+    expect(second).not.toBe(first);
+  });
+
+  it("custom: exact-same logical facts reuse the pending id", () => {
+    const generator = makeGenerator();
+    const pendingRef: { current: PendingExpenseCreationRequest | null } = { current: null };
+    const facts: ExpenseCreationFacts = {
+      ...baseFacts(),
+      splitStrategy: "custom",
+      participants: canonicalizeCustomParticipants([
+        { uid: "member-1", amountMinor: 4500 },
+        { uid: "member-2", amountMinor: 4500 },
+      ]),
+    } as ExpenseCreationFacts;
+    const first = resolveExpenseClientRequestId(pendingRef, facts, generator);
+    const second = resolveExpenseClientRequestId(pendingRef, { ...facts }, generator);
+    expect(second).toBe(first);
+  });
+
+  it("custom: an amount change mints a fresh id", () => {
+    const generator = makeGenerator();
+    const pendingRef: { current: PendingExpenseCreationRequest | null } = { current: null };
+    const facts: ExpenseCreationFacts = {
+      ...baseFacts(),
+      splitStrategy: "custom",
+      participants: canonicalizeCustomParticipants([
+        { uid: "member-1", amountMinor: 4500 },
+        { uid: "member-2", amountMinor: 4500 },
+      ]),
+    } as ExpenseCreationFacts;
+    const changed: ExpenseCreationFacts = {
+      ...baseFacts(),
+      splitStrategy: "custom",
+      participants: canonicalizeCustomParticipants([
+        { uid: "member-1", amountMinor: 9000 },
+        { uid: "member-2", amountMinor: 0 },
+      ]),
+    } as ExpenseCreationFacts;
+    const first = resolveExpenseClientRequestId(pendingRef, facts, generator);
+    const second = resolveExpenseClientRequestId(pendingRef, changed, generator);
     expect(second).not.toBe(first);
   });
 });

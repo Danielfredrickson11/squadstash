@@ -1,11 +1,13 @@
-// Add Expense route/controller (Checkpoint 4D.3), per the frozen
-// docs/audits/TRIP_EXPENSE_UI_UX_PREFLIGHT_2026-09-18.md. Owns Trip
-// loading, the current-member/profile subscription, all field state, the
-// idempotency controller, the trusted recordTripExpense call, and
-// navigation - components/expenses/AddExpenseForm.tsx is presentation
-// only. paymentSource: "member_out_of_pocket" only; splitStrategy is
-// always "equal" (no percentage/custom UI); no occurredAt/date field; no
-// correction mode (replacesExpenseId is always null in 4D.3).
+// Add Expense route/controller (Checkpoint 4D.3, extended by 4D.4 for
+// percentage/custom split strategies), per the frozen docs/audits/
+// TRIP_EXPENSE_UI_UX_PREFLIGHT_2026-09-18.md. Owns Trip loading, the
+// current-member/profile subscription, ALL field state (including every
+// strategy's own per-participant inputs), the idempotency controller,
+// the trusted recordTripExpense call, and navigation -
+// components/expenses/AddExpenseForm.tsx (+ its two small split-input
+// sub-components) is presentation only. paymentSource:
+// "member_out_of_pocket" only; no occurredAt/date field; no correction
+// mode (replacesExpenseId is always null in 4D).
 import { useLocalSearchParams, useRouter } from "expo-router";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Platform, Pressable, SafeAreaView, ScrollView, StyleSheet, View } from "react-native";
@@ -15,7 +17,11 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 
 import { BAR_HEIGHT, CENTER_BUTTON_SIZE } from "../../../../../components/navigation/BottomNav";
 import { initialsFromName } from "../../../../../components/buckets/AvatarCircle";
-import { AddExpenseForm, type MemberOption } from "../../../../../components/expenses/AddExpenseForm";
+import {
+  AddExpenseForm,
+  type MemberOption,
+  type SplitStrategyValue,
+} from "../../../../../components/expenses/AddExpenseForm";
 import { cardShadowFor, radii, spacing, typography } from "../../../../../src/theme/tokens";
 import { useSemanticColors } from "../../../../../src/theme/useSemanticColors";
 import { useAuth } from "../../../../../src/contexts/AuthContext";
@@ -25,11 +31,16 @@ import { generateExpenseClientRequestId, recordTripExpense } from "../../../../.
 import { subscribeToPublicUsersByIdsChunked } from "../../../../../src/services/firebase/users";
 import {
   canSelectParticipant,
+  canonicalizeCustomParticipants,
   canonicalizeEqualParticipants,
+  canonicalizePercentageParticipants,
   defaultParticipantSelection,
   deriveCurrentMemberUids,
   parseExpenseMoneyInput,
+  parseExpenseShareMoneyInput,
+  parsePercentageToBasisPoints,
   resolveExpenseClientRequestId,
+  sumSafeIntegers,
   validateExpenseCategory,
   validateExpenseDescription,
   type ExpenseCreationFacts,
@@ -233,19 +244,102 @@ export default function AddExpenseScreen() {
     initializedRef.current = true;
   }, [user, tripState, currentMemberUids]);
 
-  const toggleParticipant = useCallback((uid: string) => {
-    setSelectedParticipants((prev) => {
-      const current = prev ?? new Set<string>();
-      const next = new Set(current);
-      if (next.has(uid)) {
-        next.delete(uid);
-      } else if (canSelectParticipant(current, uid)) {
-        next.add(uid);
+  // ------------------------------------------------------------------
+  // Split-strategy state (Checkpoint 4D.4 §4/§19/§20) - percentageInputs/
+  // customInputs hold ONLY raw per-participant text, keyed by uid.
+  // Switching strategy always resets the ABANDONED strategy's own values
+  // (never carried across strategies); deselecting a participant always
+  // retires THEIR OWN abandoned strategy-specific value (whichever
+  // strategy is currently active) so re-selecting/switching back never
+  // silently resurrects stale financial input.
+  // ------------------------------------------------------------------
+  const [splitStrategy, setSplitStrategyValue] = useState<SplitStrategyValue>("equal");
+  const [percentageInputs, setPercentageInputs] = useState<Record<string, string>>({});
+  const [customInputs, setCustomInputs] = useState<Record<string, string>>({});
+  const [percentageErrors, setPercentageErrors] = useState<Record<string, string>>({});
+  const [customErrors, setCustomErrors] = useState<Record<string, string>>({});
+  const [splitAggregateError, setSplitAggregateError] = useState<string | null>(null);
+
+  const changeSplitStrategy = useCallback(
+    (next: SplitStrategyValue) => {
+      if (splitStrategy === next) return;
+      if (splitStrategy === "percentage") {
+        setPercentageInputs({});
+        setPercentageErrors({});
+      } else if (splitStrategy === "custom") {
+        setCustomInputs({});
+        setCustomErrors({});
       }
-      return next;
+      setSplitAggregateError(null);
+      setSplitStrategyValue(next);
+    },
+    [splitStrategy]
+  );
+
+  const retireUidFromStrategyValues = useCallback((uid: string) => {
+    setPercentageInputs((prev) => {
+      if (!(uid in prev)) return prev;
+      const copy = { ...prev };
+      delete copy[uid];
+      return copy;
     });
-    setParticipantsError(null);
+    setPercentageErrors((prev) => {
+      if (!(uid in prev)) return prev;
+      const copy = { ...prev };
+      delete copy[uid];
+      return copy;
+    });
+    setCustomInputs((prev) => {
+      if (!(uid in prev)) return prev;
+      const copy = { ...prev };
+      delete copy[uid];
+      return copy;
+    });
+    setCustomErrors((prev) => {
+      if (!(uid in prev)) return prev;
+      const copy = { ...prev };
+      delete copy[uid];
+      return copy;
+    });
   }, []);
+
+  const changePercentageInput = useCallback((uid: string, value: string) => {
+    setPercentageInputs((prev) => ({ ...prev, [uid]: value }));
+    setPercentageErrors((prev) => {
+      if (!(uid in prev)) return prev;
+      const copy = { ...prev };
+      delete copy[uid];
+      return copy;
+    });
+  }, []);
+
+  const changeCustomInput = useCallback((uid: string, value: string) => {
+    setCustomInputs((prev) => ({ ...prev, [uid]: value }));
+    setCustomErrors((prev) => {
+      if (!(uid in prev)) return prev;
+      const copy = { ...prev };
+      delete copy[uid];
+      return copy;
+    });
+  }, []);
+
+  const toggleParticipant = useCallback(
+    (uid: string) => {
+      setSelectedParticipants((prev) => {
+        const current = prev ?? new Set<string>();
+        const next = new Set(current);
+        if (next.has(uid)) {
+          next.delete(uid);
+          retireUidFromStrategyValues(uid);
+        } else if (canSelectParticipant(current, uid)) {
+          next.add(uid);
+        }
+        return next;
+      });
+      setParticipantsError(null);
+    },
+    [retireUidFromStrategyValues]
+  );
 
   const selectAllParticipants = useCallback(() => {
     setSelectedParticipants(new Set(currentMemberUids));
@@ -255,6 +349,10 @@ export default function AddExpenseScreen() {
   const clearAllParticipants = useCallback(() => {
     setSelectedParticipants(new Set());
     setParticipantsError(null);
+    setPercentageInputs({});
+    setPercentageErrors({});
+    setCustomInputs({});
+    setCustomErrors({});
   }, []);
 
   // Live-parsed preview amount ONLY (never sets amountError itself -
@@ -264,6 +362,98 @@ export default function AddExpenseScreen() {
     const result = parseExpenseMoneyInput(amountText);
     return result.ok ? result.amountMinor : null;
   }, [amountText]);
+
+  const selectedParticipantList = useMemo(
+    () => (selectedParticipants ? Array.from(selectedParticipants).sort() : []),
+    [selectedParticipants]
+  );
+
+  // ------------------------------------------------------------------
+  // Live percentage/custom parsing + aggregate text (§10/§12/§17/§18) -
+  // read-only DERIVED display state, recomputed every render from the
+  // current raw inputs. Never writes into percentageErrors/customErrors
+  // (those are reserved for a submit attempt, matching this form's
+  // existing "validate on submit" convention) - only informs the live
+  // aggregate copy and the preview's own gating.
+  // ------------------------------------------------------------------
+  const percentageParseResults = useMemo(() => {
+    const results = new Map<string, ReturnType<typeof parsePercentageToBasisPoints>>();
+    selectedParticipantList.forEach((uid) => {
+      results.set(uid, parsePercentageToBasisPoints(percentageInputs[uid] ?? ""));
+    });
+    return results;
+  }, [selectedParticipantList, percentageInputs]);
+
+  const percentageAggregateText = useMemo(() => {
+    if (splitStrategy !== "percentage" || selectedParticipantList.length === 0) return null;
+    const allValid = selectedParticipantList.every((uid) => percentageParseResults.get(uid)?.ok);
+    if (!allValid) return null;
+    const total = sumSafeIntegers(
+      selectedParticipantList.map((uid) => {
+        const result = percentageParseResults.get(uid);
+        return result && result.ok ? result.percentageBasisPoints : 0;
+      })
+    );
+    if (total === null) return null;
+    const totalText = (total / 100).toFixed(2);
+    return total === 10000 ? `Total: ${totalText}%` : `Total: ${totalText}% — must equal 100.00%.`;
+  }, [splitStrategy, selectedParticipantList, percentageParseResults]);
+
+  const previewPercentageParticipants = useMemo(() => {
+    if (splitStrategy !== "percentage" || selectedParticipantList.length === 0) return null;
+    const allValid = selectedParticipantList.every((uid) => percentageParseResults.get(uid)?.ok);
+    if (!allValid) return null;
+    const entries = selectedParticipantList.map((uid) => {
+      const result = percentageParseResults.get(uid);
+      return { uid, percentageBasisPoints: result && result.ok ? result.percentageBasisPoints : 0 };
+    });
+    const total = sumSafeIntegers(entries.map((e) => e.percentageBasisPoints));
+    return total === 10000 ? entries : null;
+  }, [splitStrategy, selectedParticipantList, percentageParseResults]);
+
+  const customParseResults = useMemo(() => {
+    const results = new Map<string, ReturnType<typeof parseExpenseShareMoneyInput>>();
+    selectedParticipantList.forEach((uid) => {
+      results.set(uid, parseExpenseShareMoneyInput(customInputs[uid] ?? ""));
+    });
+    return results;
+  }, [selectedParticipantList, customInputs]);
+
+  const customAggregateText = useMemo(() => {
+    if (splitStrategy !== "custom" || selectedParticipantList.length === 0 || previewAmountMinor === null) {
+      return null;
+    }
+    const allValid = selectedParticipantList.every((uid) => customParseResults.get(uid)?.ok);
+    if (!allValid) return null;
+    const total = sumSafeIntegers(
+      selectedParticipantList.map((uid) => {
+        const result = customParseResults.get(uid);
+        return result && result.ok ? result.amountMinor : 0;
+      })
+    );
+    if (total === null) return null;
+    const totalText = formatCurrency(total / 100);
+    const targetText = formatCurrency(previewAmountMinor / 100);
+    if (total === previewAmountMinor) return `Assigned: ${totalText} of ${targetText}`;
+    const diffText = formatCurrency(Math.abs(previewAmountMinor - total) / 100);
+    return total < previewAmountMinor
+      ? `Assigned: ${totalText} of ${targetText} — ${diffText} remaining.`
+      : `Assigned: ${totalText} of ${targetText} — ${diffText} over.`;
+  }, [splitStrategy, selectedParticipantList, customParseResults, previewAmountMinor]);
+
+  const previewCustomParticipants = useMemo(() => {
+    if (splitStrategy !== "custom" || selectedParticipantList.length === 0 || previewAmountMinor === null) {
+      return null;
+    }
+    const allValid = selectedParticipantList.every((uid) => customParseResults.get(uid)?.ok);
+    if (!allValid) return null;
+    const entries = selectedParticipantList.map((uid) => {
+      const result = customParseResults.get(uid);
+      return { uid, amountMinor: result && result.ok ? result.amountMinor : 0 };
+    });
+    const total = sumSafeIntegers(entries.map((e) => e.amountMinor));
+    return total === previewAmountMinor ? entries : null;
+  }, [splitStrategy, selectedParticipantList, customParseResults, previewAmountMinor]);
 
   // ------------------------------------------------------------------
   // Submission controller (§25/§26/§27/§28) - inFlightRef (synchronous
@@ -291,23 +481,120 @@ export default function AddExpenseScreen() {
     setCategoryError(categoryResult.ok ? null : categoryResult.error);
     setParticipantsError(participants.length > 0 ? null : "Select at least one participant.");
 
+    // Checkpoint 4D.4 §21: the route re-validates independently in
+    // handleSubmit for every strategy - UI disablement is never the sole
+    // authority. Each branch below re-parses from the raw text state,
+    // never trusting the live/memoized preview values. Bailing out here
+    // (rather than deep inside each branch) lets every branch below
+    // safely rely on descResult/amountResult/categoryResult/payerUid
+    // already being narrowed to their "ok" shapes by TypeScript's own
+    // control-flow analysis - no `as` casts needed anywhere below.
     if (!descResult.ok || !amountResult.ok || !categoryResult.ok || participants.length === 0 || !payerUid) {
       return;
     }
 
-    const facts: ExpenseCreationFacts = {
-      tripId,
-      payerUid,
-      amountMinor: amountResult.amountMinor,
-      currency: "USD",
-      description: descResult.value,
-      category: categoryResult.value,
-      paymentSource: "member_out_of_pocket",
-      occurredAtInstantMs: null,
-      replacesExpenseId: null,
-      splitStrategy: "equal",
-      participants: canonicalizeEqualParticipants(participants),
-    };
+    let facts: ExpenseCreationFacts | null = null;
+
+    if (splitStrategy === "equal") {
+      setPercentageErrors({});
+      setCustomErrors({});
+      setSplitAggregateError(null);
+      facts = {
+        tripId,
+        payerUid,
+        amountMinor: amountResult.amountMinor,
+        currency: "USD",
+        description: descResult.value,
+        category: categoryResult.value,
+        paymentSource: "member_out_of_pocket",
+        occurredAtInstantMs: null,
+        replacesExpenseId: null,
+        splitStrategy: "equal",
+        participants: canonicalizeEqualParticipants(participants),
+      };
+    } else if (splitStrategy === "percentage") {
+      setCustomErrors({});
+      const nextErrors: Record<string, string> = {};
+      const parsed: { uid: string; percentageBasisPoints: number }[] = [];
+      participants.forEach((uid) => {
+        const result = parsePercentageToBasisPoints(percentageInputs[uid] ?? "");
+        if (result.ok) parsed.push({ uid, percentageBasisPoints: result.percentageBasisPoints });
+        else nextErrors[uid] = result.error;
+      });
+      setPercentageErrors(nextErrors);
+
+      let aggregateOk = false;
+      let aggregateMessage: string | null = null;
+      if (Object.keys(nextErrors).length === 0 && parsed.length > 0) {
+        const total = sumSafeIntegers(parsed.map((p) => p.percentageBasisPoints));
+        if (total === 10000) {
+          aggregateOk = true;
+        } else if (total === null) {
+          aggregateMessage = "Percentages are too large to total. Adjust and try again.";
+        } else {
+          aggregateMessage = `Total: ${(total / 100).toFixed(2)}% — must equal 100.00%.`;
+        }
+      }
+      setSplitAggregateError(aggregateMessage);
+
+      if (Object.keys(nextErrors).length === 0 && aggregateOk) {
+        facts = {
+          tripId,
+          payerUid,
+          amountMinor: amountResult.amountMinor,
+          currency: "USD",
+          description: descResult.value,
+          category: categoryResult.value,
+          paymentSource: "member_out_of_pocket",
+          occurredAtInstantMs: null,
+          replacesExpenseId: null,
+          splitStrategy: "percentage",
+          participants: canonicalizePercentageParticipants(parsed),
+        };
+      }
+    } else {
+      setPercentageErrors({});
+      const nextErrors: Record<string, string> = {};
+      const parsed: { uid: string; amountMinor: number }[] = [];
+      participants.forEach((uid) => {
+        const result = parseExpenseShareMoneyInput(customInputs[uid] ?? "");
+        if (result.ok) parsed.push({ uid, amountMinor: result.amountMinor });
+        else nextErrors[uid] = result.error;
+      });
+      setCustomErrors(nextErrors);
+
+      let aggregateOk = false;
+      let aggregateMessage: string | null = null;
+      if (Object.keys(nextErrors).length === 0 && parsed.length > 0) {
+        const total = sumSafeIntegers(parsed.map((p) => p.amountMinor));
+        if (total === amountResult.amountMinor) {
+          aggregateOk = true;
+        } else if (total === null) {
+          aggregateMessage = "Custom amounts are too large to total. Adjust and try again.";
+        } else {
+          aggregateMessage = `Assigned: ${formatCurrency(total / 100)} of ${formatCurrency(amountResult.amountMinor / 100)}.`;
+        }
+      }
+      setSplitAggregateError(aggregateMessage);
+
+      if (Object.keys(nextErrors).length === 0 && aggregateOk) {
+        facts = {
+          tripId,
+          payerUid,
+          amountMinor: amountResult.amountMinor,
+          currency: "USD",
+          description: descResult.value,
+          category: categoryResult.value,
+          paymentSource: "member_out_of_pocket",
+          occurredAtInstantMs: null,
+          replacesExpenseId: null,
+          splitStrategy: "custom",
+          participants: canonicalizeCustomParticipants(parsed),
+        };
+      }
+    }
+
+    if (!facts) return;
 
     const clientRequestId = resolveExpenseClientRequestId(
       pendingRef,
@@ -320,17 +607,53 @@ export default function AddExpenseScreen() {
     setSubmitError(null);
 
     try {
-      await recordTripExpense({
-        tripId: facts.tripId,
-        payerUid: facts.payerUid,
-        amountMinor: facts.amountMinor,
-        currency: facts.currency,
-        description: facts.description,
-        ...(facts.category !== null ? { category: facts.category } : {}),
-        splitStrategy: "equal",
-        participants: facts.participants,
-        clientRequestId,
-      });
+      // Checkpoint 4D.4 §27/§28/§29: switching on facts.splitStrategy
+      // (not merging into one generic call) lets TypeScript correctly
+      // narrow facts.participants to the matching wire shape for each
+      // strategy - no direct Firestore writes, no preview allocation
+      // values sent, the backend independently recomputes/validates the
+      // exact split regardless of strategy.
+      switch (facts.splitStrategy) {
+        case "equal":
+          await recordTripExpense({
+            tripId: facts.tripId,
+            payerUid: facts.payerUid,
+            amountMinor: facts.amountMinor,
+            currency: facts.currency,
+            description: facts.description,
+            ...(facts.category !== null ? { category: facts.category } : {}),
+            splitStrategy: "equal",
+            participants: facts.participants,
+            clientRequestId,
+          });
+          break;
+        case "percentage":
+          await recordTripExpense({
+            tripId: facts.tripId,
+            payerUid: facts.payerUid,
+            amountMinor: facts.amountMinor,
+            currency: facts.currency,
+            description: facts.description,
+            ...(facts.category !== null ? { category: facts.category } : {}),
+            splitStrategy: "percentage",
+            participants: facts.participants,
+            clientRequestId,
+          });
+          break;
+        case "custom":
+          await recordTripExpense({
+            tripId: facts.tripId,
+            payerUid: facts.payerUid,
+            amountMinor: facts.amountMinor,
+            currency: facts.currency,
+            description: facts.description,
+            ...(facts.category !== null ? { category: facts.category } : {}),
+            splitStrategy: "custom",
+            participants: facts.participants,
+            clientRequestId,
+          });
+          break;
+      }
 
       // Success clears the pending record - a later submission is a new
       // logical request and must get a new id.
@@ -366,6 +689,9 @@ export default function AddExpenseScreen() {
     category,
     selectedParticipants,
     payerUid,
+    splitStrategy,
+    percentageInputs,
+    customInputs,
     announceExpenseSuccess,
     goToExpenseList,
   ]);
@@ -405,7 +731,7 @@ export default function AddExpenseScreen() {
           >
             <Text style={[styles.title, { color: colors.textPrimary }]}>Add Expense</Text>
             <Text style={[styles.subtitle, { color: colors.textMuted }]}>
-              Split equally with the trip members who shared this cost.
+              Choose who shared this cost and how to split it.
             </Text>
 
             <View style={{ height: spacing.md }} />
@@ -508,6 +834,20 @@ export default function AddExpenseScreen() {
                 profileErrorVisible={profileState.status === "error"}
                 onRetryProfiles={retryProfiles}
                 previewAmountMinor={previewAmountMinor}
+                splitStrategy={splitStrategy}
+                onChangeSplitStrategy={changeSplitStrategy}
+                percentageValues={percentageInputs}
+                onChangePercentageValue={changePercentageInput}
+                percentageErrors={percentageErrors}
+                percentageAggregateText={percentageAggregateText}
+                percentageAggregateError={splitStrategy === "percentage" ? splitAggregateError : null}
+                previewPercentageParticipants={previewPercentageParticipants}
+                customValues={customInputs}
+                onChangeCustomValue={changeCustomInput}
+                customErrors={customErrors}
+                customAggregateText={customAggregateText}
+                customAggregateError={splitStrategy === "custom" ? splitAggregateError : null}
+                previewCustomParticipants={previewCustomParticipants}
                 submitting={submitting}
                 submitError={submitError}
                 onSubmit={handleSubmit}

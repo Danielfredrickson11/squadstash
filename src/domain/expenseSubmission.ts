@@ -27,7 +27,12 @@ export type ParseExpenseMoneyResult =
   | { ok: true; amountMinor: number }
   | { ok: false; error: string };
 
-export function parseExpenseMoneyInput(input: string): ParseExpenseMoneyResult {
+// Shared shape/strip logic for BOTH the total Expense amount (never
+// zero) and a custom per-participant share (zero IS a legitimate
+// intentional share, Checkpoint 4D.4 §13) - `allowZero` is the only
+// behavioral difference between the two exported wrappers below, so the
+// actual parsing logic is written once, not duplicated.
+function parseMoneyShape(input: string, allowZero: boolean): ParseExpenseMoneyResult {
   const trimmed = input.trim();
   if (trimmed.length === 0) {
     return { ok: false, error: "Enter a valid amount." };
@@ -37,12 +42,15 @@ export function parseExpenseMoneyInput(input: string): ParseExpenseMoneyResult {
   const unsigned = isNegative ? trimmed.slice(1) : trimmed;
 
   // Shape-check FIRST, on the unsigned remainder - "-abc" must still
-  // report "Enter a valid amount.", not "Enter a positive amount.".
+  // report "Enter a valid amount.", not a negative-specific message.
   if (!MONEY_SHAPE_PATTERN.test(unsigned)) {
     return { ok: false, error: "Enter a valid amount." };
   }
   if (isNegative) {
-    return { ok: false, error: "Enter a positive amount." };
+    return {
+      ok: false,
+      error: allowZero ? "Enter a non-negative amount." : "Enter a positive amount.",
+    };
   }
 
   // Only NOW, once the whole shape is confirmed acceptable, strip the
@@ -55,8 +63,14 @@ export function parseExpenseMoneyInput(input: string): ParseExpenseMoneyResult {
     return { ok: false, error: "Enter an amount with at most 2 decimal places." };
   }
 
-  const amountMinor = parseDollarsToMinorUnits(withoutCommas);
+  const amountMinor = parseDollarsToMinorUnits(withoutCommas, { allowZero });
   if (amountMinor === null) {
+    if (allowZero) {
+      // With allowZero:true, parseDollarsToMinorUnits only returns null
+      // for an unsafe-integer result now (zero itself is accepted) - no
+      // separate "greater than $0" message applies here.
+      return { ok: false, error: "Enter a smaller amount." };
+    }
     // parseDollarsToMinorUnits returns null for both "exactly zero" (its
     // own allowZero:false rejection) and "unsafe-integer result" - these
     // need different, honest messages, so distinguish them here rather
@@ -69,6 +83,95 @@ export function parseExpenseMoneyInput(input: string): ParseExpenseMoneyResult {
   }
 
   return { ok: true, amountMinor };
+}
+
+// The total Expense amount - zero is never valid (unchanged from
+// Checkpoint 4D.3).
+export function parseExpenseMoneyInput(input: string): ParseExpenseMoneyResult {
+  return parseMoneyShape(input, false);
+}
+
+// A custom split's per-participant share (Checkpoint 4D.4 §13) - the
+// SAME accepted shapes as the total Expense amount, but an explicit $0
+// share is valid (someone was included in the expense but owes nothing
+// toward it).
+export function parseExpenseShareMoneyInput(input: string): ParseExpenseMoneyResult {
+  return parseMoneyShape(input, true);
+}
+
+// ---------------------------------------------------------------------
+// PERCENTAGE INPUT (Checkpoint 4D.4 §7/§8/§9)
+// ---------------------------------------------------------------------
+//
+// Parses a plain percentage string (never a literal "%" suffix - the UI
+// indicates percentage visually) into integer basis points (100.00% =
+// 10000), by parsing the whole/fractional digit strings directly and
+// combining them as integers - NEVER Number(input)*100/parseFloat*100/
+// Math.round(decimal*100), matching parseExpenseMoneyInput's own
+// no-floating-point-round-trip discipline exactly.
+//
+// A leading digit is REQUIRED (".5" is rejected - "0.5" is the accepted
+// form) - PERCENTAGE_SHAPE_PATTERN's mandatory leading \d+ enforces this
+// by construction, with no special-case code needed.
+const PERCENTAGE_SHAPE_PATTERN = /^\d+(\.\d+)?$/;
+
+export type ParsePercentageResult =
+  | { ok: true; percentageBasisPoints: number }
+  | { ok: false; error: string };
+
+export function parsePercentageToBasisPoints(input: string): ParsePercentageResult {
+  const trimmed = input.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, error: "Enter a valid percentage." };
+  }
+
+  const isNegative = trimmed.startsWith("-");
+  const unsigned = isNegative ? trimmed.slice(1) : trimmed;
+
+  if (!PERCENTAGE_SHAPE_PATTERN.test(unsigned)) {
+    return { ok: false, error: "Enter a valid percentage." };
+  }
+  if (isNegative) {
+    return { ok: false, error: "Enter a percentage from 0 to 100." };
+  }
+
+  const decimalPart = unsigned.includes(".") ? unsigned.split(".")[1] : "";
+  if (decimalPart.length > 2) {
+    return { ok: false, error: "Use at most 2 decimal places." };
+  }
+
+  const [wholePart, fractionPart = ""] = unsigned.split(".");
+  const paddedFraction = (fractionPart + "00").slice(0, 2);
+  const percentageBasisPoints = Number(wholePart) * 100 + Number(paddedFraction);
+
+  if (!Number.isSafeInteger(percentageBasisPoints) || percentageBasisPoints > 10000) {
+    return { ok: false, error: "Enter a percentage from 0 to 100." };
+  }
+
+  return { ok: true, percentageBasisPoints };
+}
+
+// ---------------------------------------------------------------------
+// SAFE-INTEGER AGGREGATION (Checkpoint 4D.4 §10/§16/§39)
+// ---------------------------------------------------------------------
+//
+// Sums a list of already-validated integers, checking the RUNNING total
+// after every addition (a running sum can leave the safe-integer range
+// partway through even when every individual addend is independently
+// safe) - mirrors src/domain/tripExpenseSplits.ts's own private
+// sumSafeIntegers discipline exactly (that file is frozen/unmodified in
+// this checkpoint, so this is a small, deliberate, intentional
+// duplication of the same already-proven arithmetic, not a new pattern).
+// Returns null (never throws, never a fabricated total) the moment the
+// running sum becomes unsafe - callers fail closed on null.
+export function sumSafeIntegers(values: number[]): number | null {
+  let total = 0;
+  for (const value of values) {
+    const next = total + value;
+    if (!Number.isSafeInteger(next)) return null;
+    total = next;
+  }
+  return total;
 }
 
 // ---------------------------------------------------------------------
@@ -200,6 +303,42 @@ export function canonicalizeEqualParticipants(uids: Iterable<string>): EqualSpli
   return Array.from(new Set(uids))
     .sort()
     .map((uid) => ({ uid }));
+}
+
+// Percentage/custom canonicalizers (Checkpoint 4D.4 §23/§24/§38) - unlike
+// canonicalizeEqualParticipants above (a flat uid list with no attached
+// value, where silent dedup is harmless), a duplicate uid here carries
+// two INDEPENDENT financial values that may genuinely disagree - picking
+// one arbitrarily would silently discard a contradictory input the
+// caller never intended. These FAIL LOUDLY on a duplicate uid instead.
+export function canonicalizePercentageParticipants(
+  participants: Iterable<PercentageSplitParticipantFacts>
+): PercentageSplitParticipantFacts[] {
+  const byUid = new Map<string, number>();
+  for (const p of participants) {
+    if (byUid.has(p.uid)) {
+      throw new Error(`canonicalizePercentageParticipants: duplicate participant uid "${p.uid}".`);
+    }
+    byUid.set(p.uid, p.percentageBasisPoints);
+  }
+  return Array.from(byUid.keys())
+    .sort()
+    .map((uid) => ({ uid, percentageBasisPoints: byUid.get(uid) as number }));
+}
+
+export function canonicalizeCustomParticipants(
+  participants: Iterable<CustomSplitParticipantFacts>
+): CustomSplitParticipantFacts[] {
+  const byUid = new Map<string, number>();
+  for (const p of participants) {
+    if (byUid.has(p.uid)) {
+      throw new Error(`canonicalizeCustomParticipants: duplicate participant uid "${p.uid}".`);
+    }
+    byUid.set(p.uid, p.amountMinor);
+  }
+  return Array.from(byUid.keys())
+    .sort()
+    .map((uid) => ({ uid, amountMinor: byUid.get(uid) as number }));
 }
 
 function equalParticipantsEqual(
