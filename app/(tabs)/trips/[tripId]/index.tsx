@@ -1443,18 +1443,35 @@ export default function TripDetails() {
                     <Text style={[styles.cardSub, { color: colors.textSecondary }]}>
                       No personal stash yet
                     </Text>
-                    <Pressable
-                      onPress={startCreateStash}
-                      style={({ pressed }) => [
-                        styles.primaryActionBtn,
-                        { backgroundColor: colors.mintDark },
-                        pressed && { opacity: 0.9 },
-                      ]}
-                    >
-                      <Text style={[styles.primaryActionText, { color: colors.onMint }]}>
-                        Create My Stash
-                      </Text>
-                    </Pressable>
+                    {/* Checkpoint 4D.5A: primaryActionBtn's own `flex: 1`
+                        only resolves to "fill available width" inside a
+                        flexDirection:"row" parent (see actionsRow's every
+                        other use in this file - Shared Stash/My Stash
+                        Add Money/Withdraw, the Expense card's own
+                        actions). Placed directly inside stashEmptyWrap
+                        (a plain column View) instead, flex:1 fought the
+                        button's own fixed height:42 and collapsed it to
+                        a thin strip. Reusing actionsRow here - the exact
+                        same already-correct wrapper, not a new style -
+                        fixes it with no change to primaryActionBtn
+                        itself, so every other button relying on it is
+                        unaffected. */}
+                    <View style={styles.actionsRow}>
+                      <Pressable
+                        onPress={startCreateStash}
+                        accessibilityRole="button"
+                        accessibilityLabel="Create My Stash"
+                        style={({ pressed }) => [
+                          styles.primaryActionBtn,
+                          { backgroundColor: colors.mintDark },
+                          pressed && { opacity: 0.9 },
+                        ]}
+                      >
+                        <Text style={[styles.primaryActionText, { color: colors.onMint }]}>
+                          Create My Stash
+                        </Text>
+                      </Pressable>
+                    </View>
                   </View>
                 )
               ) : (
