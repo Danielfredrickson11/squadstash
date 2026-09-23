@@ -21,16 +21,63 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { BAR_HEIGHT, CENTER_BUTTON_SIZE } from "../../../../../components/navigation/BottomNav";
 import { AvatarCircle, initialsFromName } from "../../../../../components/buckets/AvatarCircle";
 import { StatusChip } from "../../../../../components/expenses/StatusChip";
+import { ReverseExpenseDialog } from "../../../../../components/expenses/ReverseExpenseDialog";
 import { cardShadowFor, radii, spacing, typography } from "../../../../../src/theme/tokens";
 import { useSemanticColors } from "../../../../../src/theme/useSemanticColors";
+import { useAuth } from "../../../../../src/contexts/AuthContext";
+import { useExpenseSuccess } from "../../../../../src/hooks/useExpenseSuccess";
 import {
   fetchExpenseById,
   fetchExpenseSplitsForExpense,
+  generateExpenseClientRequestId,
+  reverseTripExpense,
   subscribeToExpenseById,
 } from "../../../../../src/services/firebase/expenses";
 import { subscribeToPublicUsersByIdsChunked } from "../../../../../src/services/firebase/users";
+import { fetchTripById } from "../../../../../src/services/firebase/trips";
+import {
+  canReverseExpense,
+  isDefinitiveDifferentRequestFailure,
+  normalizeReversalReason,
+  reduceReversalOutcome,
+  resolveExpenseReversalClientRequestId,
+  type ExpenseReversalFacts,
+  type PendingExpenseReversalRequest,
+  type ReversalOutcomeResult,
+} from "../../../../../src/domain/expenseReversal";
 import { formatCurrency, formatTransactionTimestamp } from "../../../../../utils/format";
-import type { Expense, ExpenseSplit, PublicProfile, SplitStrategy } from "../../../../../src/types/domain";
+import type { Expense, ExpenseSplit, PublicProfile, SplitStrategy, Trip } from "../../../../../src/types/domain";
+
+// Local error mapper (Checkpoint 4D.6), matching the exact existing
+// per-feature convention (expenseErrorMessage in expenses/create.tsx,
+// savingsErrorMessage, stashCreateErrorMessage) rather than a shared
+// app-wide abstraction - the same definitive-vs-ambiguous table from the
+// frozen UI preflight §20, applied to reversal. `knownAlreadyReversed`
+// lets this function show the SPECIFIC "already reversed" copy only when
+// the client independently has the freshest, live-confirmed persisted
+// status - never guessed from the failed-precondition code alone.
+function reversalErrorMessage(e: unknown, knownAlreadyReversed: boolean): string {
+  const code = (e as { code?: string } | null | undefined)?.code;
+  switch (code) {
+    case "functions/invalid-argument":
+      return "That information isn't valid — please check and try again.";
+    case "functions/permission-denied":
+      return "You don't have permission to do that.";
+    case "functions/failed-precondition":
+      return knownAlreadyReversed
+        ? "This expense has already been reversed."
+        : "We couldn't reverse this expense because its trip or record information changed. Refresh and try again.";
+    case "functions/not-found":
+      return "This expense could not be found.";
+    case "functions/already-exists":
+      return "We couldn't safely reconcile this reversal request. Review it and try again.";
+    case "functions/unavailable":
+    case "functions/deadline-exceeded":
+      return "We couldn't reach the server, so we can't confirm this went through — it's safe to try again.";
+    default:
+      return "We couldn't reach the server, so we can't confirm this went through — it's safe to try again.";
+  }
+}
 
 const NAV_BUTTON_PEEK = CENTER_BUTTON_SIZE / 2 - 4;
 const NAV_BREATHING_ROOM = spacing.xxl;
@@ -70,6 +117,8 @@ export default function ExpenseDetailScreen() {
   const theme = useTheme();
   const colors = useSemanticColors();
   const insets = useSafeAreaInsets();
+  const { user } = useAuth();
+  const { announceExpenseSuccess } = useExpenseSuccess();
 
   const scrollBottomInset = useMemo(() => {
     const navSafeAreaPadding = Platform.OS === "ios" ? 0 : Math.max(insets.bottom, spacing.sm);
@@ -289,6 +338,36 @@ export default function ExpenseDetailScreen() {
     [profileState, missingMemberLabels]
   );
 
+  // ------------------------------------------------------------------
+  // Trip - one-shot, AUTHORIZATION-ONLY (Checkpoint 4D.6). A read
+  // failure must never accidentally grant reversal authority: `trip`
+  // stays `undefined` (loading) or `null` (unavailable/failed) rather
+  // than a fabricated value, and canReverseExpense already fails closed
+  // on missing owner/member data by construction - no special-case
+  // "Trip unavailable" branch is needed here. A Trip-read failure never
+  // hides the Expense's own already-loaded historical content above.
+  // ------------------------------------------------------------------
+  const [trip, setTrip] = useState<Trip | null | undefined>(undefined);
+  useEffect(() => {
+    let cancelled = false;
+    if (!tripId) {
+      setTrip(null);
+      return undefined;
+    }
+    setTrip(undefined);
+    fetchTripById(tripId)
+      .then((t) => {
+        if (!cancelled) setTrip(t);
+      })
+      .catch((err) => {
+        console.error("Trip fetch error (expense detail, reversal authorization only):", err);
+        if (!cancelled) setTrip(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tripId]);
+
   const expense = expenseState.status === "ready" ? expenseState.expense : null;
   const isReversed = expense?.status === "reversed";
   const isCorrection = !!expense?.replacesExpenseId;
@@ -298,7 +377,296 @@ export default function ExpenseDetailScreen() {
     ? resolveMemberLabel(expense.payerUid)
     : null;
 
+  // ------------------------------------------------------------------
+  // Reversal authorization (advisory only - reverseTripExpense
+  // independently re-authorizes server-side regardless).
+  // ------------------------------------------------------------------
+  const canReverse = useMemo(() => {
+    if (!expense) return false;
+    return canReverseExpense({
+      currentUid: user?.uid,
+      expenseStatus: expense.status,
+      expenseCreatedBy: expense.createdBy,
+      tripOwnerId: trip?.ownerId,
+      tripMemberIds: trip?.memberIds,
+    });
+  }, [expense, user?.uid, trip]);
+
+  // ------------------------------------------------------------------
+  // Reversal dialog + submission controller (§25/§26/§27/§28 of the
+  // Add-Expense checkpoint's own idempotency architecture, reused
+  // exactly - inFlightRef + pendingRef, mirroring
+  // src/hooks/useSavingsMoneyAction.tsx's submit() precisely).
+  //
+  // Checkpoint 4D.6A hardening: ALL outcome decisions (direct success,
+  // a definitive/ambiguous failure, a passive live-listener update) are
+  // routed through the pure reduceReversalOutcome reducer
+  // (src/domain/expenseReversal.ts) rather than inferring success from
+  // `reversedBy === currentUid` alone - that inference was unsound (the
+  // same account can independently reverse the same Expense from a
+  // different device/session with a different clientRequestId). Only an
+  // ACTUAL successful trusted-callable response (the original
+  // submission, or an explicit user-initiated exact-replay verification
+  // of a previously-ambiguous one) can ever resolve to genuine success.
+  // ------------------------------------------------------------------
+  const [reverseDialogVisible, setReverseDialogVisible] = useState(false);
+  const [reasonText, setReasonText] = useState("");
+  const [reversalSubmitting, setReversalSubmitting] = useState(false);
+  const [reversalSubmitError, setReversalSubmitError] = useState<string | null>(null);
+  // Mirrors pendingReversalRef.current !== null, but as real React state
+  // so the "Check reversal status" recovery affordance can render even
+  // once the ordinary "Reverse expense" trigger disappears (the Expense
+  // is already showing as reversed) - a ref alone can't drive a render.
+  const [hasPendingReversal, setHasPendingReversal] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+
+  const pendingReversalRef = useRef<PendingExpenseReversalRequest | null>(null);
+  const reversalInFlightRef = useRef(false);
+
+  // Prevents a stale async continuation (a reverseTripExpense call still
+  // in flight at unmount/route-change time) from touching this
+  // component's state after it can no longer legitimately do so -
+  // matches this file's own established `cancelled` pattern used by
+  // every other one-shot effect, applied here to the two event-handler-
+  // triggered async functions below (which aren't themselves inside a
+  // useEffect and so need their own persistent mounted-flag).
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // Kept in sync via effect so the eventual catch() below (which may run
+  // after a live Expense update has already arrived) reads the FRESHEST
+  // persisted status, never a stale closure snapshot from when the
+  // request was first fired - required for the "only conclude already-
+  // reversed if independently confirmed" rule.
+  const expenseStateRef = useRef(expenseState);
+  useEffect(() => {
+    expenseStateRef.current = expenseState;
+  }, [expenseState]);
+
+  // Applies a reduceReversalOutcome result as the one place every
+  // resulting state change happens - every call site below (direct
+  // submit, explicit verification, the passive live-update effect)
+  // funnels through this, so "success" can only ever be declared once
+  // per pending request (action "none" is always a no-op) and the
+  // announcement/dialog-close/pending-clear side effects never drift out
+  // of sync with each other.
+  const applyReversalOutcome = useCallback(
+    (result: ReversalOutcomeResult) => {
+      if (result.action === "none") return;
+      setReversalSubmitting(false);
+      setVerifying(false);
+      if (result.action === "success") {
+        pendingReversalRef.current = null;
+        setHasPendingReversal(false);
+        setReverseDialogVisible(false);
+        setReversalSubmitError(null);
+        setVerifyError(null);
+        announceExpenseSuccess("Expense reversed.");
+      } else if (result.action === "reversed_by_other") {
+        pendingReversalRef.current = null;
+        setHasPendingReversal(false);
+        setReversalSubmitError("This expense was already reversed.");
+        setVerifyError("This expense was already reversed.");
+      } else if (result.action === "show_error") {
+        // Definitive-but-not-confirmed-already-reversed, or ambiguous -
+        // pendingReversalRef is deliberately PRESERVED (never cleared
+        // here) so an identical-facts retry safely reuses the same
+        // clientRequestId, matching the existing ambiguous-failure
+        // precedent exactly.
+        setReversalSubmitError(result.message);
+        setVerifyError(result.message);
+      }
+    },
+    [announceExpenseSuccess]
+  );
+
+  // Checkpoint 4D.6A follow-up review: classifies a caught
+  // reverseTripExpense failure for reconciliation, shared by both
+  // handleConfirmReverse and verifyPendingReversal's own catch blocks so
+  // neither can independently drift out of sync. Critically, this does
+  // NOT derive "definitely a different request" from the live listener
+  // alone (that was the original bug) - it requires the FAILURE'S OWN
+  // error code to be the backend's specific "already reversed" rejection
+  // (isDefinitiveDifferentRequestFailure), in addition to the live
+  // listener confirming reversed status. An ambiguous transport failure
+  // (unavailable/deadline-exceeded/unknown) is NEVER promoted to
+  // "definitely different" merely because the Expense already displays
+  // Reversed - it always falls through to honest "couldn't verify" copy,
+  // preserving the pending request for another explicit retry.
+  const classifyReversalFailure = useCallback(
+    (e: unknown): { definitelyDifferentRequest: boolean; errorMessage: string } => {
+      const latest = expenseStateRef.current;
+      const liveStatusIsReversed = latest.status === "ready" && latest.expense.status === "reversed";
+      const errorCode = (e as { code?: string } | null | undefined)?.code;
+      const definitelyDifferentRequest = isDefinitiveDifferentRequestFailure({
+        errorCode,
+        liveStatusIsReversed,
+      });
+
+      if (definitelyDifferentRequest) {
+        return { definitelyDifferentRequest: true, errorMessage: "This expense has already been reversed." };
+      }
+      if (liveStatusIsReversed) {
+        // The Expense already shows Reversed live, but THIS specific
+        // request's own outcome could not be confirmed (an ambiguous
+        // transport failure, or a non-"already reversed" definitive
+        // rejection) - honest, distinct copy from the generic ambiguous
+        // message, naming both true facts without conflating them.
+        return {
+          definitelyDifferentRequest: false,
+          errorMessage:
+            "This expense shows as reversed, but we couldn’t confirm whether your request was the one that went through. It’s safe to check again.",
+        };
+      }
+      return { definitelyDifferentRequest: false, errorMessage: reversalErrorMessage(e, false) };
+    },
+    []
+  );
+
+  const openReverseDialog = useCallback(() => {
+    if (reversalInFlightRef.current) return;
+    // Prefills from any still-pending request's own facts (never from
+    // stale form state) - reopening after an ambiguous failure this way
+    // guarantees a same-facts retry reuses the same clientRequestId.
+    setReasonText(pendingReversalRef.current?.reversalReason ?? "");
+    setReversalSubmitError(null);
+    setReverseDialogVisible(true);
+  }, []);
+
+  const closeReverseDialog = useCallback(() => {
+    // Ignored while a request is unresolved - mirrors
+    // useSavingsMoneyAction's own close() guard; pendingReversalRef is
+    // deliberately NEVER cleared merely by dismissing the dialog, so a
+    // later re-open with the same reason still safely reuses the same
+    // clientRequestId.
+    if (reversalInFlightRef.current) return;
+    setReverseDialogVisible(false);
+  }, []);
+
+  const changeReasonText = useCallback((value: string) => {
+    setReasonText(value);
+    setReversalSubmitError(null);
+  }, []);
+
+  // Passive reconciliation against the LIVE Expense subscription - fires
+  // whenever the live listener reports a status change while we still
+  // have an unresolved pending request of our own. Per the fix, this can
+  // ONLY ever safely conclude "reversed_by_other" (a definitively
+  // different uid - never us, on any device) - a same-uid match is
+  // explicitly left unresolved ("none") rather than assumed successful;
+  // see reduceReversalOutcome's own module comment for the full
+  // reasoning. Never issues a retry itself.
+  useEffect(() => {
+    if (expenseState.status !== "ready") return;
+    const current = expenseState.expense;
+    applyReversalOutcome(
+      reduceReversalOutcome(
+        {
+          type: "live_update",
+          expenseStatus: current.status,
+          expenseReversedBy: current.reversedBy,
+          currentUid: user?.uid,
+        },
+        pendingReversalRef.current !== null
+      )
+    );
+  }, [expenseState, user?.uid, applyReversalOutcome]);
+
+  const handleConfirmReverse = useCallback(async () => {
+    if (reversalInFlightRef.current) return;
+    if (!expense) return;
+    if (!canReverse) {
+      setReversalSubmitError("You don't have permission to do that.");
+      return;
+    }
+
+    const reasonResult = normalizeReversalReason(reasonText);
+    if (!reasonResult.ok) {
+      setReversalSubmitError(reasonResult.error);
+      return;
+    }
+
+    const facts: ExpenseReversalFacts = { expenseId: expense.id, reversalReason: reasonResult.value };
+    const clientRequestId = resolveExpenseReversalClientRequestId(
+      pendingReversalRef,
+      facts,
+      generateExpenseClientRequestId
+    );
+    setHasPendingReversal(true);
+
+    reversalInFlightRef.current = true;
+    setReversalSubmitting(true);
+    setReversalSubmitError(null);
+
+    try {
+      await reverseTripExpense({
+        expenseId: facts.expenseId,
+        ...(facts.reversalReason !== undefined ? { reversalReason: facts.reversalReason } : {}),
+        clientRequestId,
+      });
+      if (!isMountedRef.current) return;
+      // The existing live Expense subscription independently reconciles
+      // the real persisted Reversed status/reversedAt/reversalReason -
+      // no optimistic/fabricated mutation is ever applied here.
+      applyReversalOutcome(reduceReversalOutcome({ type: "callable_success" }, true));
+    } catch (e) {
+      if (!isMountedRef.current) return;
+      console.error("Failed to reverse expense:", e);
+      const { definitelyDifferentRequest, errorMessage } = classifyReversalFailure(e);
+      applyReversalOutcome(
+        reduceReversalOutcome({ type: "callable_failure", definitelyDifferentRequest, errorMessage }, true)
+      );
+    } finally {
+      if (isMountedRef.current) reversalInFlightRef.current = false;
+    }
+  }, [expense, canReverse, reasonText, applyReversalOutcome, classifyReversalFailure]);
+
+  // Explicit, user-initiated recovery action (Checkpoint 4D.6A
+  // requirement #3/#4) - re-submits the EXACT pending request (same
+  // clientRequestId, same normalized reason) through the trusted
+  // callable to get a VERIFIED answer, never inferred from `reversedBy`
+  // alone. Reachable even once the ordinary "Reverse expense" trigger
+  // has disappeared (the Expense already shows as reversed), so the
+  // user is never forced to mint a new request id just to find out
+  // whether their own previous attempt actually committed. Never fires
+  // automatically - only ever called from an explicit tap.
+  const verifyPendingReversal = useCallback(async () => {
+    if (reversalInFlightRef.current) return;
+    const pending = pendingReversalRef.current;
+    if (!pending) return;
+
+    reversalInFlightRef.current = true;
+    setVerifying(true);
+    setVerifyError(null);
+
+    try {
+      await reverseTripExpense({
+        expenseId: pending.expenseId,
+        ...(pending.reversalReason !== undefined ? { reversalReason: pending.reversalReason } : {}),
+        clientRequestId: pending.clientRequestId,
+      });
+      if (!isMountedRef.current) return;
+      applyReversalOutcome(reduceReversalOutcome({ type: "callable_success" }, true));
+    } catch (e) {
+      if (!isMountedRef.current) return;
+      console.error("Failed to verify pending reversal:", e);
+      const { definitelyDifferentRequest, errorMessage } = classifyReversalFailure(e);
+      applyReversalOutcome(
+        reduceReversalOutcome({ type: "callable_failure", definitelyDifferentRequest, errorMessage }, true)
+      );
+    } finally {
+      if (isMountedRef.current) reversalInFlightRef.current = false;
+    }
+  }, [applyReversalOutcome, classifyReversalFailure]);
+
   return (
+    <>
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.colors.background }]}>
       <ScrollView contentContainerStyle={[styles.scrollContent, { paddingBottom: scrollBottomInset }]}>
         <View style={styles.contentWrap}>
@@ -544,12 +912,98 @@ export default function ExpenseDetailScreen() {
                     ) : null}
                   </>
                 ) : null}
+
+                {/* Checkpoint 4D.6: read-only view otherwise - the ONLY
+                    mutation action on this screen. Shown only when the
+                    Expense is active AND the current user is
+                    authorized (advisory only - the trusted callable
+                    independently re-authorizes). Never shown once
+                    reversed - matches the frozen "no Reverse expense
+                    action remains available once the record is
+                    reversed" requirement. Archived Trips are NOT
+                    gated here at all (reversal preflight §6) - an
+                    authorized caller may reverse an Expense on an
+                    archived Trip exactly like an active one. */}
+                {canReverse ? (
+                  <Pressable
+                    onPress={openReverseDialog}
+                    accessibilityRole="button"
+                    accessibilityLabel="Reverse expense"
+                    style={({ pressed }) => [
+                      styles.secondaryActionBtn,
+                      styles.reverseBtn,
+                      { borderColor: colors.border },
+                      pressed && { opacity: 0.85 },
+                    ]}
+                  >
+                    <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>
+                      Reverse expense
+                    </Text>
+                  </Pressable>
+                ) : null}
+
+                {/* Checkpoint 4D.6A: recovery affordance for an
+                    unresolved (ambiguous-outcome) reversal request,
+                    reachable even once the ordinary "Reverse expense"
+                    trigger above has disappeared (the Expense already
+                    shows as reversed, by an uncertain requester). The
+                    user is never forced to mint a fresh request id just
+                    to find out whether their own earlier attempt
+                    actually committed - this re-submits the EXACT same
+                    pending facts/clientRequestId for a verified answer,
+                    never inferred from reversedBy alone. Only ever
+                    fires from this explicit tap - never automatically. */}
+                {isReversed && hasPendingReversal ? (
+                  <View style={styles.recoveryWrap}>
+                    <Text style={[styles.recoveryText, { color: colors.textMuted }]}>
+                      We couldn’t confirm whether your reversal request went through.
+                    </Text>
+                    {verifyError ? (
+                      <Text style={[styles.errorTextCentered, { color: colors.coral }]}>{verifyError}</Text>
+                    ) : null}
+                    <Pressable
+                      onPress={verifyPendingReversal}
+                      disabled={verifying}
+                      accessibilityRole="button"
+                      accessibilityLabel="Check reversal status"
+                      style={({ pressed }) => [
+                        styles.secondaryActionBtn,
+                        styles.reverseBtn,
+                        { borderColor: colors.border },
+                        (pressed || verifying) && { opacity: 0.85 },
+                      ]}
+                    >
+                      {verifying ? (
+                        <ActivityIndicator size="small" color={colors.textPrimary} />
+                      ) : (
+                        <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>
+                          Check reversal status
+                        </Text>
+                      )}
+                    </Pressable>
+                  </View>
+                ) : null}
               </>
             ) : null}
           </View>
         </View>
       </ScrollView>
     </SafeAreaView>
+    {expense ? (
+      <ReverseExpenseDialog
+        visible={reverseDialogVisible}
+        expenseDescription={expense.description}
+        expenseAmountMinor={expense.amountMinor}
+        reasonText={reasonText}
+        onChangeReasonText={changeReasonText}
+        submitting={reversalSubmitting}
+        submitError={reversalSubmitError}
+        onCancel={closeReverseDialog}
+        onConfirm={handleConfirmReverse}
+        colors={colors}
+      />
+    ) : null}
+    </>
   );
 }
 
@@ -658,6 +1112,10 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   inlineRetryBtn: { alignSelf: "center", marginTop: spacing.xs },
+  reverseBtn: { marginTop: spacing.lg, width: "100%" },
+  recoveryWrap: { marginTop: spacing.lg, alignItems: "center", gap: spacing.xs },
+  recoveryText: { fontSize: 12, fontWeight: "600", textAlign: "center" },
+  errorTextCentered: { fontSize: 12, fontWeight: "700", textAlign: "center" },
   secondaryActionText: { fontSize: 13, fontWeight: "800" },
 
   description: { fontSize: 17, fontWeight: "800" },
