@@ -279,7 +279,7 @@ export function AddExpenseForm({
       <Text style={[styles.sectionLabel, { color: colors.textSecondary, marginTop: spacing.lg }]}>
         Paid by
       </Text>
-      <View style={[styles.selectorBorder, { borderColor: colors.border }]}>
+      <View style={[styles.selectorBorder, { borderColor: colors.border }]} accessibilityRole="radiogroup">
         <ScrollView style={styles.selectorScroll} nestedScrollEnabled>
           {members.map((member) => {
             const selected = member.uid === payerUid;
@@ -291,6 +291,7 @@ export function AddExpenseForm({
                 selected={selected}
                 disabled={submitting}
                 iconName={selected ? "radiobox-marked" : "radiobox-blank"}
+                role="radio"
                 onPress={() => onSelectPayer(member.uid)}
               />
             );
@@ -350,6 +351,7 @@ export function AddExpenseForm({
                 selected={selected}
                 disabled={submitting || atCap}
                 iconName={selected ? "checkbox-marked" : "checkbox-blank-outline"}
+                role="checkbox"
                 onPress={() => onToggleParticipant(member.uid)}
               />
             );
@@ -362,11 +364,15 @@ export function AddExpenseForm({
 
       {/* Checkpoint 4D.4 §5: strategy selector, after participant
           selection and before the preview. Selection is conveyed by more
-          than color - a check icon plus a distinct border/tint. */}
+          than color - a check icon plus a distinct border/tint.
+          Checkpoint 4D.8: accessibilityRole is "radio" (a mutually-
+          exclusive single-select group of 3 options), not "button" -
+          state is conveyed via accessibilityState.checked, matching the
+          same convention now used for MemberSelectRow below. */}
       <Text style={[styles.sectionLabel, { color: colors.textSecondary, marginTop: spacing.lg }]}>
         Split strategy
       </Text>
-      <View style={styles.strategyRow}>
+      <View style={styles.strategyRow} accessibilityRole="radiogroup">
         {STRATEGY_OPTIONS.map(({ value, label }) => {
           const selected = splitStrategy === value;
           return (
@@ -374,9 +380,9 @@ export function AddExpenseForm({
               key={value}
               onPress={() => onChangeSplitStrategy(value)}
               disabled={submitting}
-              accessibilityRole="button"
+              accessibilityRole="radio"
               accessibilityLabel={label}
-              accessibilityState={{ selected }}
+              accessibilityState={{ checked: selected }}
               style={({ pressed }) => [
                 styles.strategyPill,
                 { borderColor: selected ? colors.blue : colors.border },
@@ -503,6 +509,7 @@ function MemberSelectRow({
   selected,
   disabled,
   iconName,
+  role,
   onPress,
 }: {
   member: MemberOption;
@@ -510,6 +517,11 @@ function MemberSelectRow({
   selected: boolean;
   disabled: boolean;
   iconName: React.ComponentProps<typeof MaterialCommunityIcons>["name"];
+  // Checkpoint 4D.8: the payer list is a single-select radio group; the
+  // participant list is a multi-select checkbox group - neither is a
+  // "button" semantically, and selection is now conveyed to assistive
+  // tools via accessibilityState.checked, not just the visual icon/tint.
+  role: "radio" | "checkbox";
   onPress: () => void;
 }) {
   const label = member.isCurrentUser ? `${member.nameLabel} · You` : member.nameLabel;
@@ -517,8 +529,9 @@ function MemberSelectRow({
     <Pressable
       onPress={onPress}
       disabled={disabled}
-      accessibilityRole="button"
+      accessibilityRole={role}
       accessibilityLabel={label}
+      accessibilityState={{ checked: selected }}
       style={({ pressed }) => [
         styles.memberRow,
         selected && { backgroundColor: colors.bluePale },
