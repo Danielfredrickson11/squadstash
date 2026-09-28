@@ -56,7 +56,13 @@ export type AddExpenseFormProps = {
   onChangeCategory: (value: string) => void;
   categoryError: string | null;
 
-  payerUid: string;
+  // Checkpoint 4D.7A: null represents "not yet explicitly chosen" - used
+  // by the correction flow when the original payer is no longer a
+  // current Trip member (never auto-resolved to a fallback; §1 of the
+  // checkpoint prompt requires an explicit choice). Ordinary Add Expense
+  // never passes null here (its own initializedRef effect always
+  // defaults payerUid to the signed-in user before this form renders).
+  payerUid: string | null;
   onSelectPayer: (uid: string) => void;
 
   selectedParticipantUids: Set<string>;
@@ -104,6 +110,17 @@ export type AddExpenseFormProps = {
   submitError: string | null;
   onSubmit: () => void;
   onCancel: () => void;
+
+  // Checkpoint 4D.7: lets the correction flow (expenses/create.tsx in
+  // correction mode) relabel the primary action ("Save correction"/
+  // "Finish correction" instead of "Add Expense") without a second,
+  // near-duplicate form component - every other control/validation/
+  // preview here is identical between ordinary creation and correction.
+  // Both default to ordinary Add Expense's existing copy, so every
+  // existing call site is unaffected.
+  primaryActionLabel?: string;
+  primaryActionAccessibilityLabel?: string;
+  savingLabel?: string;
 };
 
 export function AddExpenseForm({
@@ -147,6 +164,9 @@ export function AddExpenseForm({
   submitError,
   onSubmit,
   onCancel,
+  primaryActionLabel = "Add Expense",
+  primaryActionAccessibilityLabel = "Add Expense",
+  savingLabel = "Saving…",
 }: AddExpenseFormProps) {
   const memberByUid = useMemo(() => new Map(members.map((m) => [m.uid, m])), [members]);
   const selectedParticipantList = useMemo(
@@ -200,7 +220,7 @@ export function AddExpenseForm({
     previewCustomParticipants,
   ]);
 
-  const payerMember = memberByUid.get(payerUid);
+  const payerMember = payerUid ? memberByUid.get(payerUid) : undefined;
 
   return (
     <View>
@@ -440,7 +460,7 @@ export function AddExpenseForm({
           onPress={onSubmit}
           disabled={submitting}
           accessibilityRole="button"
-          accessibilityLabel="Add Expense"
+          accessibilityLabel={primaryActionAccessibilityLabel}
           style={({ pressed }) => [
             styles.primaryActionBtn,
             { backgroundColor: colors.mint },
@@ -450,10 +470,10 @@ export function AddExpenseForm({
           {submitting ? (
             <View style={styles.submittingRow}>
               <ActivityIndicator size="small" color={colors.onMint} />
-              <Text style={[styles.primaryActionText, { color: colors.onMint }]}>Saving…</Text>
+              <Text style={[styles.primaryActionText, { color: colors.onMint }]}>{savingLabel}</Text>
             </View>
           ) : (
-            <Text style={[styles.primaryActionText, { color: colors.onMint }]}>Add Expense</Text>
+            <Text style={[styles.primaryActionText, { color: colors.onMint }]}>{primaryActionLabel}</Text>
           )}
         </Pressable>
         <Pressable

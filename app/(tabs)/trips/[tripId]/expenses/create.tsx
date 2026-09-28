@@ -22,12 +22,20 @@ import {
   type MemberOption,
   type SplitStrategyValue,
 } from "../../../../../components/expenses/AddExpenseForm";
+import { CorrectExpenseConfirmDialog } from "../../../../../components/expenses/CorrectExpenseConfirmDialog";
 import { cardShadowFor, radii, spacing, typography } from "../../../../../src/theme/tokens";
 import { useSemanticColors } from "../../../../../src/theme/useSemanticColors";
 import { useAuth } from "../../../../../src/contexts/AuthContext";
 import { useExpenseSuccess } from "../../../../../src/hooks/useExpenseSuccess";
 import { fetchTripById } from "../../../../../src/services/firebase/trips";
-import { generateExpenseClientRequestId, recordTripExpense } from "../../../../../src/services/firebase/expenses";
+import {
+  fetchExpenseById,
+  fetchExpenseSplitsForExpense,
+  generateExpenseClientRequestId,
+  recordTripExpense,
+  reverseTripExpense,
+  type RecordTripExpenseInput,
+} from "../../../../../src/services/firebase/expenses";
 import { subscribeToPublicUsersByIdsChunked } from "../../../../../src/services/firebase/users";
 import {
   canSelectParticipant,
@@ -46,8 +54,23 @@ import {
   type ExpenseCreationFacts,
   type PendingExpenseCreationRequest,
 } from "../../../../../src/domain/expenseSubmission";
+import {
+  CORRECTION_REVERSAL_REASON,
+  buildCorrectionPrefill,
+  canClaimCorrection,
+  initialCorrectionPhase,
+  partitionParticipantsByEligibility,
+  resolveCorrectionAction,
+  type CorrectionSourceExpense,
+  type CorrectionSourceSplit,
+} from "../../../../../src/domain/expenseCorrection";
+import {
+  resolveExpenseReversalClientRequestId,
+  type ExpenseReversalFacts,
+  type PendingExpenseReversalRequest,
+} from "../../../../../src/domain/expenseReversal";
 import { formatCurrency } from "../../../../../utils/format";
-import type { PublicProfile, Trip } from "../../../../../src/types/domain";
+import type { Expense, ExpenseSplit, PublicProfile, Trip } from "../../../../../src/types/domain";
 
 const NAV_BUTTON_PEEK = CENTER_BUTTON_SIZE / 2 - 4;
 const NAV_BREATHING_ROOM = spacing.xxl;
@@ -59,6 +82,15 @@ type PayerProfileState =
   | { status: "loading" }
   | { status: "error" }
   | { status: "ready"; profiles: Map<string, PublicProfile> };
+
+// Checkpoint 4D.7: the old Expense (+ its immutable Splits) being
+// corrected, loaded ONE-SHOT via this route's own tripId (§2).
+type OldExpenseState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "unavailable" }
+  | { status: "error" }
+  | { status: "ready"; expense: Expense; splits: ExpenseSplit[] };
 
 // Local error mapper (Checkpoint 4D.3 §27) - matches the existing
 // per-feature convention (savingsErrorMessage, stashCreateErrorMessage,
@@ -89,9 +121,115 @@ function expenseErrorMessage(e: unknown, knownArchived: boolean): string {
   }
 }
 
+// Reversal-step failure classification for the correction flow's own
+// two-step mutation (Checkpoint 4D.7A §4) - a SEPARATE table from
+// reversalErrorMessage in expenses/[expenseId].tsx (that screen has its
+// own live-listener-informed distinction this one-shot route has no
+// equivalent of). Reuses 4D.6/4D.6A's own finalized principle: the
+// backend's functions/failed-precondition code is returned for MULTIPLE
+// distinct reasons in reverseTripExpense.ts (malformed tripId on the
+// Expense record, a missing Trip, AND "already reversed by a different
+// reverser/request") - the code ALONE is never sufficient to claim that
+// last, specific outcome. Only an INDEPENDENT re-fetch of the old
+// Expense's own currently-persisted status (via the same route-bound
+// fetchExpenseById this screen already uses everywhere else) can confirm
+// it. If the re-fetch itself fails, or doesn't confirm "reversed", this
+// falls back to honest generic copy rather than a specific claim without
+// independently verified evidence - never promoted to "definitely a
+// different request" merely because the error code, by itself, could
+// mean that.
+async function classifyCorrectionReverseFailure(
+  e: unknown,
+  tripId: string,
+  oldExpenseId: string
+): Promise<string> {
+  const code = (e as { code?: string } | null | undefined)?.code;
+  if (code === "functions/failed-precondition") {
+    try {
+      const latest = await fetchExpenseById(tripId, oldExpenseId);
+      if (latest && latest.status === "reversed") {
+        return "This expense was already reversed by a different request. Go back to the expense to see its current status.";
+      }
+    } catch (verifyErr) {
+      console.error("Failed to verify reversal status after failed-precondition:", verifyErr);
+    }
+    return "We couldn't reverse this expense because its trip or record information changed. Refresh and try again.";
+  }
+  switch (code) {
+    case "functions/invalid-argument":
+      return "That information isn't valid — please check and try again.";
+    case "functions/permission-denied":
+      return "You don't have permission to do that.";
+    case "functions/not-found":
+      return "This expense could not be found.";
+    case "functions/already-exists":
+      return "We couldn't safely reconcile this reversal request. Review it and try again.";
+    default:
+      return "We couldn't reach the server, so we can't confirm this went through — it's safe to try again.";
+  }
+}
+
+// Creation-step error mapper for the correction flow (§9/§10/§25) - by
+// the time this step runs, the original Expense IS already reversed
+// (either just now, in "start" mode, or previously, in "finish" mode),
+// so the ambiguous/ostherwise-unclassified fallback below is truthful in
+// both modes.
+function correctionCreateErrorMessage(e: unknown, knownArchived: boolean): string {
+  const code = (e as { code?: string } | null | undefined)?.code;
+  switch (code) {
+    case "functions/invalid-argument":
+      return "That information isn't valid — please check and try again.";
+    case "functions/permission-denied":
+      return "You don't have permission to do that.";
+    case "functions/failed-precondition":
+      return knownArchived
+        ? "This trip is archived and no longer accepts a corrected replacement."
+        : "We couldn't save the correction — the original may already have a replacement, or trip/member information changed. Refresh and try again.";
+    case "functions/not-found":
+      return "The original expense could not be found.";
+    case "functions/already-exists":
+      return "We couldn't safely reconcile this request. Review it and try again.";
+    default:
+      return "The original expense was reversed, but we couldn't save the corrected version. Your edits are still here — try saving again.";
+  }
+}
+
+// Bridges the strategy-discriminated ExpenseCreationFacts (§19/§23 of the
+// checkpoint prompt) to the wire-shaped RecordTripExpenseInput, shared by
+// BOTH the ordinary Add Expense submit path and the correction submit
+// path below - occurredAt/replacesExpenseId are always null for ordinary
+// creation, so this single builder produces IDENTICAL requests to the
+// pre-4D.7 inline switch for that case, and only adds the two correction
+// fields when facts actually carry them.
+function buildRecordTripExpenseInput(
+  facts: ExpenseCreationFacts,
+  clientRequestId: string
+): RecordTripExpenseInput {
+  const common = {
+    tripId: facts.tripId,
+    payerUid: facts.payerUid,
+    amountMinor: facts.amountMinor,
+    currency: facts.currency,
+    description: facts.description,
+    ...(facts.category !== null ? { category: facts.category } : {}),
+    ...(facts.occurredAtInstantMs !== null ? { occurredAt: new Date(facts.occurredAtInstantMs) } : {}),
+    ...(facts.replacesExpenseId !== null ? { replacesExpenseId: facts.replacesExpenseId } : {}),
+    clientRequestId,
+  };
+  switch (facts.splitStrategy) {
+    case "equal":
+      return { ...common, splitStrategy: "equal", participants: facts.participants };
+    case "percentage":
+      return { ...common, splitStrategy: "percentage", participants: facts.participants };
+    case "custom":
+      return { ...common, splitStrategy: "custom", participants: facts.participants };
+  }
+}
+
 export default function AddExpenseScreen() {
   const router = useRouter();
-  const { tripId } = useLocalSearchParams<{ tripId: string }>();
+  const { tripId, replaces: replacesExpenseId } = useLocalSearchParams<{ tripId: string; replaces?: string }>();
+  const isCorrectionRoute = typeof replacesExpenseId === "string" && replacesExpenseId.length > 0;
   const { user } = useAuth();
   const theme = useTheme();
   const colors = useSemanticColors();
@@ -143,6 +281,144 @@ export default function AddExpenseScreen() {
 
   const isCurrentMember = !!user && currentMemberUids.includes(user.uid);
   const isOverCapacity = currentMemberUids.length > 100;
+
+  // ------------------------------------------------------------------
+  // Correction mode (Checkpoint 4D.7) - the old Expense + its immutable
+  // Splits are loaded ONE-SHOT, via the route's OWN tripId (§2: "Enforce
+  // route-tripId integrity on every read" - fetchExpenseById/
+  // fetchExpenseSplitsForExpense already internally re-verify this).
+  // Never a live subscription: this route only ever reads the old
+  // Expense once, at entry, and any race that develops after that (e.g.
+  // someone else finishes a competing correction) surfaces honestly as a
+  // recordTripExpense failure at submit time (§11) rather than through a
+  // second data source this screen would have to reconcile.
+  // ------------------------------------------------------------------
+  const [oldExpenseState, setOldExpenseState] = useState<OldExpenseState>({ status: "idle" });
+  const [oldExpenseRetryNonce, setOldExpenseRetryNonce] = useState(0);
+  const retryOldExpense = useCallback(() => setOldExpenseRetryNonce((n) => n + 1), []);
+
+  useEffect(() => {
+    if (!isCorrectionRoute) {
+      setOldExpenseState({ status: "idle" });
+      return undefined;
+    }
+    if (!tripId || typeof replacesExpenseId !== "string") return undefined;
+    let cancelled = false;
+    setOldExpenseState({ status: "loading" });
+    Promise.all([
+      fetchExpenseById(tripId, replacesExpenseId),
+      fetchExpenseSplitsForExpense(tripId, replacesExpenseId),
+    ])
+      .then(([expense, splits]) => {
+        if (cancelled) return;
+        setOldExpenseState(expense ? { status: "ready", expense, splits } : { status: "unavailable" });
+      })
+      .catch((err) => {
+        console.error("Old expense fetch error (correction):", err);
+        if (!cancelled) setOldExpenseState({ status: "error" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isCorrectionRoute, tripId, replacesExpenseId, oldExpenseRetryNonce]);
+
+  const oldExpense = oldExpenseState.status === "ready" ? oldExpenseState.expense : null;
+
+  // Advisory-only correction-link authorization/state gating (§1/§27),
+  // reusing the EXACT same pure logic Expense Detail uses to decide
+  // whether to offer "Correct expense"/"Finish correction" in the first
+  // place - the backend independently re-authorizes and re-validates
+  // state regardless of what this computes.
+  const canClaim = useMemo(() => {
+    if (!oldExpense) return false;
+    return canClaimCorrection({
+      currentUid: user?.uid,
+      expenseCreatedBy: oldExpense.createdBy,
+      expenseReversedBy: oldExpense.reversedBy,
+      tripOwnerId: tripState.status === "ready" ? tripState.trip.ownerId : undefined,
+      tripMemberIds: tripState.status === "ready" ? tripState.trip.memberIds : undefined,
+    });
+  }, [oldExpense, user?.uid, tripState]);
+
+  const correctionAction = useMemo(() => {
+    if (!oldExpense) return { kind: "none" as const };
+    return resolveCorrectionAction({
+      expenseStatus: oldExpense.status,
+      replacedByExpenseId: oldExpense.replacedByExpenseId,
+      canClaim,
+    });
+  }, [oldExpense, canClaim]);
+
+  // Pure prefill mapping (§3/§5/§26) - a VALIDATOR, never a repairer;
+  // malformed persisted split data surfaces as an explicit error rather
+  // than a silently-guessed form.
+  const prefillResult = useMemo(() => {
+    if (!oldExpense || oldExpenseState.status !== "ready") return null;
+
+    // Checkpoint 4D.7A §3: fail closed rather than silently truncating
+    // any sub-millisecond precision a persisted occurredAt Timestamp
+    // might carry. This app's own writers only ever construct occurredAt
+    // from a millisecond-precision Date (recordTripExpense.ts's own
+    // contract), so this should never actually fire against data this
+    // app itself wrote - but Timestamp.toMillis() below IS a lossy
+    // operation in general, and silently losing precision during a
+    // "correction" would itself be an unreviewed, unintended data
+    // change, exactly what this whole correction model exists to avoid.
+    if (oldExpense.occurredAt && oldExpense.occurredAt.nanoseconds % 1_000_000 !== 0) {
+      return {
+        ok: false as const,
+        error: "This expense's original date/time can't be preserved exactly and can't be corrected here.",
+      };
+    }
+
+    const sourceExpense: CorrectionSourceExpense = {
+      paymentSource: oldExpense.paymentSource,
+      payerUid: oldExpense.payerUid,
+      description: oldExpense.description,
+      amountMinor: oldExpense.amountMinor,
+      category: oldExpense.category,
+      splitStrategy: oldExpense.splitStrategy,
+      occurredAtInstantMs: oldExpense.occurredAt ? oldExpense.occurredAt.toMillis() : null,
+    };
+    const sourceSplits: CorrectionSourceSplit[] = oldExpenseState.splits.map((s) => ({
+      userId: s.userId,
+      amountMinor: s.amountMinor,
+      percentageBasisPoints: s.percentageBasisPoints,
+    }));
+    return buildCorrectionPrefill(sourceExpense, sourceSplits);
+  }, [oldExpense, oldExpenseState]);
+
+  // Historical participants (§4) no longer among the CURRENT Trip member
+  // set - never silently dropped/transferred. AddExpenseForm's own
+  // member selector already only lists current members, so an ineligible
+  // historical participant simply can't be preselected here; the banner
+  // below (rendered alongside the form) explains this explicitly and the
+  // form's OWN existing split-total validation then requires the user to
+  // explicitly adjust participants/splits before "Save correction" can
+  // succeed - never an automatic transfer of their share to anyone else.
+  const eligibilityPartition = useMemo(() => {
+    if (!prefillResult || !prefillResult.ok) return null;
+    return partitionParticipantsByEligibility(prefillResult.data.participantUids, currentMemberUids);
+  }, [prefillResult, currentMemberUids]);
+
+  // Checkpoint 4D.7A §1: whether the ORIGINAL payer is no longer a
+  // current Trip member - drives both the "never auto-reassign" prefill
+  // decision below and the explicit-choice explanation banner. Never
+  // itself decides what payerUid should become; it only reports the
+  // fact.
+  const originalPayerIneligible = useMemo(() => {
+    if (!prefillResult || !prefillResult.ok) return false;
+    return !currentMemberUids.includes(prefillResult.data.payerUid);
+  }, [prefillResult, currentMemberUids]);
+
+  // Explicit "I've reviewed the removed participants and the revised
+  // split" acknowledgment (§1) - required before handleSubmit will
+  // proceed whenever any historical participant is no longer eligible.
+  // This is the safety net for Equal splits specifically: Equal has no
+  // aggregate-total validation of its own (unlike Percentage/Custom, an
+  // unacknowledged silent drop-and-redistribute would otherwise sail
+  // through undetected).
+  const [removedParticipantsAcknowledged, setRemovedParticipantsAcknowledged] = useState(false);
 
   // ------------------------------------------------------------------
   // Public-profile resolution (§9) over the FULL current-member set -
@@ -234,15 +510,20 @@ export default function AddExpenseScreen() {
   // Defaults payerUid/selectedParticipants exactly ONCE, the first time
   // Trip + member data is actually available - never re-runs and clobbers
   // the user's own edits on a later re-render (e.g. a profile retry).
+  // Checkpoint 4D.7: skipped entirely in correction mode - the dedicated
+  // correction-prefill effect below (which needs splitStrategy/
+  // percentage/custom state declared further down) owns initialization
+  // there instead, so the two initializers never race each other.
   const initializedRef = useRef(false);
   useEffect(() => {
+    if (isCorrectionRoute) return;
     if (initializedRef.current) return;
     if (!user || tripState.status !== "ready") return;
     if (!currentMemberUids.includes(user.uid)) return;
     setPayerUid(user.uid);
     setSelectedParticipants(defaultParticipantSelection(currentMemberUids, user.uid));
     initializedRef.current = true;
-  }, [user, tripState, currentMemberUids]);
+  }, [isCorrectionRoute, user, tripState, currentMemberUids]);
 
   // ------------------------------------------------------------------
   // Split-strategy state (Checkpoint 4D.4 §4/§19/§20) - percentageInputs/
@@ -259,6 +540,49 @@ export default function AddExpenseScreen() {
   const [percentageErrors, setPercentageErrors] = useState<Record<string, string>>({});
   const [customErrors, setCustomErrors] = useState<Record<string, string>>({});
   const [splitAggregateError, setSplitAggregateError] = useState<string | null>(null);
+
+  // Correction-mode initialization (Checkpoint 4D.7/4D.7A §2/§3/§4/§5/
+  // §26) - mirrors the ordinary initializedRef effect's own "exactly
+  // once, never clobbers later edits" discipline, but sourced from the
+  // validated prefillResult instead of Trip-member defaults.
+  //
+  // Checkpoint 4D.7A §2 fix: requires tripState to actually be "ready"
+  // AND the signed-in user to be a CONFIRMED current member before
+  // initializing anything. currentMemberUids is [] while tripState is
+  // still "loading"/"not_found" - without this gate, an old-Expense
+  // fetch that resolved before the Trip fetch could previously
+  // initialize the correction form against an empty member set (every
+  // historical participant treated as ineligible, payerUid reset) and
+  // then PERMANENTLY lock itself out via correctionInitializedRef, since
+  // the guard never re-ran once tripState later became ready.
+  const correctionInitializedRef = useRef(false);
+  useEffect(() => {
+    if (!isCorrectionRoute) return;
+    if (correctionInitializedRef.current) return;
+    if (!user) return;
+    if (tripState.status !== "ready") return;
+    if (!currentMemberUids.includes(user.uid)) return;
+    if (!prefillResult || !prefillResult.ok) return;
+    if (!eligibilityPartition) return;
+
+    const { data } = prefillResult;
+    setDescription(data.description);
+    setAmountText(data.amountText);
+    setCategory(data.category);
+    // Checkpoint 4D.7A §1 fix: NEVER auto-reassign financial
+    // responsibility. Only prefill the payer when the ORIGINAL payer is
+    // still a current member - when they are not, payerUid is left null
+    // (AddExpenseForm now accepts payerUid: string | null for exactly
+    // this case) so the "Paid by" selector shows no selection at all,
+    // and handleSubmit below refuses to proceed until the user
+    // explicitly taps a real, eligible payer.
+    setPayerUid(currentMemberUids.includes(data.payerUid) ? data.payerUid : null);
+    setSelectedParticipants(new Set(eligibilityPartition.eligible));
+    setSplitStrategyValue(data.splitStrategy);
+    setPercentageInputs(data.percentageInputs);
+    setCustomInputs(data.customInputs);
+    correctionInitializedRef.current = true;
+  }, [isCorrectionRoute, user, tripState, currentMemberUids, prefillResult, eligibilityPartition]);
 
   const changeSplitStrategy = useCallback(
     (next: SplitStrategyValue) => {
@@ -481,6 +805,28 @@ export default function AddExpenseScreen() {
     setCategoryError(categoryResult.ok ? null : categoryResult.error);
     setParticipantsError(participants.length > 0 ? null : "Select at least one participant.");
 
+    // Checkpoint 4D.7A §1: explicit resolution gates for correction mode
+    // - checked BEFORE the generic bail below so each gets its own
+    // honest, specific message rather than a silent no-op. Neither gate
+    // can be satisfied merely by UI disablement elsewhere; both are
+    // re-checked here independently, matching this handler's own
+    // existing "UI disablement is never the sole authority" convention.
+    if (isCorrectionRoute && !payerUid) {
+      setSubmitError(
+        "Choose who paid for this corrected expense — the original payer is no longer part of this trip."
+      );
+      return;
+    }
+    if (
+      isCorrectionRoute &&
+      eligibilityPartition &&
+      eligibilityPartition.ineligible.length > 0 &&
+      !removedParticipantsAcknowledged
+    ) {
+      setSubmitError("Review the removed participants above before saving.");
+      return;
+    }
+
     // Checkpoint 4D.4 §21: the route re-validates independently in
     // handleSubmit for every strategy - UI disablement is never the sole
     // authority. Each branch below re-parses from the raw text state,
@@ -495,6 +841,15 @@ export default function AddExpenseScreen() {
 
     let facts: ExpenseCreationFacts | null = null;
 
+    // Checkpoint 4D.7 §9: the logical creation identity includes
+    // replacesExpenseId/occurredAtInstantMs - both null for ordinary
+    // creation (unchanged from 4D.3/4D.4), both set from the validated
+    // correction prefill when this route is in correction mode.
+    const factOccurredAtInstantMs =
+      isCorrectionRoute && prefillResult && prefillResult.ok ? prefillResult.data.occurredAtInstantMs : null;
+    const factReplacesExpenseId =
+      isCorrectionRoute && typeof replacesExpenseId === "string" ? replacesExpenseId : null;
+
     if (splitStrategy === "equal") {
       setPercentageErrors({});
       setCustomErrors({});
@@ -507,8 +862,8 @@ export default function AddExpenseScreen() {
         description: descResult.value,
         category: categoryResult.value,
         paymentSource: "member_out_of_pocket",
-        occurredAtInstantMs: null,
-        replacesExpenseId: null,
+        occurredAtInstantMs: factOccurredAtInstantMs,
+        replacesExpenseId: factReplacesExpenseId,
         splitStrategy: "equal",
         participants: canonicalizeEqualParticipants(participants),
       };
@@ -546,8 +901,8 @@ export default function AddExpenseScreen() {
           description: descResult.value,
           category: categoryResult.value,
           paymentSource: "member_out_of_pocket",
-          occurredAtInstantMs: null,
-          replacesExpenseId: null,
+          occurredAtInstantMs: factOccurredAtInstantMs,
+          replacesExpenseId: factReplacesExpenseId,
           splitStrategy: "percentage",
           participants: canonicalizePercentageParticipants(parsed),
         };
@@ -586,8 +941,8 @@ export default function AddExpenseScreen() {
           description: descResult.value,
           category: categoryResult.value,
           paymentSource: "member_out_of_pocket",
-          occurredAtInstantMs: null,
-          replacesExpenseId: null,
+          occurredAtInstantMs: factOccurredAtInstantMs,
+          replacesExpenseId: factReplacesExpenseId,
           splitStrategy: "custom",
           participants: canonicalizeCustomParticipants(parsed),
         };
@@ -595,6 +950,21 @@ export default function AddExpenseScreen() {
     }
 
     if (!facts) return;
+
+    // Checkpoint 4D.7 §7/§8/§24: correction mode NEVER submits directly
+    // from this validation pass - the reviewed/validated facts are held
+    // for the confirmation dialog, and the trusted mutation(s) only ever
+    // run after an explicit "Save correction"/"Finish correction" tap
+    // inside it (review-before-reverse ordering, §24 step F/G/H). Facts
+    // are rebuilt from current field state on every Save tap, so editing
+    // after Cancel and tapping Save again always reflects the latest
+    // edits.
+    if (isCorrectionRoute) {
+      pendingCorrectionFactsRef.current = facts;
+      setCorrectionSubmitError(null);
+      setCorrectDialogVisible(true);
+      return;
+    }
 
     const clientRequestId = resolveExpenseClientRequestId(
       pendingRef,
@@ -607,53 +977,7 @@ export default function AddExpenseScreen() {
     setSubmitError(null);
 
     try {
-      // Checkpoint 4D.4 §27/§28/§29: switching on facts.splitStrategy
-      // (not merging into one generic call) lets TypeScript correctly
-      // narrow facts.participants to the matching wire shape for each
-      // strategy - no direct Firestore writes, no preview allocation
-      // values sent, the backend independently recomputes/validates the
-      // exact split regardless of strategy.
-      switch (facts.splitStrategy) {
-        case "equal":
-          await recordTripExpense({
-            tripId: facts.tripId,
-            payerUid: facts.payerUid,
-            amountMinor: facts.amountMinor,
-            currency: facts.currency,
-            description: facts.description,
-            ...(facts.category !== null ? { category: facts.category } : {}),
-            splitStrategy: "equal",
-            participants: facts.participants,
-            clientRequestId,
-          });
-          break;
-        case "percentage":
-          await recordTripExpense({
-            tripId: facts.tripId,
-            payerUid: facts.payerUid,
-            amountMinor: facts.amountMinor,
-            currency: facts.currency,
-            description: facts.description,
-            ...(facts.category !== null ? { category: facts.category } : {}),
-            splitStrategy: "percentage",
-            participants: facts.participants,
-            clientRequestId,
-          });
-          break;
-        case "custom":
-          await recordTripExpense({
-            tripId: facts.tripId,
-            payerUid: facts.payerUid,
-            amountMinor: facts.amountMinor,
-            currency: facts.currency,
-            description: facts.description,
-            ...(facts.category !== null ? { category: facts.category } : {}),
-            splitStrategy: "custom",
-            participants: facts.participants,
-            clientRequestId,
-          });
-          break;
-      }
+      await recordTripExpense(buildRecordTripExpenseInput(facts, clientRequestId));
 
       // Success clears the pending record - a later submission is a new
       // logical request and must get a new id.
@@ -684,6 +1008,11 @@ export default function AddExpenseScreen() {
     tripId,
     isCurrentMember,
     isArchived,
+    isCorrectionRoute,
+    prefillResult,
+    replacesExpenseId,
+    eligibilityPartition,
+    removedParticipantsAcknowledged,
     description,
     amountText,
     category,
@@ -701,7 +1030,146 @@ export default function AddExpenseScreen() {
     goToExpenseList();
   }, [submitting, goToExpenseList]);
 
+  // ------------------------------------------------------------------
+  // Correction confirm dialog + trusted two-step mutation (Checkpoint
+  // 4D.7 §7/§8/§9/§10/§11). Two INDEPENDENT pending-request facts (the
+  // reversal of the OLD Expense, and the creation of the NEW replacement)
+  // - never the same clientRequestId for both, per §8. handleSubmit above
+  // only ever gets this far after validating/building `facts` and, in
+  // correction mode, holding them in pendingCorrectionFactsRef pending
+  // this explicit confirmation - no reversal or creation call is ever
+  // issued merely by opening this dialog or navigating to this screen.
+  // ------------------------------------------------------------------
+  const pendingCorrectionFactsRef = useRef<ExpenseCreationFacts | null>(null);
+  const pendingReversalRef = useRef<PendingExpenseReversalRequest | null>(null);
+  const correctionInFlightRef = useRef(false);
+  const [correctDialogVisible, setCorrectDialogVisible] = useState(false);
+  const [correctionSubmitting, setCorrectionSubmitting] = useState(false);
+  const [correctionSubmitError, setCorrectionSubmitError] = useState<string | null>(null);
+
+  // Guards the two-step mutation's own state updates against a stale
+  // continuation after unmount/route-change (§11) - this component has
+  // no other async work that outlives a render the way this dialog's
+  // confirm handler can (an in-flight reverseTripExpense/recordTripExpense
+  // pair), so a dedicated ref is added here rather than reusing any
+  // existing one-shot effect's local `cancelled` flag.
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  const closeCorrectDialog = useCallback(() => {
+    // Ignored while a request is unresolved, mirroring
+    // ReverseExpenseDialog's own guardedCancel - pendingReversalRef/
+    // pendingRef are deliberately never cleared merely by dismissing the
+    // dialog, so re-opening it (by tapping "Save correction" again)
+    // still safely reuses the same clientRequestId(s) for any step that
+    // hasn't yet been confirmed successful.
+    if (correctionInFlightRef.current) return;
+    setCorrectDialogVisible(false);
+  }, []);
+
+  const handleConfirmCorrection = useCallback(async () => {
+    if (correctionInFlightRef.current) return;
+    if (!tripId) return;
+    const facts = pendingCorrectionFactsRef.current;
+    if (!facts || !facts.replacesExpenseId) return;
+    const oldExpenseId = facts.replacesExpenseId;
+
+    correctionInFlightRef.current = true;
+    setCorrectionSubmitting(true);
+    setCorrectionSubmitError(null);
+
+    try {
+      // Step 1 (§8/§24 step H.1) - ONLY when initialCorrectionPhase says
+      // the reversal step is still pending for THIS route's own
+      // one-shot-loaded state (Checkpoint 4D.7A §5's tested contract).
+      // Once a reversal attempt here is confirmed successful,
+      // oldExpenseState is updated to reflect that (below), so a later
+      // retry of THIS confirmation (e.g. after step 2 failed) re-derives
+      // "create" from initialCorrectionPhase and never re-issues a
+      // second reversal - matching §8's "skip reversal entirely" rule
+      // for an already-reversed original exactly, without needing a
+      // separate ambiguous-outcome recovery banner: the dialog's own
+      // Confirm button, tapped again, IS the retry, and
+      // reverseTripExpense's own exact-replay support (reused unchanged
+      // from 4D.6) makes that retry safe regardless of whether an
+      // earlier ambiguous attempt actually committed.
+      if (
+        oldExpenseState.status === "ready" &&
+        initialCorrectionPhase(oldExpenseState.expense.status) === "reverse"
+      ) {
+        const reversalFacts: ExpenseReversalFacts = {
+          expenseId: oldExpenseId,
+          reversalReason: CORRECTION_REVERSAL_REASON,
+        };
+        const reversalClientRequestId = resolveExpenseReversalClientRequestId(
+          pendingReversalRef,
+          reversalFacts,
+          generateExpenseClientRequestId
+        );
+        try {
+          await reverseTripExpense({
+            expenseId: reversalFacts.expenseId,
+            reversalReason: reversalFacts.reversalReason,
+            clientRequestId: reversalClientRequestId,
+          });
+        } catch (e) {
+          if (!isMountedRef.current) return;
+          console.error("Failed to reverse original expense during correction:", e);
+          // Checkpoint 4D.7A §4: classification may re-fetch the old
+          // Expense to independently confirm status before claiming a
+          // specific cause - never inferred from the error code alone.
+          const message = await classifyCorrectionReverseFailure(e, tripId, oldExpenseId);
+          if (!isMountedRef.current) return;
+          setCorrectionSubmitError(message);
+          return;
+        }
+        if (!isMountedRef.current) return;
+        // Verified successful (no throw) - reflect it locally so a retry
+        // of this same confirmation never attempts a second reversal,
+        // and clear the reversal's own pending id (a LATER, unrelated
+        // correction attempt must never reuse it).
+        pendingReversalRef.current = null;
+        setOldExpenseState((prev) =>
+          prev.status === "ready" ? { ...prev, expense: { ...prev.expense, status: "reversed" } } : prev
+        );
+      }
+
+      // Step 2 (§8/§24 step H.2) - only ever reached once step 1 is
+      // skipped (already reversed) or verified successful above.
+      const clientRequestId = resolveExpenseClientRequestId(pendingRef, facts, generateExpenseClientRequestId);
+      try {
+        await recordTripExpense(buildRecordTripExpenseInput(facts, clientRequestId));
+      } catch (e) {
+        if (!isMountedRef.current) return;
+        console.error("Failed to save corrected expense:", e);
+        if ((e as { code?: string } | null | undefined)?.code === "functions/already-exists") {
+          pendingRef.current = null;
+        }
+        setCorrectionSubmitError(correctionCreateErrorMessage(e, isArchived));
+        return;
+      }
+
+      if (!isMountedRef.current) return;
+      pendingRef.current = null;
+      pendingCorrectionFactsRef.current = null;
+      setCorrectDialogVisible(false);
+      announceExpenseSuccess(`Saved corrected expense`);
+      goToExpenseList();
+    } finally {
+      if (isMountedRef.current) {
+        correctionInFlightRef.current = false;
+        setCorrectionSubmitting(false);
+      }
+    }
+  }, [tripId, oldExpenseState, isArchived, announceExpenseSuccess, goToExpenseList]);
+
   return (
+    <>
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.colors.background }]}>
       <ScrollView contentContainerStyle={[styles.scrollContent, { paddingBottom: scrollBottomInset }]}>
         <View style={styles.contentWrap}>
@@ -729,9 +1197,19 @@ export default function AddExpenseScreen() {
               cardShadowFor(theme.dark),
             ]}
           >
-            <Text style={[styles.title, { color: colors.textPrimary }]}>Add Expense</Text>
+            <Text style={[styles.title, { color: colors.textPrimary }]}>
+              {isCorrectionRoute
+                ? correctionAction.kind === "finish"
+                  ? "Finish correction"
+                  : "Correct expense"
+                : "Add Expense"}
+            </Text>
             <Text style={[styles.subtitle, { color: colors.textMuted }]}>
-              Choose who shared this cost and how to split it.
+              {isCorrectionRoute
+                ? correctionAction.kind === "finish"
+                  ? "The original expense is already reversed and has no replacement yet. Review the details below to finish the correction."
+                  : "Review the details before replacing the original expense."
+                : "Choose who shared this cost and how to split it."}
             </Text>
 
             <View style={{ height: spacing.md }} />
@@ -762,7 +1240,9 @@ export default function AddExpenseScreen() {
             ) : isArchived ? (
               <View style={styles.stateWrap}>
                 <Text style={[styles.stateTitle, { color: colors.textPrimary }]}>
-                  This trip is archived and no longer accepts new expenses.
+                  {isCorrectionRoute
+                    ? "This trip is archived, so a corrected replacement can’t be created here."
+                    : "This trip is archived and no longer accepts new expenses."}
                 </Text>
                 <Pressable
                   onPress={goToExpenseList}
@@ -799,9 +1279,162 @@ export default function AddExpenseScreen() {
                   </Text>
                 </Pressable>
               </View>
-            ) : payerUid === null || selectedParticipants === null ? (
+            ) : isCorrectionRoute && (oldExpenseState.status === "idle" || oldExpenseState.status === "loading") ? (
+              <Text style={[styles.stateText, { color: colors.textMuted }]}>Loading original expense…</Text>
+            ) : isCorrectionRoute && oldExpenseState.status === "unavailable" ? (
+              <View style={styles.stateWrap}>
+                <Text style={[styles.stateTitle, { color: colors.textPrimary }]}>
+                  This expense could not be found.
+                </Text>
+                <Text style={[styles.stateText, { color: colors.textMuted }]}>
+                  It may have been part of a trip you no longer have access to.
+                </Text>
+                <Pressable
+                  onPress={goToExpenseList}
+                  accessibilityRole="button"
+                  accessibilityLabel="Back to Expense history"
+                  style={({ pressed }) => [
+                    styles.primaryActionBtn,
+                    { backgroundColor: colors.mint },
+                    pressed && { opacity: 0.9 },
+                  ]}
+                >
+                  <Text style={[styles.primaryActionText, { color: colors.onMint }]}>
+                    Back to Expense history
+                  </Text>
+                </Pressable>
+              </View>
+            ) : isCorrectionRoute && oldExpenseState.status === "error" ? (
+              <View style={styles.stateWrap}>
+                <Text style={[styles.stateText, { color: colors.textMuted }]}>
+                  We couldn’t load the original expense.
+                </Text>
+                <Pressable
+                  onPress={retryOldExpense}
+                  accessibilityRole="button"
+                  accessibilityLabel="Retry loading the original expense"
+                  style={({ pressed }) => [
+                    styles.secondaryActionBtn,
+                    { borderColor: colors.border },
+                    pressed && { opacity: 0.9 },
+                  ]}
+                >
+                  <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Retry</Text>
+                </Pressable>
+              </View>
+            ) : isCorrectionRoute && oldExpenseState.status === "ready" && !canClaim ? (
+              <View style={styles.stateWrap}>
+                <Text style={[styles.stateTitle, { color: colors.textPrimary }]}>
+                  You don’t have permission to correct this expense.
+                </Text>
+                <Pressable
+                  onPress={goToExpenseList}
+                  accessibilityRole="button"
+                  accessibilityLabel="Back to Expense history"
+                  style={({ pressed }) => [
+                    styles.primaryActionBtn,
+                    { backgroundColor: colors.mint },
+                    pressed && { opacity: 0.9 },
+                  ]}
+                >
+                  <Text style={[styles.primaryActionText, { color: colors.onMint }]}>
+                    Back to Expense history
+                  </Text>
+                </Pressable>
+              </View>
+            ) : isCorrectionRoute && correctionAction.kind === "none" ? (
+              <View style={styles.stateWrap}>
+                <Text style={[styles.stateTitle, { color: colors.textPrimary }]}>
+                  This expense has already been corrected.
+                </Text>
+                <Pressable
+                  onPress={goToExpenseList}
+                  accessibilityRole="button"
+                  accessibilityLabel="Back to Expense history"
+                  style={({ pressed }) => [
+                    styles.primaryActionBtn,
+                    { backgroundColor: colors.mint },
+                    pressed && { opacity: 0.9 },
+                  ]}
+                >
+                  <Text style={[styles.primaryActionText, { color: colors.onMint }]}>
+                    Back to Expense history
+                  </Text>
+                </Pressable>
+              </View>
+            ) : isCorrectionRoute && prefillResult && !prefillResult.ok ? (
+              <View style={styles.stateWrap}>
+                <Text style={[styles.stateTitle, { color: colors.textPrimary }]}>{prefillResult.error}</Text>
+                <Pressable
+                  onPress={goToExpenseList}
+                  accessibilityRole="button"
+                  accessibilityLabel="Back to Expense history"
+                  style={({ pressed }) => [
+                    styles.primaryActionBtn,
+                    { backgroundColor: colors.mint },
+                    pressed && { opacity: 0.9 },
+                  ]}
+                >
+                  <Text style={[styles.primaryActionText, { color: colors.onMint }]}>
+                    Back to Expense history
+                  </Text>
+                </Pressable>
+              </View>
+            ) : selectedParticipants === null ? (
+              // Checkpoint 4D.7A §1: payerUid is deliberately EXCLUDED
+              // from this gate - in correction mode it can legitimately
+              // stay null (awaiting an explicit payer choice) once
+              // everything else has finished loading, and the form must
+              // render (not show an indefinite "Loading…") so the user
+              // can actually make that choice. Ordinary Add Expense is
+              // unaffected: its own initializedRef effect always sets a
+              // real payerUid together with selectedParticipants, so
+              // payerUid is never null once this branch is reached there.
               <Text style={[styles.stateText, { color: colors.textMuted }]}>Loading trip members…</Text>
             ) : (
+              <>
+              {isCorrectionRoute &&
+              (originalPayerIneligible || (eligibilityPartition && eligibilityPartition.ineligible.length > 0)) ? (
+                <View style={[styles.ineligibleBanner, { backgroundColor: colors.surfaceTertiary }]}>
+                  {originalPayerIneligible ? (
+                    <Text style={[styles.ineligibleBannerText, { color: colors.textMuted }]}>
+                      {payerUid
+                        ? "The original payer is no longer part of this trip — a new payer has been selected below."
+                        : "The original payer is no longer part of this trip. Choose who paid below before saving."}
+                    </Text>
+                  ) : null}
+                  {eligibilityPartition && eligibilityPartition.ineligible.length > 0 ? (
+                    <>
+                      <Text
+                        style={[
+                          styles.ineligibleBannerText,
+                          { color: colors.textMuted, marginTop: originalPayerIneligible ? spacing.xs : 0 },
+                        ]}
+                      >
+                        {eligibilityPartition.ineligible.length === 1
+                          ? "The original expense included 1 person who is no longer part of this trip. Their participation can’t be reproduced automatically — review the participants and split below before saving."
+                          : `The original expense included ${eligibilityPartition.ineligible.length} people who are no longer part of this trip. Their participation can’t be reproduced automatically — review the participants and split below before saving.`}
+                      </Text>
+                      <Pressable
+                        onPress={() => setRemovedParticipantsAcknowledged((v) => !v)}
+                        accessibilityRole="checkbox"
+                        accessibilityState={{ checked: removedParticipantsAcknowledged }}
+                        accessibilityLabel="I've reviewed the removed participants and the revised split"
+                        style={styles.acknowledgeRow}
+                      >
+                        <MaterialCommunityIcons
+                          name={removedParticipantsAcknowledged ? "checkbox-marked" : "checkbox-blank-outline"}
+                          size={18}
+                          color={removedParticipantsAcknowledged ? colors.blue : colors.textMuted}
+                        />
+                        <Text style={[styles.acknowledgeText, { color: colors.textPrimary }]}>
+                          I’ve reviewed the removed participants and the revised split
+                        </Text>
+                      </Pressable>
+                    </>
+                  ) : null}
+                </View>
+              ) : null}
               <AddExpenseForm
                 colors={colors}
                 members={members}
@@ -852,12 +1485,33 @@ export default function AddExpenseScreen() {
                 submitError={submitError}
                 onSubmit={handleSubmit}
                 onCancel={handleCancel}
+                primaryActionLabel={
+                  isCorrectionRoute ? (correctionAction.kind === "finish" ? "Finish correction" : "Save correction") : undefined
+                }
+                primaryActionAccessibilityLabel={
+                  isCorrectionRoute ? (correctionAction.kind === "finish" ? "Finish correction" : "Save correction") : undefined
+                }
               />
+              </>
             )}
           </View>
         </View>
       </ScrollView>
     </SafeAreaView>
+    {isCorrectionRoute && oldExpenseState.status === "ready" ? (
+      <CorrectExpenseConfirmDialog
+        visible={correctDialogVisible}
+        mode={correctionAction.kind === "finish" ? "finish" : "start"}
+        expenseDescription={description}
+        expenseAmountMinor={previewAmountMinor ?? oldExpenseState.expense.amountMinor}
+        submitting={correctionSubmitting}
+        submitError={correctionSubmitError}
+        onCancel={closeCorrectDialog}
+        onConfirm={handleConfirmCorrection}
+        colors={colors}
+      />
+    ) : null}
+    </>
   );
 }
 
@@ -898,4 +1552,27 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   primaryActionText: { fontSize: 13, fontWeight: "800" },
+  secondaryActionBtn: {
+    height: 42,
+    paddingHorizontal: spacing.xl,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  secondaryActionText: { fontSize: 13, fontWeight: "800" },
+
+  ineligibleBanner: {
+    borderRadius: radii.md,
+    padding: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  ineligibleBannerText: { fontSize: 12, fontWeight: "600", lineHeight: 17 },
+  acknowledgeRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    marginTop: spacing.sm,
+  },
+  acknowledgeText: { fontSize: 12, fontWeight: "700", flex: 1 },
 });

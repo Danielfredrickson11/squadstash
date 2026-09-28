@@ -45,6 +45,7 @@ import {
   type PendingExpenseReversalRequest,
   type ReversalOutcomeResult,
 } from "../../../../../src/domain/expenseReversal";
+import { canClaimCorrection, resolveCorrectionAction } from "../../../../../src/domain/expenseCorrection";
 import { formatCurrency, formatTransactionTimestamp } from "../../../../../utils/format";
 import type { Expense, ExpenseSplit, PublicProfile, SplitStrategy, Trip } from "../../../../../src/types/domain";
 
@@ -391,6 +392,39 @@ export default function ExpenseDetailScreen() {
       tripMemberIds: trip?.memberIds,
     });
   }, [expense, user?.uid, trip]);
+
+  // ------------------------------------------------------------------
+  // Correction entry point (Checkpoint 4D.7, UI preflight §24/§27/§28).
+  // Advisory only - recordTripExpense/reverseTripExpense independently
+  // re-authorize every request server-side regardless of what this
+  // computes. isArchived gates ONLY the correction action (§28) - it
+  // never affects canReverse above, matching reversal's own frozen
+  // "no archive gate" behavior exactly.
+  // ------------------------------------------------------------------
+  const isArchived = !!trip?.archivedAt;
+  const correctionAction = useMemo(() => {
+    if (!expense) return { kind: "none" as const };
+    const canClaim = canClaimCorrection({
+      currentUid: user?.uid,
+      expenseCreatedBy: expense.createdBy,
+      expenseReversedBy: expense.reversedBy,
+      tripOwnerId: trip?.ownerId,
+      tripMemberIds: trip?.memberIds,
+    });
+    return resolveCorrectionAction({
+      expenseStatus: expense.status,
+      replacedByExpenseId: expense.replacedByExpenseId,
+      canClaim,
+    });
+  }, [expense, user?.uid, trip]);
+
+  const goToCorrectExpense = useCallback(() => {
+    if (!tripId || !expense) return;
+    router.push({
+      pathname: "/(tabs)/trips/[tripId]/expenses/create",
+      params: { tripId, replaces: expense.id },
+    });
+  }, [router, tripId, expense]);
 
   // ------------------------------------------------------------------
   // Reversal dialog + submission controller (§25/§26/§27/§28 of the
@@ -913,6 +947,39 @@ export default function ExpenseDetailScreen() {
                   </>
                 ) : null}
 
+                {/* Checkpoint 4D.7: "Correct expense" (active) /
+                    "Finish correction" (reversed, unlinked) - shown only
+                    when otherwise authorized AND the old Expense's own
+                    state qualifies (never once a canonical replacement
+                    already exists - the "Replaced by …" lineage link
+                    above already covers that case). On an archived Trip,
+                    replacement creation is always blocked server-side
+                    (§28) - rather than offering an action that can only
+                    fail, an honest explanation is shown instead. */}
+                {correctionAction.kind !== "none" ? (
+                  isArchived ? (
+                    <Text style={[styles.archivedCorrectionNote, { color: colors.textMuted }]}>
+                      This trip is archived, so a corrected replacement can’t be created here.
+                    </Text>
+                  ) : (
+                    <Pressable
+                      onPress={goToCorrectExpense}
+                      accessibilityRole="button"
+                      accessibilityLabel={correctionAction.kind === "start" ? "Correct expense" : "Finish correction"}
+                      style={({ pressed }) => [
+                        styles.secondaryActionBtn,
+                        styles.reverseBtn,
+                        { borderColor: colors.border },
+                        pressed && { opacity: 0.85 },
+                      ]}
+                    >
+                      <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>
+                        {correctionAction.kind === "start" ? "Correct expense" : "Finish correction"}
+                      </Text>
+                    </Pressable>
+                  )
+                ) : null}
+
                 {/* Checkpoint 4D.6: read-only view otherwise - the ONLY
                     mutation action on this screen. Shown only when the
                     Expense is active AND the current user is
@@ -1113,6 +1180,7 @@ const styles = StyleSheet.create({
   },
   inlineRetryBtn: { alignSelf: "center", marginTop: spacing.xs },
   reverseBtn: { marginTop: spacing.lg, width: "100%" },
+  archivedCorrectionNote: { fontSize: 12, fontWeight: "600", textAlign: "center", marginTop: spacing.lg },
   recoveryWrap: { marginTop: spacing.lg, alignItems: "center", gap: spacing.xs },
   recoveryText: { fontSize: 12, fontWeight: "600", textAlign: "center" },
   errorTextCentered: { fontSize: 12, fontWeight: "700", textAlign: "center" },
