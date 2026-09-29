@@ -1,6 +1,7 @@
 import {
   assertUsdCurrency,
   assertValidExpensePaymentShape,
+  assertValidSettlementReversalShape,
   computeTripBalances,
 } from "../tripSettlement";
 import type { Expense, ExpenseSplit, Settlement } from "../../types/domain";
@@ -42,6 +43,10 @@ function makeSplit(expenseId: string, overrides: Partial<ExpenseSplit> = {}): Ex
   };
 }
 
+// Checkpoint 4E.1: defaults to "active" with no reversal metadata - an
+// ordinary fixture must never silently carry fake reversal metadata, so
+// every EXISTING active-Settlement test below continues to prove the
+// exact same math it always did, unmodified.
 function makeSettlement(overrides: Partial<Settlement> = {}): Settlement {
   return {
     id: freshId("settlement"),
@@ -53,8 +58,21 @@ function makeSettlement(overrides: Partial<Settlement> = {}): Settlement {
     method: "cash",
     createdAt: FAKE_TIMESTAMP,
     createdBy: "a",
+    status: "active",
     ...overrides,
   };
+}
+
+// Checkpoint 4E.1: a properly-shaped reversed Settlement fixture -
+// spreads over makeSettlement() so every OTHER field keeps its own
+// default/override, only the reversal transition fields are added here.
+function makeReversedSettlement(overrides: Partial<Settlement> = {}): Settlement {
+  return makeSettlement({
+    status: "reversed",
+    reversedAt: FAKE_TIMESTAMP,
+    reversedBy: "b",
+    ...overrides,
+  });
 }
 
 describe("assertValidExpensePaymentShape", () => {
@@ -128,6 +146,70 @@ describe("assertUsdCurrency", () => {
     expect(() => assertUsdCurrency("EUR", "test")).toThrow(/must be "USD"/);
     expect(() => assertUsdCurrency("usd", "test")).toThrow(/must be "USD"/);
     expect(() => assertUsdCurrency("", "test")).toThrow(/must be "USD"/);
+  });
+});
+
+// Checkpoint 4E.1, per the frozen docs/audits/
+// TRIP_BALANCES_SETTLEMENTS_PREFLIGHT_2026-09-28.md §10/§11/§20.
+describe("assertValidSettlementReversalShape", () => {
+  it("accepts a well-formed active Settlement (no reversal metadata)", () => {
+    expect(() => assertValidSettlementReversalShape(makeSettlement())).not.toThrow();
+  });
+
+  it("accepts a well-formed reversed Settlement with a reversalReason", () => {
+    expect(() =>
+      assertValidSettlementReversalShape(makeReversedSettlement({ reversalReason: "Recorded by mistake" }))
+    ).not.toThrow();
+  });
+
+  it("I. accepts a well-formed reversed Settlement with NO reversalReason (optional)", () => {
+    const settlement = makeReversedSettlement();
+    expect(settlement.reversalReason).toBeUndefined();
+    expect(() => assertValidSettlementReversalShape(settlement)).not.toThrow();
+  });
+
+  it("E. rejects an unknown/malformed status", () => {
+    const settlement = makeSettlement({ status: "pending" as unknown as Settlement["status"] });
+    expect(() => assertValidSettlementReversalShape(settlement)).toThrow(/unknown status/);
+  });
+
+  it("F. rejects status \"reversed\" with a missing reversedAt", () => {
+    const settlement = makeReversedSettlement({ reversedAt: undefined });
+    expect(() => assertValidSettlementReversalShape(settlement)).toThrow(/requires a reversedAt/);
+  });
+
+  it("G. rejects status \"reversed\" with a missing reversedBy", () => {
+    const settlement = makeReversedSettlement({ reversedBy: undefined });
+    expect(() => assertValidSettlementReversalShape(settlement)).toThrow(/requires a non-empty reversedBy/);
+  });
+
+  it("G. rejects status \"reversed\" with a whitespace-only reversedBy", () => {
+    const settlement = makeReversedSettlement({ reversedBy: "   " });
+    expect(() => assertValidSettlementReversalShape(settlement)).toThrow(/requires a non-empty reversedBy/);
+  });
+
+  it("rejects status \"reversed\" with a non-string reversalReason", () => {
+    const settlement = makeReversedSettlement({
+      reversalReason: 123 as unknown as string,
+    });
+    expect(() => assertValidSettlementReversalShape(settlement)).toThrow(
+      /reversalReason, when present, must be a string/
+    );
+  });
+
+  it("H. rejects an active Settlement carrying a reversedAt", () => {
+    const settlement = makeSettlement({ reversedAt: FAKE_TIMESTAMP });
+    expect(() => assertValidSettlementReversalShape(settlement)).toThrow(/must not have a reversedAt/);
+  });
+
+  it("H. rejects an active Settlement carrying a reversedBy", () => {
+    const settlement = makeSettlement({ reversedBy: "b" });
+    expect(() => assertValidSettlementReversalShape(settlement)).toThrow(/must not have a reversedBy/);
+  });
+
+  it("H. rejects an active Settlement carrying a reversalReason", () => {
+    const settlement = makeSettlement({ reversalReason: "should not be here" });
+    expect(() => assertValidSettlementReversalShape(settlement)).toThrow(/must not have a reversalReason/);
   });
 });
 
@@ -621,6 +703,91 @@ describe("computeTripBalances", () => {
       expect(computeTripBalances([expense], splits, [], TRIP_ID)).toEqual([
         { fromUid: otherUid, toUid: payerUid, amountMinor: 100 },
       ]);
+    });
+  });
+
+  // Checkpoint 4E.1, per the frozen docs/audits/
+  // TRIP_BALANCES_SETTLEMENTS_PREFLIGHT_2026-09-28.md §11/§20 - Settlement
+  // reversal's effect on the actual debt math, exercised through the real
+  // computeTripBalances entry point (not just the standalone shape-check
+  // function above).
+  describe("4E.1: Settlement reversal", () => {
+    it("A. an active Settlement still reduces debt exactly as before (regression)", () => {
+      const expense = makeExpense({ amountMinor: 200, payerUid: "B" });
+      const splits = [
+        makeSplit(expense.id, { userId: "B", amountMinor: 100 }),
+        makeSplit(expense.id, { userId: "A", amountMinor: 100 }),
+      ];
+      const settlement = makeSettlement({ fromUid: "A", toUid: "B", amountMinor: 40 });
+      expect(computeTripBalances([expense], splits, [settlement], TRIP_ID)).toEqual([
+        { fromUid: "A", toUid: "B", amountMinor: 60 },
+      ]);
+    });
+
+    it("B. a reversed Settlement contributes zero debt reduction", () => {
+      const expense = makeExpense({ amountMinor: 200, payerUid: "B" });
+      const splits = [
+        makeSplit(expense.id, { userId: "B", amountMinor: 100 }),
+        makeSplit(expense.id, { userId: "A", amountMinor: 100 }),
+      ];
+      const settlement = makeReversedSettlement({ fromUid: "A", toUid: "B", amountMinor: 40 });
+      expect(computeTripBalances([expense], splits, [settlement], TRIP_ID)).toEqual([
+        { fromUid: "A", toUid: "B", amountMinor: 100 },
+      ]);
+    });
+
+    it("C. an active exact Settlement clears a pair; the same Settlement reversed leaves the original debt intact", () => {
+      const expense = makeExpense({ amountMinor: 200, payerUid: "B" });
+      const splits = [
+        makeSplit(expense.id, { userId: "B", amountMinor: 100 }),
+        makeSplit(expense.id, { userId: "A", amountMinor: 100 }),
+      ];
+      const activeSettlement = makeSettlement({ fromUid: "A", toUid: "B", amountMinor: 100 });
+      expect(computeTripBalances([expense], splits, [activeSettlement], TRIP_ID)).toEqual([]);
+
+      const reversedSettlement = makeReversedSettlement({ fromUid: "A", toUid: "B", amountMinor: 100 });
+      expect(computeTripBalances([expense], splits, [reversedSettlement], TRIP_ID)).toEqual([
+        { fromUid: "A", toUid: "B", amountMinor: 100 },
+      ]);
+    });
+
+    it("D. an active over-settlement still flips direction; reversing it restores the pre-settlement debt", () => {
+      const expense = makeExpense({ amountMinor: 200, payerUid: "B" });
+      const splits = [
+        makeSplit(expense.id, { userId: "B", amountMinor: 100 }),
+        makeSplit(expense.id, { userId: "A", amountMinor: 100 }),
+      ];
+      const activeOverSettlement = makeSettlement({ fromUid: "A", toUid: "B", amountMinor: 150 });
+      expect(computeTripBalances([expense], splits, [activeOverSettlement], TRIP_ID)).toEqual([
+        { fromUid: "B", toUid: "A", amountMinor: 50 },
+      ]);
+
+      const reversedOverSettlement = makeReversedSettlement({ fromUid: "A", toUid: "B", amountMinor: 150 });
+      expect(computeTripBalances([expense], splits, [reversedOverSettlement], TRIP_ID)).toEqual([
+        { fromUid: "A", toUid: "B", amountMinor: 100 },
+      ]);
+    });
+
+    it("a reversed Settlement's own shape is still validated even though its contribution is skipped (mirrors the reversed-Expense precedent)", () => {
+      const settlement = makeReversedSettlement({ reversedBy: undefined });
+      expect(() => computeTripBalances([], [], [settlement], TRIP_ID)).toThrow(
+        /requires a non-empty reversedBy/
+      );
+    });
+
+    it("J. a reversed Settlement with a malformed (negative) amountMinor still throws before the contribution skip can hide it", () => {
+      const settlement = makeReversedSettlement({ amountMinor: -50 });
+      expect(() => computeTripBalances([], [], [settlement], TRIP_ID)).toThrow(/malformed amountMinor/);
+    });
+
+    it("J. a reversed Settlement with a non-USD currency still throws before the contribution skip can hide it", () => {
+      const settlement = makeReversedSettlement({ currency: "EUR" });
+      expect(() => computeTripBalances([], [], [settlement], TRIP_ID)).toThrow(/must be "USD"/);
+    });
+
+    it("E. an unknown Settlement status fails closed inside computeTripBalances too, not just the standalone shape check", () => {
+      const settlement = makeSettlement({ status: "pending" as unknown as Settlement["status"] });
+      expect(() => computeTripBalances([], [], [settlement], TRIP_ID)).toThrow(/unknown status/);
     });
   });
 });

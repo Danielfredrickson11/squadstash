@@ -144,6 +144,62 @@ export function assertValidExpensePaymentShape(
   );
 }
 
+// Checkpoint 4E.1, per the frozen docs/audits/
+// TRIP_BALANCES_SETTLEMENTS_PREFLIGHT_2026-09-28.md §10/§11 (as hardened
+// by 4E.0A): the active/reversed conditional shape a Settlement must
+// satisfy, mirroring assertValidExpensePaymentShape's own "exported so a
+// later trusted write boundary can reuse the identical check" rationale.
+// Deliberately narrow - not a general schema-validation framework, only
+// the specific shape needed so a malformed reversed Settlement can never
+// hide behind status: "reversed" (the same unconditional-shape-
+// validation-before-any-skip philosophy already applied to Expense's own
+// split-total check above). Runs BEFORE the reversed-status debt-skip in
+// computeTripBalances, never after.
+export function assertValidSettlementReversalShape(
+  settlement: Pick<Settlement, "id" | "status" | "reversedAt" | "reversedBy" | "reversalReason">
+): void {
+  if (settlement.status === "active") {
+    if (settlement.reversedAt !== undefined) {
+      throw new Error(`Settlement "${settlement.id}": status "active" must not have a reversedAt.`);
+    }
+    if (settlement.reversedBy !== undefined) {
+      throw new Error(`Settlement "${settlement.id}": status "active" must not have a reversedBy.`);
+    }
+    if (settlement.reversalReason !== undefined) {
+      throw new Error(
+        `Settlement "${settlement.id}": status "active" must not have a reversalReason.`
+      );
+    }
+    return;
+  }
+  if (settlement.status === "reversed") {
+    if (settlement.reversedAt === undefined) {
+      throw new Error(`Settlement "${settlement.id}": status "reversed" requires a reversedAt.`);
+    }
+    // Checkpoint 4B.2 §1/§2's own trim-checked (not just typeof-checked)
+    // identifier discipline, reused here for reversedBy - a whitespace-
+    // only value is not a meaningful reverser identifier either.
+    if (typeof settlement.reversedBy !== "string" || settlement.reversedBy.trim().length === 0) {
+      throw new Error(`Settlement "${settlement.id}": status "reversed" requires a non-empty reversedBy.`);
+    }
+    // reversalReason MAY be absent (optional, matching reverseTripExpense's
+    // own convention); if present, it only needs to be a string here -
+    // trimming/length-capping is the future trusted callable/mapper's own
+    // responsibility (§10), not re-duplicated in this pure engine.
+    if (settlement.reversalReason !== undefined && typeof settlement.reversalReason !== "string") {
+      throw new Error(
+        `Settlement "${settlement.id}": reversalReason, when present, must be a string.`
+      );
+    }
+    return;
+  }
+  throw new Error(
+    `Settlement "${settlement.id}": unknown status "${String(
+      (settlement as { status: unknown }).status
+    )}".`
+  );
+}
+
 // Checkpoint 4B §12/§13: derives net pairwise balances directly from
 // canonical Expense + ExpenseSplit + Settlement records - never a cached
 // "net balance" field anywhere. Scope is DIRECT PAIRWISE netting only
@@ -330,6 +386,15 @@ export function computeTripBalances(
       throw new Error(`computeTripBalances: Settlement "${settlement.id}" has a malformed amountMinor.`);
     }
     assertUsdCurrency(settlement.currency, `Settlement "${settlement.id}"`);
+
+    // Checkpoint 4E.1: shape/status validation runs UNCONDITIONALLY,
+    // before the reversed-status short-circuit below - a malformed
+    // record must never be allowed to hide behind status: "reversed",
+    // exactly mirroring the identical Expense discipline above (§11 of
+    // the frozen preflight).
+    assertValidSettlementReversalShape(settlement);
+
+    if (settlement.status === "reversed") continue; // reversed Settlements contribute zero debt reduction
 
     // A settlement REDUCES what fromUid owes toUid - expressed as
     // negative debt in the same direction, so it composes with ordinary
