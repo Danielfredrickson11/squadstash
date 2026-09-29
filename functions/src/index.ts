@@ -7,3 +7,5 @@ export {lookupUserByEmail} from "./callables/lookupUserByEmail";
 export {recordSavingsTransaction} from "./callables/recordSavingsTransaction";
 export {recordTripExpense} from "./callables/recordTripExpense";
 export {reverseTripExpense} from "./callables/reverseTripExpense";
+export {recordTripSettlement} from "./callables/recordTripSettlement";
+export {reverseTripSettlement} from "./callables/reverseTripSettlement";

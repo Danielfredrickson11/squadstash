@@ -443,6 +443,30 @@ service cloud.firestore {
     }
 
     // ---------------------------------------
+    // TRIP SETTLEMENTS (Checkpoint 4E.2, approved docs/audits/
+    // TRIP_BALANCES_SETTLEMENTS_PREFLIGHT_2026-09-28.md §10/§13, as
+    // hardened by 4E.0A) - reuses canAccessTripById() verbatim (declared
+    // above, in this same outer scope), matching tripExpenses/
+    // tripExpenseSplits' identical read-only, trusted-write-only posture
+    // exactly. The trusted recordTripSettlement/reverseTripSettlement
+    // Cloud Functions (Admin SDK, which bypass these rules entirely) are
+    // the SOLE write path - no client create/update/delete, for any
+    // role, ever, including the Settlement's own recipient (toUid),
+    // debtor (fromUid), or the Trip owner. Deliberately does NOT inspect
+    // archivedAt - a current Trip member's Settlement history remains
+    // fully readable on an archived Trip, exactly like tripExpenses.
+    // ---------------------------------------
+    match /tripSettlements/{settlementId} {
+      // Document id conveys no authority whatsoever - access follows
+      // ONLY the resource's own tripId field, checked fresh against that
+      // Trip's CURRENT membership/ownership on every read.
+      allow get, list: if resource.data.tripId is string
+        && canAccessTripById(resource.data.tripId);
+
+      allow create, update, delete: if false;
+    }
+
+    // ---------------------------------------
     // USERS
     // ---------------------------------------
     match /users/{uid} {
