@@ -56,9 +56,11 @@ import {
   type PendingMoneyActionRequest,
 } from "../../../../src/domain/savingsMoneyAction";
 import { useSavingsMoneyAction } from "../../../../src/hooks/useSavingsMoneyAction";
+import { useTripBalances, type TripBalancesErrorSource } from "../../../../src/hooks/useTripBalances";
 import type { Bucket, Expense, PublicProfile, SavingsTransactionType, Trip } from "../../../../src/types/domain";
 import { initialsFromName } from "../../../../components/buckets/AvatarCircle";
 import { ExpenseRow, type ExpenseRowPayer } from "../../../../components/expenses/ExpenseRow";
+import { BalanceRow, type BalanceRowFromMember } from "../../../../components/balances/BalanceRow";
 
 const FALLBACK_IMAGE =
   "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=60";
@@ -93,6 +95,25 @@ function money(n?: number) {
 }
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
+}
+
+// Checkpoint 4E.5 §18: never displays a raw Firebase/HttpsError message -
+// safe, source-aware copy only. `source` is always present on a real
+// TripBalancesError, but this stays total (a default branch) rather than
+// assuming that shape can never drift.
+function balanceErrorSourceCopy(source: TripBalancesErrorSource | undefined): string {
+  switch (source) {
+    case "expenses":
+      return "We couldn’t load the expenses needed to calculate balances.";
+    case "splits":
+      return "We couldn’t load one or more expense splits.";
+    case "settlements":
+      return "We couldn’t load confirmed settlements.";
+    case "calculation":
+      return "We couldn’t calculate balances from the current trip data.";
+    default:
+      return "We couldn’t load balances.";
+  }
 }
 
 export default function TripDetails() {
@@ -932,6 +953,117 @@ export default function TripDetails() {
     [profileState, missingPayerLabels]
   );
 
+  // ==========================================================================
+  // Checkpoint 4E.5: BALANCES - read-only "who owes whom" card.
+  // useTripBalances is the SOLE balance source (src/hooks/
+  // useTripBalances.ts) - this screen never recomputes/nets balances,
+  // never subscribes to Settlements or Expense Splits directly, and
+  // never imports any Settlement-write callable. Every non-zero
+  // pairwise TripBalance the hook returns is rendered as-is (no
+  // filtering to "involves me," no re-sorting) - the frozen privacy
+  // model treats the full pairwise graph as Trip-visible to every
+  // current member, since it's derived only from already Trip-visible
+  // Expense/Split/Settlement facts (preflight §17).
+  // ==========================================================================
+  const { state: balanceState, retry: retryBalances } = useTripBalances(tripId);
+
+  // Checkpoint 4E.5 §9/§10: a SEPARATE profile-resolution state from the
+  // Expense payer one above - Balances may involve a different/larger
+  // set of people (including a departed member still shown in an
+  // outstanding balance), so it must not be coupled to payerUids/
+  // profileState, which is intentionally scoped to only the 3 rendered
+  // recent Expense rows. Derived strictly from the balance facts
+  // themselves (fromUid/toUid), never from trip.memberIds - a departed
+  // member's historical balance must remain displayable.
+  type BalanceProfileState =
+    | { status: "loading" }
+    | { status: "error" }
+    | { status: "ready"; profiles: Map<string, PublicProfile> };
+
+  const balanceUids = useMemo(() => {
+    const uids = new Set<string>();
+    (balanceState.balances ?? []).forEach((balance) => {
+      uids.add(balance.fromUid);
+      uids.add(balance.toUid);
+    });
+    return Array.from(uids).sort();
+  }, [balanceState.balances]);
+  const balanceUidsKey = balanceUids.join("|");
+
+  const [balanceProfileState, setBalanceProfileState] = useState<BalanceProfileState>({ status: "loading" });
+  const balanceProfileUnsubRef = useRef<(() => void) | null>(null);
+  const [balanceProfileRetryNonce, setBalanceProfileRetryNonce] = useState(0);
+  const retryBalanceProfiles = useCallback(() => setBalanceProfileRetryNonce((n) => n + 1), []);
+
+  useEffect(() => {
+    balanceProfileUnsubRef.current?.();
+    balanceProfileUnsubRef.current = null;
+    setBalanceProfileState({ status: "loading" });
+    if (balanceUids.length === 0) {
+      setBalanceProfileState({ status: "ready", profiles: new Map() });
+      return undefined;
+    }
+    balanceProfileUnsubRef.current = subscribeToPublicUsersByIdsChunked(
+      balanceUids,
+      (profiles) =>
+        setBalanceProfileState({ status: "ready", profiles: new Map(profiles.map((p) => [p.uid, p])) }),
+      (err) => {
+        console.error("Balance member profile subscription error:", err);
+        setBalanceProfileState({ status: "error" });
+      }
+    );
+    return () => {
+      balanceProfileUnsubRef.current?.();
+      balanceProfileUnsubRef.current = null;
+    };
+    // balanceUidsKey is the real dependency (a stable primitive derived
+    // from balanceUids' content) - balanceUids itself is included so the
+    // effect body always closes over the exact array that produced the
+    // key, mirroring the existing payerUidsKey pattern above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [balanceUidsKey, balanceProfileRetryNonce]);
+
+  // Checkpoint 4E.5 §11/§12: deterministic numbered fallback for every
+  // uid with no resolved profile - covers BOTH "the subscription is
+  // ready but this specific uid has no profile/displayName" AND "the
+  // whole subscription errored, so no uid resolved at all." A profile
+  // lookup failure must never make a valid financial balance disappear.
+  const fallbackBalanceLabels = useMemo(() => {
+    const labels = new Map<string, string>();
+    const missing =
+      balanceProfileState.status === "ready"
+        ? balanceUids.filter((uid) => !balanceProfileState.profiles.get(uid)?.displayName?.trim())
+        : balanceProfileState.status === "error"
+          ? balanceUids
+          : [];
+    missing.forEach((uid, i) => {
+      labels.set(uid, missing.length > 1 ? `Trip member ${i + 1}` : "Trip member");
+    });
+    return labels;
+  }, [balanceProfileState, balanceUids]);
+
+  const resolveBalanceMember = useCallback(
+    (uid: string): BalanceRowFromMember => {
+      if (balanceProfileState.status === "loading") {
+        return { avatarLabel: "Loading member", nameLabel: "Loading member…" };
+      }
+      if (balanceProfileState.status === "ready") {
+        const profile = balanceProfileState.profiles.get(uid);
+        const name = profile?.displayName?.trim();
+        if (name) {
+          return {
+            avatarLabel: initialsFromName(name),
+            nameLabel: name,
+            photoURL: profile?.photoURL?.trim() || undefined,
+          };
+        }
+      }
+      const fallback = fallbackBalanceLabels.get(uid) ?? "Trip member";
+      return { avatarLabel: fallback, nameLabel: fallback };
+    },
+    [balanceProfileState, fallbackBalanceLabels]
+  );
+
   const dangerText = theme.colors.onErrorContainer ?? "#991B1B";
 
   if (loading) {
@@ -1705,6 +1837,157 @@ export default function TripDetails() {
                 </>
               )}
             </View>
+
+            {/* Checkpoint 4E.5: BALANCES - read-only, immediately after
+                Expenses. No Settle Up/Record Settlement control exists
+                yet (4E.6) - a control that does nothing is worse than no
+                control. Remains visible/readable on an archived Trip
+                (no archive gate, matching Expenses' own "View all"
+                precedent) - historical Expense/Settlement facts stay
+                valid history regardless of archive state. */}
+            <View
+              style={[
+                styles.card,
+                { backgroundColor: theme.colors.surface, borderColor: colors.border },
+                cardShadowFor(theme.dark),
+              ]}
+            >
+              <View style={styles.cardHeaderRow}>
+                <View style={[styles.iconBubble, { backgroundColor: colors.bluePale }]}>
+                  <MaterialCommunityIcons name="swap-horizontal" size={18} color={colors.blue} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.cardTitle, { color: colors.textPrimary }]}>Balances</Text>
+                  <Text style={[styles.cardSub, { color: colors.textMuted }]}>
+                    Who owes whom for this trip
+                  </Text>
+                </View>
+              </View>
+
+              {/* Checkpoint 4E.5 §5: explicit privacy-boundary copy -
+                  never implies net worth, ability to pay, or My Stash
+                  availability. */}
+              <Text style={[styles.balancesExplainer, { color: colors.textMuted }]}>
+                Based on shared trip expenses and confirmed settlements.
+              </Text>
+
+              {balanceState.status === "loading" && balanceState.balances === null ? (
+                // Checkpoint 4E.5 §14: loading is not proof of zero debt -
+                // never show $0/"All settled"/[] before the controller is
+                // actually ready.
+                <View style={styles.stashLoadingWrap}>
+                  <ActivityIndicator size="small" />
+                  <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                    Calculating balances…
+                  </Text>
+                </View>
+              ) : balanceState.status === "error" && balanceState.balances === null ? (
+                // Checkpoint 4E.5 §18: no prior snapshot exists - a hard
+                // error state with Retry, never a raw Firebase message.
+                <View style={styles.expenseErrorWrap}>
+                  <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                    {balanceErrorSourceCopy(balanceState.error?.source)}
+                  </Text>
+                  <Pressable
+                    onPress={retryBalances}
+                    accessibilityRole="button"
+                    accessibilityLabel="Retry loading balances"
+                    style={({ pressed }) => [
+                      styles.secondaryActionBtn,
+                      styles.inlineRetryBtn,
+                      { borderColor: colors.border },
+                      pressed && { opacity: 0.9 },
+                    ]}
+                  >
+                    <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Retry</Text>
+                  </Pressable>
+                </View>
+              ) : balanceState.status === "ready" && balanceState.balances !== null && balanceState.balances.length === 0 ? (
+                // Checkpoint 4E.5 §15: a positive but factual empty state
+                // - never invents a payment story ("Everyone has paid").
+                <View style={styles.stashEmptyWrap}>
+                  <Text style={[styles.cardSub, { color: colors.textSecondary }]}>
+                    No outstanding balances.
+                  </Text>
+                  <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                    Shared trip expenses and confirmed settlements are currently balanced.
+                  </Text>
+                </View>
+              ) : balanceState.balances !== null ? (
+                <>
+                  {/* Checkpoint 4E.5 §6: the COMPLETE non-zero pairwise
+                      list, never filtered to "involves me" and never
+                      re-sorted - rendered exactly as the engine returned
+                      it. */}
+                  <View style={styles.expenseListWrap}>
+                    {balanceState.balances.map((balance) => (
+                      <BalanceRow
+                        key={`${balance.fromUid}|${balance.toUid}`}
+                        from={resolveBalanceMember(balance.fromUid)}
+                        to={{ nameLabel: resolveBalanceMember(balance.toUid).nameLabel }}
+                        amountMinor={balance.amountMinor}
+                      />
+                    ))}
+                  </View>
+
+                  {/* Checkpoint 4E.5 §17: "updating" must never be
+                      visually presented as fully current - the retained
+                      rows above stay visible, but this indicator makes
+                      the transitional state obvious. */}
+                  {balanceState.status === "updating" ? (
+                    <View style={styles.balancesStatusRow}>
+                      <ActivityIndicator size="small" />
+                      <Text style={[styles.balancesStatusText, { color: colors.textMuted }]}>
+                        Updating balances…
+                      </Text>
+                    </View>
+                  ) : null}
+
+                  {/* Checkpoint 4E.5 §19: a last-known-good snapshot on
+                      error must stay visibly identified as stale - never
+                      labeled ready, never hiding the error because rows
+                      still exist. */}
+                  {balanceState.status === "error" ? (
+                    <View style={styles.balancesStatusRow}>
+                      <Text style={[styles.balancesStatusText, { color: colors.textMuted }]}>
+                        Balances may be out of date.
+                      </Text>
+                      <Pressable
+                        onPress={retryBalances}
+                        accessibilityRole="button"
+                        accessibilityLabel="Retry loading balances"
+                      >
+                        <Text style={[styles.profileErrorRetryText, { color: colors.blue }]}>
+                          Retry
+                        </Text>
+                      </Pressable>
+                    </View>
+                  ) : null}
+
+                  {/* Checkpoint 4E.5 §12/§20: the FINANCIAL controller's
+                      own Retry (above) is entirely independent of this
+                      profile-only Retry - a profile lookup failure never
+                      hides a valid balance, and never retries the
+                      financial controller merely because names failed. */}
+                  {balanceProfileState.status === "error" ? (
+                    <View style={styles.profileErrorRow}>
+                      <Text style={[styles.profileErrorText, { color: colors.textMuted }]}>
+                        Some member names couldn’t be loaded.
+                      </Text>
+                      <Pressable
+                        onPress={retryBalanceProfiles}
+                        accessibilityRole="button"
+                        accessibilityLabel="Retry loading member names"
+                      >
+                        <Text style={[styles.profileErrorRetryText, { color: colors.blue }]}>
+                          Retry
+                        </Text>
+                      </Pressable>
+                    </View>
+                  ) : null}
+                </>
+              ) : null}
+            </View>
           </View>
 
           {/* Side */}
@@ -2345,6 +2628,16 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.xs,
   },
   viewAllText: { fontSize: 13, fontWeight: "800" },
+
+  // --- Balances card (Checkpoint 4E.5) -------------------------------
+  balancesExplainer: { fontSize: 12, fontWeight: "500", marginTop: spacing.xs, marginBottom: spacing.xs },
+  balancesStatusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    marginTop: spacing.sm,
+  },
+  balancesStatusText: { fontSize: 12, fontWeight: "600" },
 
   // --- Quick Analysis -----------------------------------------------
   groupLabel: {
