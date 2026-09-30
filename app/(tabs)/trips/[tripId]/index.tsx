@@ -55,12 +55,34 @@ import {
   resolveMoneyActionClientRequestId,
   type PendingMoneyActionRequest,
 } from "../../../../src/domain/savingsMoneyAction";
+import { deriveCurrentMemberUids, parseExpenseMoneyInput } from "../../../../src/domain/expenseSubmission";
+import {
+  assessSettlementAgainstDebt,
+  normalizeSettlementNote,
+  resolveSettlementClientRequestId,
+  settlementCreationFactsEqual,
+  type PendingSettlementCreationRequest,
+  type SettlementCreationFacts,
+} from "../../../../src/domain/settlementSubmission";
+import type { TripBalance } from "../../../../src/domain/tripSettlement";
 import { useSavingsMoneyAction } from "../../../../src/hooks/useSavingsMoneyAction";
 import { useTripBalances, type TripBalancesErrorSource } from "../../../../src/hooks/useTripBalances";
-import type { Bucket, Expense, PublicProfile, SavingsTransactionType, Trip } from "../../../../src/types/domain";
+import {
+  generateSettlementClientRequestId,
+  recordTripSettlement,
+} from "../../../../src/services/firebase/settlements";
+import type {
+  Bucket,
+  Expense,
+  PublicProfile,
+  SavingsTransactionType,
+  SettlementMethod,
+  Trip,
+} from "../../../../src/types/domain";
 import { initialsFromName } from "../../../../components/buckets/AvatarCircle";
 import { ExpenseRow, type ExpenseRowPayer } from "../../../../components/expenses/ExpenseRow";
 import { BalanceRow, type BalanceRowFromMember } from "../../../../components/balances/BalanceRow";
+import { RecordSettlementDialog } from "../../../../components/balances/RecordSettlementDialog";
 
 const FALLBACK_IMAGE =
   "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=60";
@@ -113,6 +135,64 @@ function balanceErrorSourceCopy(source: TripBalancesErrorSource | undefined): st
       return "We couldn’t calculate balances from the current trip data.";
     default:
       return "We couldn’t load balances.";
+  }
+}
+
+// Checkpoint 4E.6 §13: converts an integer minor-unit amount into a
+// plain "12.34" string for the amount field's default value - pure
+// integer arithmetic only (Math.trunc/modulo on the already-integer
+// amountMinor), never a Number(dollarString)*100-style float round-trip.
+function minorUnitsToPlainAmountText(amountMinor: number): string {
+  const whole = Math.trunc(amountMinor / 100);
+  const cents = Math.abs(amountMinor) % 100;
+  return `${whole}.${cents.toString().padStart(2, "0")}`;
+}
+
+// Checkpoint 4E.6 §26: never shows a raw Firebase/HttpsError string.
+function settlementErrorMessage(e: unknown): string {
+  const code = (e as { code?: string } | null | undefined)?.code;
+  switch (code) {
+    case "functions/invalid-argument":
+      return "Check the amount, payment method, and note and try again.";
+    case "functions/permission-denied":
+      return "Only the member who received the payment can record this settlement.";
+    case "functions/not-found":
+      return "This trip could not be found.";
+    case "functions/failed-precondition":
+      return "This settlement can't be recorded because the trip membership or record state changed. Review the latest balances and try again.";
+    case "functions/already-exists":
+      return "We couldn't safely reconcile this settlement request. Review it and try again.";
+    case "functions/unavailable":
+    case "functions/deadline-exceeded":
+      return "We couldn't reach the server, so we can't confirm this went through - it's safe to try again.";
+    default:
+      return "We couldn't record that. Please try again.";
+  }
+}
+
+// Checkpoint 4E.6A §3: classifies whether a recordTripSettlement
+// FAILURE means "we genuinely don't know if this committed" (ambiguous -
+// the pending idempotency request must stay explicitly re-verifiable)
+// versus a DEFINITIVE rejection (the request provably did not create
+// anything new, or already-exists' own provably-different-request
+// case). Only unavailable/deadline-exceeded, plus any unknown/no-code
+// failure, are ambiguous - mirrors this codebase's existing conservative
+// "we don't know if it went through" precedent
+// (useSavingsMoneyAction/submitSharedAction's own identical treatment of
+// unavailable/deadline-exceeded). Never classifies already-exists as
+// ambiguous - it remains a DEFINITIVE, non-retryable-with-the-same-id
+// outcome and continues to clear the pending record.
+function isAmbiguousSettlementCreateFailure(e: unknown): boolean {
+  const code = (e as { code?: string } | null | undefined)?.code;
+  switch (code) {
+    case "functions/invalid-argument":
+    case "functions/permission-denied":
+    case "functions/not-found":
+    case "functions/failed-precondition":
+    case "functions/already-exists":
+      return false;
+    default:
+      return true;
   }
 }
 
@@ -1064,6 +1144,361 @@ export default function TripDetails() {
     [balanceProfileState, fallbackBalanceLabels]
   );
 
+  // ==========================================================================
+  // Checkpoint 4E.6: RECORD SETTLEMENT controller. A Settlement means
+  // "money was actually paid OUTSIDE SquadStash and the recipient
+  // confirms they received it" - SquadStash never moves money. This UI
+  // is advisory only; the trusted recordTripSettlement callable
+  // independently re-enforces every authorization/membership rule
+  // regardless of what this controller decides to *offer*.
+  // ==========================================================================
+
+  // ownerId UNION memberIds, deduplicated - the SAME current-membership
+  // semantics already used for Expense reversal authority
+  // (deriveCurrentMemberUids), never assuming ownerId is duplicated
+  // inside memberIds, never using profile availability as a membership
+  // signal.
+  const currentMemberUids = useMemo(
+    () => deriveCurrentMemberUids(trip?.ownerId, trip?.memberIds),
+    [trip?.ownerId, trip?.memberIds]
+  );
+
+  // Identified by {fromUid, toUid} only (§21) - never a whole stale
+  // TripBalance object held as authoritative. `settlementTarget` is
+  // deliberately NOT cleared merely because the dialog is closed
+  // (§22/§27) - only a definitive success (or opening a genuinely
+  // different pair) replaces it, so a retained pending idempotency
+  // request can be reused by reopening the same pair.
+  const [settlementVisible, setSettlementVisible] = useState(false);
+  const [settlementTarget, setSettlementTarget] = useState<{ fromUid: string; toUid: string } | null>(
+    null
+  );
+  const [settlementAmountText, setSettlementAmountText] = useState("");
+  const [settlementMethod, setSettlementMethod] = useState<SettlementMethod | null>(null);
+  const [settlementNote, setSettlementNote] = useState("");
+  const [settlementSubmitting, setSettlementSubmitting] = useState(false);
+  const [settlementSubmitError, setSettlementSubmitError] = useState<string | null>(null);
+  // Last successfully-observed debt for the selected pair - used ONLY
+  // for display continuity (§19) while balanceState is momentarily not
+  // "ready"; canSubmit/warnings below always reflect the CURRENT
+  // balanceState, never this cached value.
+  const [lastKnownSettlementDebtMinor, setLastKnownSettlementDebtMinor] = useState<number | null>(
+    null
+  );
+  // Checkpoint 4E.6A §4: a RENDERABLE mirror of pendingSettlementRef,
+  // set only when the most recent create failure was genuinely
+  // AMBIGUOUS (never for a definitive rejection) - drives the Balances
+  // card's own "Review" recovery notice (§6), which must remain
+  // reachable even after the original BalanceRow has disappeared from
+  // the live snapshot. Always kept in exact lockstep with
+  // pendingSettlementRef: set together on an ambiguous failure, cleared
+  // together on success/already-exists/a genuinely different logical
+  // request superseding it.
+  const [ambiguousSettlementRequest, setAmbiguousSettlementRequest] =
+    useState<PendingSettlementCreationRequest | null>(null);
+
+  const pendingSettlementRef = useRef<PendingSettlementCreationRequest | null>(null);
+  // Synchronous serialization guard, checked/set before any await -
+  // mirrors useSavingsMoneyAction's own inFlightRef exactly.
+  const settlementInFlightRef = useRef(false);
+  const settlementIsMountedRef = useRef(true);
+  useEffect(() => {
+    settlementIsMountedRef.current = true;
+    return () => {
+      settlementIsMountedRef.current = false;
+    };
+  }, []);
+
+  const openSettleUp = useCallback(
+    (balance: TripBalance) => {
+      if (settlementInFlightRef.current) return;
+      const isSamePair =
+        !!settlementTarget &&
+        settlementTarget.fromUid === balance.fromUid &&
+        settlementTarget.toUid === balance.toUid;
+      if (!isSamePair) {
+        // A genuinely different pair - fresh visible form using this
+        // pair's latest current debt (§22). Reopening the SAME pair
+        // deliberately preserves amountText/method/note/submitError so
+        // an explicit retry can reuse pendingSettlementRef's id.
+        setSettlementAmountText(minorUnitsToPlainAmountText(balance.amountMinor));
+        setSettlementMethod(null);
+        setSettlementNote("");
+        setSettlementSubmitError(null);
+      }
+      setSettlementTarget({ fromUid: balance.fromUid, toUid: balance.toUid });
+      setLastKnownSettlementDebtMinor(balance.amountMinor);
+      setSettlementVisible(true);
+    },
+    [settlementTarget]
+  );
+
+  const closeSettleUp = useCallback(() => {
+    if (settlementInFlightRef.current) return;
+    setSettlementVisible(false);
+    // Deliberately does NOT clear settlementTarget/amountText/method/
+    // note/pendingSettlementRef - dismissing is just a UI-visibility
+    // action (§22), matching close()'s own established behavior for the
+    // Bucket/Shared Stash money-action controllers elsewhere in this
+    // file.
+  }, []);
+
+  // Checkpoint 4E.6A §6/§7: reopens the dialog from a RETAINED,
+  // unresolved ambiguous request - independent of whether the original
+  // BalanceRow still exists in the live snapshot. Restores fromUid/
+  // toUid/amountMinor/method/note EXACTLY from the retained pending
+  // record (never fabricating a "current debt" default) - amountText is
+  // rebuilt safely from the pending amountMinor via the same integer-
+  // only formatter used when opening from a live row.
+  const openAmbiguousSettlementReview = useCallback(() => {
+    if (settlementInFlightRef.current) return;
+    const pending = ambiguousSettlementRequest;
+    if (!pending) return;
+    setSettlementTarget({ fromUid: pending.fromUid, toUid: pending.toUid });
+    setSettlementAmountText(minorUnitsToPlainAmountText(pending.amountMinor));
+    setSettlementMethod(pending.method);
+    setSettlementNote(pending.note ?? "");
+    setSettlementSubmitError(null);
+    setSettlementVisible(true);
+  }, [ambiguousSettlementRequest]);
+
+  // Checkpoint 4E.6 §18: live current-debt binding - re-derives the
+  // pair's debt from the LATEST successful ready balanceState snapshot
+  // on every relevant update, never trusting only the amount captured
+  // when Settle Up was first tapped.
+  useEffect(() => {
+    if (!settlementTarget) return;
+    if (balanceState.status !== "ready" || !balanceState.balances) return;
+    const match = balanceState.balances.find(
+      (b) => b.fromUid === settlementTarget.fromUid && b.toUid === settlementTarget.toUid
+    );
+    if (match) setLastKnownSettlementDebtMinor(match.amountMinor);
+  }, [settlementTarget, balanceState]);
+
+  const settlementBalanceMatch: TripBalance | null =
+    settlementTarget && balanceState.status === "ready" && balanceState.balances
+      ? balanceState.balances.find(
+          (b) => b.fromUid === settlementTarget.fromUid && b.toUid === settlementTarget.toUid
+        ) ?? null
+      : null;
+
+  // Checkpoint 4E.6 §19: balances updating/loading/errored, or the
+  // selected exact pair disappeared from the newest READY snapshot -
+  // withholds submission and shows safe copy, never silently submitting
+  // against stale balance context. Never auto-flips/reinvents the pair
+  // direction.
+  const settlementPairDisappeared =
+    !!settlementTarget && balanceState.status === "ready" && settlementBalanceMatch === null;
+
+  // Checkpoint 4E.6A §5/§9: the EXACT-REPLAY exception. Builds the same
+  // logical facts the form would submit right now (mirroring
+  // submitSettlement's own construction) and compares them, via the
+  // EXISTING settlementCreationFactsEqual (never a new equality
+  // algorithm), against a retained, still-unresolved AMBIGUOUS request.
+  // A malformed/incomplete current form (invalid amount, no method
+  // chosen, invalid note) can never itself qualify as a replay - it
+  // simply produces `null` here, same as before this checkpoint.
+  const settlementFactsForCurrentForm: SettlementCreationFacts | null = (() => {
+    if (!settlementTarget) return null;
+    const parsed = parseExpenseMoneyInput(settlementAmountText);
+    if (!parsed.ok || !settlementMethod) return null;
+    const normalizedNote = normalizeSettlementNote(settlementNote);
+    if (!normalizedNote.ok) return null;
+    return {
+      tripId,
+      fromUid: settlementTarget.fromUid,
+      toUid: settlementTarget.toUid,
+      amountMinor: parsed.amountMinor,
+      currency: "USD",
+      method: settlementMethod,
+      note: normalizedNote.value,
+      occurredAtInstantMs: null,
+    };
+  })();
+
+  const isExactAmbiguousSettlementReplay =
+    !!ambiguousSettlementRequest &&
+    !!settlementFactsForCurrentForm &&
+    settlementCreationFactsEqual(ambiguousSettlementRequest, settlementFactsForCurrentForm);
+
+  let settlementFreshnessWarning: string | null = null;
+  let settlementCanSubmit = true;
+  if (settlementTarget) {
+    if (isExactAmbiguousSettlementReplay) {
+      // Checkpoint 4E.6A §9/§10: resolving an ALREADY-ISSUED financial
+      // request, not constructing a new one from stale balance data -
+      // safe regardless of current balance freshness/existence. The
+      // dialog's own verificationMode explains why, never this ordinary
+      // freshness copy. The moment the user edits ANY logical fact,
+      // settlementFactsForCurrentForm stops matching and this exception
+      // disappears on its own (recomputed fresh every render) - ordinary
+      // gating below applies immediately, with no manual reset needed.
+      settlementCanSubmit = true;
+    } else if (balanceState.status === "updating") {
+      settlementFreshnessWarning =
+        "Balances are updating. Wait for the latest balance before recording a settlement.";
+      settlementCanSubmit = false;
+    } else if (balanceState.status === "loading" || balanceState.status === "error") {
+      settlementFreshnessWarning =
+        "We couldn't confirm the latest balance. Close this window or retry balances before recording a settlement.";
+      settlementCanSubmit = false;
+    } else if (settlementPairDisappeared) {
+      settlementFreshnessWarning =
+        "This balance changed. Review the latest balances before recording a settlement.";
+      settlementCanSubmit = false;
+    }
+  }
+
+  const settlementDisplayDebtMinor = settlementBalanceMatch?.amountMinor ?? lastKnownSettlementDebtMinor ?? 0;
+
+  // Checkpoint 4E.6 §20: ADVISORY ONLY - never clamps, never disables
+  // submit solely for exceeding, never silently changes the entered
+  // amount. Only computed against a freshly-confirmed current debt
+  // (settlementBalanceMatch), never the merely-cached display value.
+  const parsedSettlementAmount = parseExpenseMoneyInput(settlementAmountText);
+  let settlementOverWarning: string | null = null;
+  if (parsedSettlementAmount.ok && settlementBalanceMatch) {
+    try {
+      const assessment = assessSettlementAgainstDebt(
+        settlementBalanceMatch.amountMinor,
+        parsedSettlementAmount.amountMinor
+      );
+      if (assessment.exceeds) {
+        const debtorName = resolveBalanceMember(settlementBalanceMatch.fromUid).nameLabel;
+        const excessText = money(assessment.excessMinor / 100);
+        settlementOverWarning = `This is ${excessText} more than the current balance. Recording it will flip the balance so you owe ${debtorName} ${excessText}.`;
+      }
+    } catch {
+      // Malformed input surfaces through ordinary submit-time validation
+      // instead - never fabricate a warning from nonsense input.
+    }
+  }
+
+  const submitSettlement = useCallback(async () => {
+    if (!tripId || !user || !settlementTarget || settlementInFlightRef.current) return;
+    if (!settlementCanSubmit) return;
+
+    const parsed = parseExpenseMoneyInput(settlementAmountText);
+    if (!parsed.ok) {
+      setSettlementSubmitError(parsed.error);
+      return;
+    }
+    if (!settlementMethod) {
+      setSettlementSubmitError("Choose a payment method.");
+      return;
+    }
+    const normalizedNote = normalizeSettlementNote(settlementNote);
+    if (!normalizedNote.ok) {
+      setSettlementSubmitError(normalizedNote.error);
+      return;
+    }
+
+    const facts: SettlementCreationFacts = {
+      tripId,
+      fromUid: settlementTarget.fromUid,
+      toUid: settlementTarget.toUid,
+      amountMinor: parsed.amountMinor,
+      currency: "USD",
+      method: settlementMethod,
+      note: normalizedNote.value,
+      occurredAtInstantMs: null,
+    };
+
+    // Checkpoint 4E.6A §13: if this submission's facts do NOT exactly
+    // match a currently-retained ambiguous request, it is a genuinely
+    // DIFFERENT logical request. resolveSettlementClientRequestId is
+    // about to overwrite the single pendingSettlementRef slot with these
+    // new facts either way - clearing the stale ambiguousSettlementRequest
+    // here (rather than leaving it dangling) ensures the Balances card's
+    // "Review" notice never survives pointing at a request the ref can
+    // no longer actually reproduce/replay. A TRUE exact replay (facts
+    // match) leaves it untouched, since THIS submission IS that same
+    // logical request.
+    if (
+      ambiguousSettlementRequest &&
+      !settlementCreationFactsEqual(ambiguousSettlementRequest, facts)
+    ) {
+      setAmbiguousSettlementRequest(null);
+    }
+
+    const clientRequestId = resolveSettlementClientRequestId(
+      pendingSettlementRef,
+      facts,
+      generateSettlementClientRequestId
+    );
+
+    settlementInFlightRef.current = true;
+    setSettlementSubmitting(true);
+    setSettlementSubmitError(null);
+
+    try {
+      await recordTripSettlement({
+        tripId: facts.tripId,
+        fromUid: facts.fromUid,
+        toUid: facts.toUid,
+        amountMinor: facts.amountMinor,
+        currency: facts.currency,
+        method: facts.method,
+        ...(facts.note !== null ? { note: facts.note } : {}),
+        clientRequestId,
+      });
+
+      if (!settlementIsMountedRef.current) return;
+
+      // Success clears the pending record (and any retained ambiguous
+      // marker - CASE G) - a later submission is a new logical request
+      // and must get a new id (§27). The live Settlement listener inside
+      // useTripBalances remains the ONLY source of truth for the
+      // resulting balance change - no optimistic mutation, no manual
+      // subtraction (§29).
+      pendingSettlementRef.current = null;
+      setAmbiguousSettlementRequest(null);
+      announceSuccess(`Recorded ${money(facts.amountMinor / 100)} settlement`);
+      setSettlementVisible(false);
+      setSettlementTarget(null);
+      setSettlementAmountText("");
+      setSettlementMethod(null);
+      setSettlementNote("");
+      setSettlementSubmitting(false);
+    } catch (e) {
+      if (!settlementIsMountedRef.current) return;
+      console.error("Failed to record settlement:", e);
+      const code = (e as { code?: string } | null | undefined)?.code;
+      if (code === "functions/already-exists") {
+        // DEFINITIVE (retrying the same id can only fail identically
+        // forever) - clears both the pending record and any ambiguous
+        // marker (CASE F).
+        pendingSettlementRef.current = null;
+        setAmbiguousSettlementRequest(null);
+      } else if (isAmbiguousSettlementCreateFailure(e)) {
+        // Checkpoint 4E.6A §4: genuinely ambiguous (unavailable/
+        // deadline-exceeded/unknown) - pendingSettlementRef is already
+        // retained (untouched above); mirror it into renderable state so
+        // the Balances card's "Review" recovery notice can surface this
+        // request even after the live BalanceRow for it disappears.
+        setAmbiguousSettlementRequest(pendingSettlementRef.current);
+      }
+      // Every other DEFINITIVE failure (invalid-argument/permission-
+      // denied/not-found/failed-precondition) retains the pending record
+      // (unchanged existing behavior) but is never marked ambiguous -
+      // it did NOT commit, and there is nothing to "verify" (§4).
+      setSettlementSubmitting(false);
+      setSettlementSubmitError(settlementErrorMessage(e));
+    } finally {
+      settlementInFlightRef.current = false;
+    }
+  }, [
+    tripId,
+    user,
+    settlementTarget,
+    settlementCanSubmit,
+    settlementAmountText,
+    settlementMethod,
+    settlementNote,
+    ambiguousSettlementRequest,
+    announceSuccess,
+  ]);
+
   const dangerText = theme.colors.onErrorContainer ?? "#991B1B";
 
   if (loading) {
@@ -1871,6 +2306,40 @@ export default function TripDetails() {
                 Based on shared trip expenses and confirmed settlements.
               </Text>
 
+              {/* Checkpoint 4E.6A §6/§10: an unresolved AMBIGUOUS
+                  Settlement attempt's recovery entry point - rendered
+                  regardless of balanceState.status (loading/ready/
+                  updating/error) and independent of whether the
+                  original BalanceRow still exists in the live snapshot,
+                  since that's the whole reason this notice exists. Gated
+                  to the same authenticated-recipient check Settle Up
+                  itself uses - never an owner/admin override. */}
+              {ambiguousSettlementRequest && user?.uid === ambiguousSettlementRequest.toUid ? (
+                <View style={styles.balancesPendingNotice}>
+                  <Text style={[styles.expenseStateText, { color: colors.textPrimary }]}>
+                    We couldn’t confirm a previous settlement attempt.
+                  </Text>
+                  <Text style={[styles.balancesPendingNoticeSub, { color: colors.textMuted }]}>
+                    Review the same settlement to verify whether it was recorded.
+                  </Text>
+                  <Pressable
+                    onPress={openAmbiguousSettlementReview}
+                    accessibilityRole="button"
+                    accessibilityLabel="Review previous settlement attempt"
+                    style={({ pressed }) => [
+                      styles.secondaryActionBtn,
+                      styles.inlineRetryBtn,
+                      { borderColor: colors.border },
+                      pressed && { opacity: 0.9 },
+                    ]}
+                  >
+                    <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>
+                      Review
+                    </Text>
+                  </Pressable>
+                </View>
+              ) : null}
+
               {balanceState.status === "loading" && balanceState.balances === null ? (
                 // Checkpoint 4E.5 §14: loading is not proof of zero debt -
                 // never show $0/"All settled"/[] before the controller is
@@ -1920,14 +2389,35 @@ export default function TripDetails() {
                       re-sorted - rendered exactly as the engine returned
                       it. */}
                   <View style={styles.expenseListWrap}>
-                    {balanceState.balances.map((balance) => (
-                      <BalanceRow
-                        key={`${balance.fromUid}|${balance.toUid}`}
-                        from={resolveBalanceMember(balance.fromUid)}
-                        to={{ nameLabel: resolveBalanceMember(balance.toUid).nameLabel }}
-                        amountMinor={balance.amountMinor}
-                      />
-                    ))}
+                    {balanceState.balances.map((balance) => {
+                      // Checkpoint 4E.6 §5/§6/§7: advisory-only UI gate -
+                      // only the balance's OWN recipient (toUid), with
+                      // both parties still CURRENT Trip members, and only
+                      // while the financial snapshot is genuinely
+                      // "ready" (never from a stale "updating"/"error"
+                      // last-known-good render), ever sees Settle Up. No
+                      // owner override. No archive gate - remains offered
+                      // on an archived Trip when these conditions hold.
+                      const fromMember = resolveBalanceMember(balance.fromUid);
+                      const canSettleUp =
+                        balanceState.status === "ready" &&
+                        !!user?.uid &&
+                        user.uid === balance.toUid &&
+                        currentMemberUids.includes(balance.fromUid) &&
+                        currentMemberUids.includes(balance.toUid);
+                      return (
+                        <BalanceRow
+                          key={`${balance.fromUid}|${balance.toUid}`}
+                          from={fromMember}
+                          to={{ nameLabel: resolveBalanceMember(balance.toUid).nameLabel }}
+                          amountMinor={balance.amountMinor}
+                          onSettleUp={canSettleUp ? () => openSettleUp(balance) : undefined}
+                          settleUpAccessibilityLabel={
+                            canSettleUp ? `Settle up with ${fromMember.nameLabel}` : undefined
+                          }
+                        />
+                      );
+                    })}
                   </View>
 
                   {/* Checkpoint 4E.5 §17: "updating" must never be
@@ -2046,6 +2536,28 @@ export default function TripDetails() {
       archiving={archiving}
       onCancel={closeArchiveDialog}
       onConfirm={confirmArchiveTrip}
+      colors={colors}
+    />
+    <RecordSettlementDialog
+      visible={settlementVisible}
+      fromNameLabel={
+        settlementTarget ? resolveBalanceMember(settlementTarget.fromUid).nameLabel : ""
+      }
+      currentDebtMinor={settlementDisplayDebtMinor}
+      amountText={settlementAmountText}
+      onChangeAmountText={setSettlementAmountText}
+      method={settlementMethod}
+      onChangeMethod={setSettlementMethod}
+      note={settlementNote}
+      onChangeNote={setSettlementNote}
+      submitting={settlementSubmitting}
+      submitError={settlementSubmitError}
+      overSettlementWarning={settlementOverWarning}
+      balanceFreshnessWarning={settlementFreshnessWarning}
+      canSubmit={settlementCanSubmit}
+      verificationMode={isExactAmbiguousSettlementReplay}
+      onCancel={closeSettleUp}
+      onConfirm={submitSettlement}
       colors={colors}
     />
     </>
@@ -2638,6 +3150,16 @@ const styles = StyleSheet.create({
     marginTop: spacing.sm,
   },
   balancesStatusText: { fontSize: 12, fontWeight: "600" },
+  // Checkpoint 4E.6A: the "Review previous settlement attempt" recovery
+  // notice - a small, restrained inline block, never alarming/coral
+  // (an unresolved ambiguous attempt is not an error state, it's an
+  // open question).
+  balancesPendingNotice: {
+    marginTop: spacing.xs,
+    marginBottom: spacing.xs,
+    gap: 2,
+  },
+  balancesPendingNoticeSub: { fontSize: 11, fontWeight: "600" },
 
   // --- Quick Analysis -----------------------------------------------
   groupLabel: {
