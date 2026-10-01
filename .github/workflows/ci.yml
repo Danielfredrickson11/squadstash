@@ -39,6 +39,13 @@ jobs:
       - name: Firestore rules tests
         run: npm run test:rules
 
+      - name: Set up Node.js 22 for Firebase Functions
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+
       - name: Install Firebase Functions dependencies
         run: npm ci --prefix functions
 
