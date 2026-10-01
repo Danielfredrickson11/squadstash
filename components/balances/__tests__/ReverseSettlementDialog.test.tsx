@@ -99,6 +99,20 @@ describe("ReverseSettlementDialog - structure", () => {
     const reasonFields = findAll(json, (n) => n.props?.placeholder === "What happened?");
     expect(reasonFields.length).toBeGreaterThan(0);
   });
+
+  // Checkpoint 4E.8 §10: a visual `label` alone does not create an
+  // accessible name for a React Native TextInput - explicit
+  // accessibilityLabel required.
+  it("the reason field has an explicit accessible name", () => {
+    const json = renderDialog(baseProps).toJSON() as JsonNode;
+    const reasonFields = findAll(
+      json,
+      (n) =>
+        n.props?.placeholder === "What happened?" &&
+        n.props?.accessibilityLabel === "Reason (optional)"
+    );
+    expect(reasonFields.length).toBeGreaterThan(0);
+  });
 });
 
 describe("ReverseSettlementDialog - actions", () => {

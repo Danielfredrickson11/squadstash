@@ -189,6 +189,65 @@ describe("SettlementRow - reversed presentation", () => {
   });
 });
 
+// Checkpoint 4E.8 §8: an explicit parent accessibilityLabel makes the
+// summary View ONE opaque accessibility element - descendant Text
+// (note/"Reversed"/reversalReason) is NOT separately exposed to
+// assistive technology once a parent declares `accessible` + an
+// explicit label. Every meaningful historical fact must therefore be
+// represented in that ONE label, not merely visible-only.
+describe("SettlementRow - accessible summary includes every historical fact (Checkpoint 4E.8)", () => {
+  function summaryLabel(props: React.ComponentProps<typeof SettlementRow>): string {
+    const json = renderRow(props).toJSON() as JsonNode;
+    return findAccessibleSummaryGroup(json).props.accessibilityLabel as string;
+  }
+
+  it("the accessible label includes from/to/amount/method/timestamp for an ordinary active row", () => {
+    const label = summaryLabel(baseProps);
+    expect(label).toContain("Daniel");
+    expect(label).toContain("paid");
+    expect(label).toContain("Sarah");
+    expect(label).toContain("$24.50");
+    expect(label).toContain("Venmo");
+    expect(label).toContain("Sep 30, 2026, 5:42 PM");
+  });
+
+  it("the accessible label includes reversed status when applicable", () => {
+    const label = summaryLabel({ ...baseProps, reversed: true });
+    expect(label).toContain("Reversed");
+  });
+
+  it("the accessible label does NOT include reversed status when active", () => {
+    const label = summaryLabel(baseProps);
+    expect(label).not.toContain("Reversed");
+  });
+
+  it("the accessible label includes the note when present", () => {
+    const label = summaryLabel({ ...baseProps, note: "Dinner split" });
+    expect(label).toContain("Dinner split");
+  });
+
+  it("the accessible label includes the reversal reason when present on a reversed row", () => {
+    const label = summaryLabel({
+      ...baseProps,
+      reversed: true,
+      reversalReason: "Entered twice",
+    });
+    expect(label).toContain("Entered twice");
+  });
+
+  it("the accessible label includes note AND reversal reason together when both are present", () => {
+    const label = summaryLabel({
+      ...baseProps,
+      note: "Dinner split",
+      reversed: true,
+      reversalReason: "Entered twice",
+    });
+    expect(label).toContain("Dinner split");
+    expect(label).toContain("Entered twice");
+    expect(label).toContain("Reversed");
+  });
+});
+
 // Checkpoint 4E.7A §4/§5/§6: note/reversalReason are audit/history
 // details that may legitimately run up to the normalized 500-character
 // cap - they must wrap and render their COMPLETE supplied text, never

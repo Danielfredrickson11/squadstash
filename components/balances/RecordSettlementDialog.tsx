@@ -28,6 +28,7 @@ import {
   Modal,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   View,
 } from "react-native";
@@ -136,6 +137,25 @@ export function RecordSettlementDialog({
           accessibilityLabel="Close"
         />
         <View style={[styles.dialogCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+          {/* Checkpoint 4E.8 §11: this dialog is materially taller than
+              ReverseExpenseDialog (summary + explanation + amount +
+              five method pills + note + warnings/errors), so on a short
+              viewport with the software keyboard open, the unscrolled
+              content can exceed the space KeyboardAvoidingView actually
+              leaves - Cancel/Confirm could otherwise be pushed off-
+              screen with no way to reach them. The scrollable region is
+              everything ABOVE the actions row; the actions row itself
+              stays OUTSIDE the ScrollView (a fixed footer), so Cancel/
+              Confirm/the spinner are always reachable regardless of how
+              tall the content above grows. Modal/KeyboardAvoidingView/
+              backdrop-sibling/centered-card/blocked-dismissal-while-
+              submitting are all otherwise unchanged. */}
+          <ScrollView
+            style={styles.dialogScroll}
+            contentContainerStyle={styles.dialogScrollContent}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
           <Text style={[styles.dialogTitle, { color: colors.textPrimary }]}>Record settlement</Text>
 
           <View style={[styles.summaryWrap, { backgroundColor: colors.surfaceTertiary }]}>
@@ -164,6 +184,13 @@ export function RecordSettlementDialog({
           ) : null}
 
           <Text style={[styles.fieldLabel, { color: colors.textMuted }]}>Amount received</Text>
+          {/* Checkpoint 4E.8 §9: an adjacent visual <Text> label does NOT
+              create an accessible name for a React Native TextInput on
+              its own - react-native-paper's own TextInput never wires
+              its `label`/nearby text into accessibilityLabel (confirmed
+              by inspecting its source: `label` only drives the floating-
+              label animation/placeholder timing, nothing accessibility-
+              related). An explicit accessibilityLabel is required. */}
           <TextInput
             mode="outlined"
             dense
@@ -172,6 +199,7 @@ export function RecordSettlementDialog({
             onChangeText={onChangeAmountText}
             editable={!submitting}
             keyboardType="numeric"
+            accessibilityLabel="Amount received"
             style={styles.amountInput}
           />
 
@@ -208,6 +236,9 @@ export function RecordSettlementDialog({
             })}
           </View>
 
+          {/* Checkpoint 4E.8 §9: the visual `label` prop above does not
+              create an accessible name either (same finding as the
+              amount field) - explicit accessibilityLabel required. */}
           <TextInput
             mode="outlined"
             dense
@@ -217,6 +248,7 @@ export function RecordSettlementDialog({
             onChangeText={onChangeNote}
             editable={!submitting}
             multiline
+            accessibilityLabel="Note (optional)"
             style={styles.noteInput}
           />
 
@@ -241,6 +273,7 @@ export function RecordSettlementDialog({
           {submitError ? (
             <Text style={[styles.errorText, { color: colors.coral }]}>{submitError}</Text>
           ) : null}
+          </ScrollView>
 
           <View style={styles.dialogActions}>
             <Pressable
@@ -290,10 +323,21 @@ const styles = StyleSheet.create({
   dialogCard: {
     width: "100%",
     maxWidth: 380,
+    // Checkpoint 4E.8 §11: bounds the card so the ScrollView below has
+    // real room to become scrollable (rather than simply growing to fit
+    // all content, which would defeat the whole fix) on a short
+    // viewport with the keyboard open.
+    maxHeight: "90%",
     borderRadius: radii.xl,
     borderWidth: 1,
     padding: spacing.lg,
   },
+  // flexShrink:1 lets this shrink to fit within dialogCard's maxHeight
+  // (sharing space with the fixed dialogActions footer below it) rather
+  // than stretching the whole card - the actual overflow then scrolls
+  // internally.
+  dialogScroll: { flexShrink: 1 },
+  dialogScrollContent: {},
   dialogTitle: { ...typography.sectionTitle, fontSize: 18, marginBottom: spacing.sm },
 
   summaryWrap: {

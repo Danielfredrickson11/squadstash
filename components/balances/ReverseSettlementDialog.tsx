@@ -82,6 +82,10 @@ export function ReverseSettlementDialog({
             is deleted.
           </Text>
 
+          {/* Checkpoint 4E.8 §10: a visual `label` alone does not create
+              an accessible name for a React Native TextInput - explicit
+              accessibilityLabel required (same finding as
+              RecordSettlementDialog's amount/note fields). */}
           <TextInput
             mode="outlined"
             dense
@@ -91,6 +95,7 @@ export function ReverseSettlementDialog({
             onChangeText={onChangeReasonText}
             editable={!submitting}
             multiline
+            accessibilityLabel="Reason (optional)"
             style={styles.reasonInput}
           />
 

@@ -60,7 +60,21 @@ export function SettlementRow({
   // Muted, not strikethrough - reversal is historical correction, never
   // deletion; history stays legible/auditable (§8).
   const primaryColor = reversed ? colors.textMuted : colors.textPrimary;
-  const summaryAccessibilityLabel = `${from.nameLabel} paid ${to.nameLabel} ${amountText} via ${methodLabel} on ${timestampLabel}${reversed ? ", reversed" : ""}`;
+  // Checkpoint 4E.8 §8: an explicit parent accessibilityLabel makes this
+  // View ONE opaque accessibility element - descendant Text (note,
+  // "Reversed", reversalReason) is NOT separately exposed to assistive
+  // technology once a parent declares `accessible` + an explicit label.
+  // Every meaningful historical fact that can appear in this row must
+  // therefore be folded into this ONE label explicitly, never left
+  // visible-only.
+  const summaryAccessibilityLabel = [
+    `${from.nameLabel} paid ${to.nameLabel} ${amountText} via ${methodLabel} on ${timestampLabel}`,
+    reversed ? "Reversed" : null,
+    note ? `Note: ${note}` : null,
+    reversed && reversalReason ? `Reversal reason: ${reversalReason}` : null,
+  ]
+    .filter((part): part is string => part !== null)
+    .join(". ");
 
   return (
     <View style={[styles.container, { borderBottomColor: colors.border }]}>

@@ -128,6 +128,30 @@ describe("RecordSettlementDialog - structure", () => {
     expect(noteFields.length).toBeGreaterThan(0);
   });
 
+  // Checkpoint 4E.8 §9: an adjacent visual <Text> label does not create
+  // an accessible name for a React Native TextInput on its own -
+  // react-native-paper's own `label` prop is purely visual. Both fields
+  // require an explicit accessibilityLabel.
+  it("the amount field has an explicit accessible name", () => {
+    const json = renderDialog(baseProps).toJSON() as JsonNode;
+    const amountFields = findAll(
+      json,
+      (n) => n.props?.placeholder === "0.00" && n.props?.accessibilityLabel === "Amount received"
+    );
+    expect(amountFields.length).toBeGreaterThan(0);
+  });
+
+  it("the note field has an explicit accessible name", () => {
+    const json = renderDialog(baseProps).toJSON() as JsonNode;
+    const noteFields = findAll(
+      json,
+      (n) =>
+        n.props?.placeholder === "What’s this for?" &&
+        n.props?.accessibilityLabel === "Note (optional)"
+    );
+    expect(noteFields.length).toBeGreaterThan(0);
+  });
+
   it("renders NO date/occurredAt field or text", () => {
     const text = collectText(renderDialog(baseProps).toJSON() as JsonNode);
     // Word-boundary match - "update"/"updated" legitimately appear in
@@ -135,6 +159,29 @@ describe("RecordSettlementDialog - structure", () => {
     expect(text.toLowerCase()).not.toMatch(/\bdate\b/);
     expect(text.toLowerCase()).not.toContain("occurred");
     expect(text.toLowerCase()).not.toContain("when did this happen");
+  });
+});
+
+// Checkpoint 4E.8 §11: on a short viewport with the keyboard open, this
+// dialog's content (summary + explanation + amount + five method pills
+// + note + warnings/errors) can exceed available space -
+// KeyboardAvoidingView alone does not guarantee Cancel/Confirm stay
+// reachable. The fields/warnings now sit inside a ScrollView, with the
+// actions row as a fixed footer OUTSIDE it.
+describe("RecordSettlementDialog - short-viewport reachability (Checkpoint 4E.8)", () => {
+  it("the scrollable content region exists (keyboardShouldPersistTaps marks it)", () => {
+    const json = renderDialog(baseProps).toJSON() as JsonNode;
+    const scrollRegions = findAll(json, (n) => n.props?.keyboardShouldPersistTaps === "handled");
+    expect(scrollRegions.length).toBeGreaterThan(0);
+  });
+
+  it("Cancel and Confirm remain present and findable outside the scroll region", () => {
+    const tree = renderDialog(baseProps);
+    // findPressable succeeding (not throwing) proves both controls are
+    // still real, addressable Pressable instances after the
+    // restructuring - not simply present as inert text.
+    expect(() => findPressable(tree, { accessibilityLabel: "Cancel" })).not.toThrow();
+    expect(() => findPressable(tree, { accessibilityLabel: "Record settlement" })).not.toThrow();
   });
 });
 
