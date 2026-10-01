@@ -61,28 +61,41 @@ import {
   normalizeSettlementNote,
   resolveSettlementClientRequestId,
   settlementCreationFactsEqual,
+  normalizeReversalReason,
+  resolveSettlementReversalClientRequestId,
+  reduceSettlementReversalOutcome,
+  isDefinitiveSettlementDifferentRequestFailure,
   type PendingSettlementCreationRequest,
   type SettlementCreationFacts,
+  type SettlementReversalFacts,
+  type PendingSettlementReversalRequest,
 } from "../../../../src/domain/settlementSubmission";
+import type { ReversalOutcomeResult } from "../../../../src/domain/expenseReversal";
 import type { TripBalance } from "../../../../src/domain/tripSettlement";
 import { useSavingsMoneyAction } from "../../../../src/hooks/useSavingsMoneyAction";
 import { useTripBalances, type TripBalancesErrorSource } from "../../../../src/hooks/useTripBalances";
 import {
   generateSettlementClientRequestId,
   recordTripSettlement,
+  reverseTripSettlement,
+  subscribeToSettlementsForTrip,
 } from "../../../../src/services/firebase/settlements";
 import type {
   Bucket,
   Expense,
   PublicProfile,
   SavingsTransactionType,
+  Settlement,
   SettlementMethod,
   Trip,
 } from "../../../../src/types/domain";
+import { formatTransactionTimestamp } from "../../../../utils/format";
 import { initialsFromName } from "../../../../components/buckets/AvatarCircle";
 import { ExpenseRow, type ExpenseRowPayer } from "../../../../components/expenses/ExpenseRow";
 import { BalanceRow, type BalanceRowFromMember } from "../../../../components/balances/BalanceRow";
 import { RecordSettlementDialog } from "../../../../components/balances/RecordSettlementDialog";
+import { SettlementRow, type SettlementRowFromMember } from "../../../../components/balances/SettlementRow";
+import { ReverseSettlementDialog } from "../../../../components/balances/ReverseSettlementDialog";
 
 const FALLBACK_IMAGE =
   "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=60";
@@ -193,6 +206,43 @@ function isAmbiguousSettlementCreateFailure(e: unknown): boolean {
       return false;
     default:
       return true;
+  }
+}
+
+// Checkpoint 4E.7 §9: polished labels only - never raw enum casing.
+const SETTLEMENT_METHOD_LABELS: Record<SettlementMethod, string> = {
+  venmo: "Venmo",
+  paypal: "PayPal",
+  zelle: "Zelle",
+  cash: "Cash",
+  other: "Other",
+};
+
+// Checkpoint 4E.7 §24: never shows a raw Firebase/HttpsError string.
+// `knownAlreadyReversed` mirrors reversalErrorMessage's own identical
+// parameter in expenses/[expenseId].tsx - only set when the client
+// independently has the freshest, live-confirmed persisted status, never
+// guessed from the failed-precondition code alone.
+function settlementReversalErrorMessage(e: unknown, knownAlreadyReversed: boolean): string {
+  const code = (e as { code?: string } | null | undefined)?.code;
+  switch (code) {
+    case "functions/invalid-argument":
+      return "That reversal information isn't valid. Review it and try again.";
+    case "functions/permission-denied":
+      return "Only the member who received this payment can reverse this settlement.";
+    case "functions/not-found":
+      return "This settlement could not be found.";
+    case "functions/failed-precondition":
+      return knownAlreadyReversed
+        ? "This settlement has already been reversed."
+        : "This settlement can no longer be reversed in its current state.";
+    case "functions/already-exists":
+      return "We couldn't safely reconcile this reversal request. Review it and try again.";
+    case "functions/unavailable":
+    case "functions/deadline-exceeded":
+      return "We couldn't confirm whether the reversal went through. It's safe to check again.";
+    default:
+      return "We couldn't confirm whether the reversal went through. It's safe to check again.";
   }
 }
 
@@ -1499,6 +1549,442 @@ export default function TripDetails() {
     announceSuccess,
   ]);
 
+  // ==========================================================================
+  // Checkpoint 4E.7: SETTLEMENT HISTORY + REVERSAL controller. A current
+  // balance row is NOT a Settlement record (one balance can result from
+  // many Expenses/Settlements; an exact Settlement can make its own
+  // balance row disappear entirely) - reversal targets a PERSISTED
+  // Settlement, so this section maintains its own live history listener,
+  // entirely independent of useTripBalances' own internal Settlement
+  // listener (the same kind of intentional read-purpose duplication this
+  // file already has for Expenses - a summary/history view vs. the
+  // balance-aggregation hook).
+  // ==========================================================================
+
+  type SettlementHistoryState =
+    | { status: "loading" }
+    | { status: "error" }
+    | { status: "ready"; settlements: Settlement[] };
+
+  const [settlementHistoryState, setSettlementHistoryState] = useState<SettlementHistoryState>({
+    status: "loading",
+  });
+  const settlementHistoryUnsubRef = useRef<(() => void) | null>(null);
+  const [settlementHistoryRetryNonce, setSettlementHistoryRetryNonce] = useState(0);
+  const retrySettlementHistory = useCallback(() => setSettlementHistoryRetryNonce((n) => n + 1), []);
+
+  useEffect(() => {
+    settlementHistoryUnsubRef.current?.();
+    settlementHistoryUnsubRef.current = null;
+    if (!tripId) return undefined;
+    setSettlementHistoryState({ status: "loading" });
+    settlementHistoryUnsubRef.current = subscribeToSettlementsForTrip(
+      tripId,
+      (settlements) => setSettlementHistoryState({ status: "ready", settlements }),
+      (err) => {
+        console.error("Settlement history subscription error:", err);
+        setSettlementHistoryState({ status: "error" });
+      }
+    );
+    return () => {
+      settlementHistoryUnsubRef.current?.();
+      settlementHistoryUnsubRef.current = null;
+    };
+  }, [tripId, settlementHistoryRetryNonce]);
+
+  // Kept in sync via effect so classifySettlementReversalFailure's
+  // eventual catch() (which may run after a live Settlement update has
+  // already arrived) reads the FRESHEST persisted status, never a stale
+  // closure snapshot from when the request was first fired - mirrors
+  // expenseStateRef's identical purpose in expenses/[expenseId].tsx.
+  const settlementHistoryStateRef = useRef(settlementHistoryState);
+  useEffect(() => {
+    settlementHistoryStateRef.current = settlementHistoryState;
+  }, [settlementHistoryState]);
+
+  // Checkpoint 4E.7 §6: a SEPARATE profile-resolution state from the
+  // balance-profile one (4E.5) - Settlement history may involve a
+  // different/larger set of people (a Settlement can fully clear its own
+  // pairwise balance, or be reversed and contribute zero, so its
+  // participants may not appear in ANY current TripBalance). Derived
+  // strictly from the history's own fromUid/toUid, never from
+  // trip.memberIds.
+  type SettlementHistoryProfileState =
+    | { status: "loading" }
+    | { status: "error" }
+    | { status: "ready"; profiles: Map<string, PublicProfile> };
+
+  const settlementHistoryUids = useMemo(() => {
+    const uids = new Set<string>();
+    if (settlementHistoryState.status === "ready") {
+      settlementHistoryState.settlements.forEach((s) => {
+        uids.add(s.fromUid);
+        uids.add(s.toUid);
+      });
+    }
+    return Array.from(uids).sort();
+  }, [settlementHistoryState]);
+  const settlementHistoryUidsKey = settlementHistoryUids.join("|");
+
+  const [settlementHistoryProfileState, setSettlementHistoryProfileState] =
+    useState<SettlementHistoryProfileState>({ status: "loading" });
+  const settlementHistoryProfileUnsubRef = useRef<(() => void) | null>(null);
+  const [settlementHistoryProfileRetryNonce, setSettlementHistoryProfileRetryNonce] = useState(0);
+  const retrySettlementHistoryProfiles = useCallback(
+    () => setSettlementHistoryProfileRetryNonce((n) => n + 1),
+    []
+  );
+
+  useEffect(() => {
+    settlementHistoryProfileUnsubRef.current?.();
+    settlementHistoryProfileUnsubRef.current = null;
+    setSettlementHistoryProfileState({ status: "loading" });
+    if (settlementHistoryUids.length === 0) {
+      setSettlementHistoryProfileState({ status: "ready", profiles: new Map() });
+      return undefined;
+    }
+    settlementHistoryProfileUnsubRef.current = subscribeToPublicUsersByIdsChunked(
+      settlementHistoryUids,
+      (profiles) =>
+        setSettlementHistoryProfileState({
+          status: "ready",
+          profiles: new Map(profiles.map((p) => [p.uid, p])),
+        }),
+      (err) => {
+        console.error("Settlement history profile subscription error:", err);
+        setSettlementHistoryProfileState({ status: "error" });
+      }
+    );
+    return () => {
+      settlementHistoryProfileUnsubRef.current?.();
+      settlementHistoryProfileUnsubRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settlementHistoryUidsKey, settlementHistoryProfileRetryNonce]);
+
+  // A profile lookup failure must NOT hide valid Settlement history -
+  // deterministic numbered fallback for every uid with no resolved
+  // profile, covering BOTH "ready but this uid has no name" and "the
+  // whole subscription errored."
+  const fallbackSettlementHistoryLabels = useMemo(() => {
+    const labels = new Map<string, string>();
+    const missing =
+      settlementHistoryProfileState.status === "ready"
+        ? settlementHistoryUids.filter(
+            (uid) => !settlementHistoryProfileState.profiles.get(uid)?.displayName?.trim()
+          )
+        : settlementHistoryProfileState.status === "error"
+          ? settlementHistoryUids
+          : [];
+    missing.forEach((uid, i) => {
+      labels.set(uid, missing.length > 1 ? `Trip member ${i + 1}` : "Trip member");
+    });
+    return labels;
+  }, [settlementHistoryProfileState, settlementHistoryUids]);
+
+  const resolveSettlementHistoryMember = useCallback(
+    (uid: string): SettlementRowFromMember => {
+      if (settlementHistoryProfileState.status === "loading") {
+        return { avatarLabel: "Loading member", nameLabel: "Loading member…" };
+      }
+      if (settlementHistoryProfileState.status === "ready") {
+        const profile = settlementHistoryProfileState.profiles.get(uid);
+        const name = profile?.displayName?.trim();
+        if (name) {
+          return {
+            avatarLabel: initialsFromName(name),
+            nameLabel: name,
+            photoURL: profile?.photoURL?.trim() || undefined,
+          };
+        }
+      }
+      const fallback = fallbackSettlementHistoryLabels.get(uid) ?? "Trip member";
+      return { avatarLabel: fallback, nameLabel: fallback };
+    },
+    [settlementHistoryProfileState, fallbackSettlementHistoryLabels]
+  );
+
+  // Checkpoint 4E.7 §11: advisory-only UI gate, mirroring
+  // canSettleUp's identical shape (4E.6) - ownerId UNION memberIds, no
+  // owner override, fromUid grants nothing. The trusted
+  // reverseTripSettlement callable independently re-enforces this
+  // regardless of what this function returns.
+  const canReverseSettlement = useCallback(
+    (settlement: Settlement): boolean => {
+      if (settlement.status !== "active") return false;
+      if (!user?.uid) return false;
+      if (user.uid !== settlement.toUid) return false;
+      return currentMemberUids.includes(user.uid);
+    },
+    [user?.uid, currentMemberUids]
+  );
+
+  // --- Reversal dialog + submission controller (mirrors expenses/
+  // [expenseId].tsx's 4D.6A-hardened reversal controller exactly, per
+  // this checkpoint's own explicit instruction to reuse it as the
+  // primary behavioral precedent). ---
+
+  const [selectedSettlementId, setSelectedSettlementId] = useState<string | null>(null);
+  const [reverseSettlementVisible, setReverseSettlementVisible] = useState(false);
+  const [settlementReasonText, setSettlementReasonText] = useState("");
+  const [settlementReversalSubmitting, setSettlementReversalSubmitting] = useState(false);
+  const [settlementReversalSubmitError, setSettlementReversalSubmitError] = useState<string | null>(
+    null
+  );
+  // Checkpoint 4E.7 §26: renderable (not just a ref) so the "Check
+  // reversal status" recovery affordance can render even once the
+  // ordinary "Reverse settlement" trigger has disappeared (the record
+  // already shows as reversed). Carries the settlementId itself (not
+  // merely a boolean) so the recovery affordance attaches to the correct
+  // ROW in a multi-record history list - unlike Expense Detail, which
+  // only ever has one record.
+  const [pendingSettlementReversalId, setPendingSettlementReversalId] = useState<string | null>(null);
+  const [settlementReversalVerifying, setSettlementReversalVerifying] = useState(false);
+  const [settlementReversalVerifyError, setSettlementReversalVerifyError] = useState<string | null>(
+    null
+  );
+
+  const pendingSettlementReversalRef = useRef<PendingSettlementReversalRequest | null>(null);
+  const settlementReversalInFlightRef = useRef(false);
+  const settlementReversalIsMountedRef = useRef(true);
+  useEffect(() => {
+    settlementReversalIsMountedRef.current = true;
+    return () => {
+      settlementReversalIsMountedRef.current = false;
+    };
+  }, []);
+
+  // Checkpoint 4E.7 §20: identified by id only - never a stale persisted
+  // object held as authoritative dialog state. Re-resolved from the
+  // LATEST settlementHistoryState on every render, so status/reversedBy
+  // changes are observed live while the dialog is open.
+  const selectedSettlement: Settlement | null =
+    selectedSettlementId && settlementHistoryState.status === "ready"
+      ? settlementHistoryState.settlements.find((s) => s.id === selectedSettlementId) ?? null
+      : null;
+
+  // Applies a reduceSettlementReversalOutcome result as the ONE place
+  // every resulting state change happens (§25) - every call site below
+  // (direct submit, explicit verification, the passive live-update
+  // effect) funnels through this, so "success" can only ever be declared
+  // once per pending request.
+  const applySettlementReversalOutcome = useCallback(
+    (result: ReversalOutcomeResult) => {
+      if (result.action === "none") return;
+      setSettlementReversalSubmitting(false);
+      setSettlementReversalVerifying(false);
+      if (result.action === "success") {
+        pendingSettlementReversalRef.current = null;
+        setPendingSettlementReversalId(null);
+        setReverseSettlementVisible(false);
+        setSettlementReversalSubmitError(null);
+        setSettlementReversalVerifyError(null);
+        announceSuccess("Settlement reversed.");
+      } else if (result.action === "reversed_by_other") {
+        pendingSettlementReversalRef.current = null;
+        setPendingSettlementReversalId(null);
+        setSettlementReversalSubmitError("This settlement was already reversed.");
+        setSettlementReversalVerifyError("This settlement was already reversed.");
+      } else if (result.action === "show_error") {
+        // Definitive-but-not-confirmed-already-reversed, or ambiguous -
+        // pendingSettlementReversalRef/pendingSettlementReversalId are
+        // deliberately PRESERVED here so an identical-facts retry safely
+        // reuses the same clientRequestId.
+        setSettlementReversalSubmitError(result.message);
+        setSettlementReversalVerifyError(result.message);
+      }
+    },
+    [announceSuccess]
+  );
+
+  // Checkpoint 4E.7 §23: classifies a caught reverseTripSettlement
+  // failure for reconciliation - shared by both the direct submit and
+  // verify call sites so neither can independently drift out of sync.
+  // Never derives "definitely a different request" from the live
+  // listener alone - requires the FAILURE'S OWN error code to be the
+  // backend's specific rejection (isDefinitiveSettlementDifferentRequestFailure),
+  // in addition to the live listener independently confirming reversed
+  // status.
+  const classifySettlementReversalFailure = useCallback(
+    (e: unknown): { definitelyDifferentRequest: boolean; errorMessage: string } => {
+      const latest = settlementHistoryStateRef.current;
+      const pending = pendingSettlementReversalRef.current;
+      const target =
+        latest.status === "ready" && pending
+          ? latest.settlements.find((s) => s.id === pending.settlementId)
+          : undefined;
+      const liveStatusIsReversed = target?.status === "reversed";
+      const errorCode = (e as { code?: string } | null | undefined)?.code;
+      const definitelyDifferentRequest = isDefinitiveSettlementDifferentRequestFailure({
+        errorCode,
+        liveStatusIsReversed,
+      });
+
+      if (definitelyDifferentRequest) {
+        return {
+          definitelyDifferentRequest: true,
+          errorMessage: "This settlement has already been reversed.",
+        };
+      }
+      if (liveStatusIsReversed) {
+        return {
+          definitelyDifferentRequest: false,
+          errorMessage:
+            "This settlement shows as reversed, but we couldn’t confirm whether your request was the one that went through. It’s safe to check again.",
+        };
+      }
+      return { definitelyDifferentRequest: false, errorMessage: settlementReversalErrorMessage(e, false) };
+    },
+    []
+  );
+
+  const openReverseSettlementDialog = useCallback((settlementId: string) => {
+    if (settlementReversalInFlightRef.current) return;
+    // Prefills from the pending request's own facts ONLY when reopening
+    // the SAME settlement (§28) - a different settlementId always
+    // starts a genuinely fresh reason, never borrowing another pending
+    // request's text.
+    const pending = pendingSettlementReversalRef.current;
+    const isSameTarget = pending?.settlementId === settlementId;
+    setSelectedSettlementId(settlementId);
+    setSettlementReasonText(isSameTarget ? pending?.reversalReason ?? "" : "");
+    setSettlementReversalSubmitError(null);
+    setReverseSettlementVisible(true);
+  }, []);
+
+  const closeReverseSettlementDialog = useCallback(() => {
+    // Ignored while unresolved (§27) - pendingSettlementReversalRef/
+    // pendingSettlementReversalId are deliberately NEVER cleared merely
+    // by dismissing the dialog.
+    if (settlementReversalInFlightRef.current) return;
+    setReverseSettlementVisible(false);
+  }, []);
+
+  const changeSettlementReasonText = useCallback((value: string) => {
+    setSettlementReasonText(value);
+    setSettlementReversalSubmitError(null);
+  }, []);
+
+  // Checkpoint 4E.7 §22: passive reconciliation against the LIVE
+  // Settlement history subscription - fires whenever it updates while we
+  // still have an unresolved pending reversal request of our own. Can
+  // ONLY ever safely conclude "reversed_by_other" (a definitively
+  // different uid) - a same-uid match is explicitly left unresolved
+  // ("none"), never assumed successful. Never issues a retry itself.
+  useEffect(() => {
+    if (settlementHistoryState.status !== "ready") return;
+    const pending = pendingSettlementReversalRef.current;
+    if (!pending) return;
+    const target = settlementHistoryState.settlements.find((s) => s.id === pending.settlementId);
+    if (!target) return;
+    applySettlementReversalOutcome(
+      reduceSettlementReversalOutcome(
+        {
+          type: "live_update",
+          expenseStatus: target.status,
+          expenseReversedBy: target.reversedBy,
+          currentUid: user?.uid,
+        },
+        true
+      )
+    );
+  }, [settlementHistoryState, user?.uid, applySettlementReversalOutcome]);
+
+  const handleConfirmReverseSettlement = useCallback(async () => {
+    if (settlementReversalInFlightRef.current) return;
+    if (!selectedSettlement) return;
+    if (!canReverseSettlement(selectedSettlement)) {
+      setSettlementReversalSubmitError(
+        "Only the member who received this payment can reverse this settlement."
+      );
+      return;
+    }
+
+    const reasonResult = normalizeReversalReason(settlementReasonText);
+    if (!reasonResult.ok) {
+      setSettlementReversalSubmitError(reasonResult.error);
+      return;
+    }
+
+    const facts: SettlementReversalFacts = {
+      settlementId: selectedSettlement.id,
+      reversalReason: reasonResult.value,
+    };
+    const clientRequestId = resolveSettlementReversalClientRequestId(
+      pendingSettlementReversalRef,
+      facts,
+      generateSettlementClientRequestId
+    );
+    setPendingSettlementReversalId(facts.settlementId);
+
+    settlementReversalInFlightRef.current = true;
+    setSettlementReversalSubmitting(true);
+    setSettlementReversalSubmitError(null);
+
+    try {
+      await reverseTripSettlement({
+        settlementId: facts.settlementId,
+        ...(facts.reversalReason !== undefined ? { reversalReason: facts.reversalReason } : {}),
+        clientRequestId,
+      });
+      if (!settlementReversalIsMountedRef.current) return;
+      // The existing Settlement history listener independently
+      // reconciles the real persisted reversed status/reversedAt/
+      // reversalReason - no optimistic/fabricated mutation is ever
+      // applied here, and balanceState is never touched (§18/§30).
+      applySettlementReversalOutcome(reduceSettlementReversalOutcome({ type: "callable_success" }, true));
+    } catch (e) {
+      if (!settlementReversalIsMountedRef.current) return;
+      console.error("Failed to reverse settlement:", e);
+      const { definitelyDifferentRequest, errorMessage } = classifySettlementReversalFailure(e);
+      applySettlementReversalOutcome(
+        reduceSettlementReversalOutcome(
+          { type: "callable_failure", definitelyDifferentRequest, errorMessage },
+          true
+        )
+      );
+    } finally {
+      if (settlementReversalIsMountedRef.current) settlementReversalInFlightRef.current = false;
+    }
+  }, [selectedSettlement, canReverseSettlement, settlementReasonText, applySettlementReversalOutcome, classifySettlementReversalFailure]);
+
+  // Checkpoint 4E.7 §26: explicit, user-initiated recovery action -
+  // re-submits the EXACT pending request (same clientRequestId, same
+  // normalized reason) to get a VERIFIED answer, never inferred from
+  // reversedBy alone. Reachable even once the ordinary "Reverse
+  // settlement" trigger has disappeared. Never fires automatically.
+  const verifyPendingSettlementReversal = useCallback(async () => {
+    if (settlementReversalInFlightRef.current) return;
+    const pending = pendingSettlementReversalRef.current;
+    if (!pending) return;
+
+    settlementReversalInFlightRef.current = true;
+    setSettlementReversalVerifying(true);
+    setSettlementReversalVerifyError(null);
+
+    try {
+      await reverseTripSettlement({
+        settlementId: pending.settlementId,
+        ...(pending.reversalReason !== undefined ? { reversalReason: pending.reversalReason } : {}),
+        clientRequestId: pending.clientRequestId,
+      });
+      if (!settlementReversalIsMountedRef.current) return;
+      applySettlementReversalOutcome(reduceSettlementReversalOutcome({ type: "callable_success" }, true));
+    } catch (e) {
+      if (!settlementReversalIsMountedRef.current) return;
+      console.error("Failed to verify pending settlement reversal:", e);
+      const { definitelyDifferentRequest, errorMessage } = classifySettlementReversalFailure(e);
+      applySettlementReversalOutcome(
+        reduceSettlementReversalOutcome(
+          { type: "callable_failure", definitelyDifferentRequest, errorMessage },
+          true
+        )
+      );
+    } finally {
+      if (settlementReversalIsMountedRef.current) settlementReversalInFlightRef.current = false;
+    }
+  }, [applySettlementReversalOutcome, classifySettlementReversalFailure]);
+
   const dangerText = theme.colors.onErrorContainer ?? "#991B1B";
 
   if (loading) {
@@ -2477,6 +2963,137 @@ export default function TripDetails() {
                   ) : null}
                 </>
               ) : null}
+
+              {/* Checkpoint 4E.7: SETTLEMENT HISTORY - a compact section
+                  inside the existing Balances card (no dedicated route
+                  yet). This is the stable UI surface for existing
+                  Settlement records - reversal targets a PERSISTED
+                  Settlement, never a derived balance row, which may
+                  differ entirely from any current TripBalance. */}
+              <View style={[styles.settlementHistoryDivider, { backgroundColor: colors.border }]} />
+              <Text style={[styles.groupLabel, { color: colors.textMuted }]}>Settlement history</Text>
+
+              {settlementHistoryState.status === "loading" ? (
+                <View style={styles.stashLoadingWrap}>
+                  <ActivityIndicator size="small" />
+                  <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                    Loading settlement history…
+                  </Text>
+                </View>
+              ) : settlementHistoryState.status === "error" ? (
+                <View style={styles.expenseErrorWrap}>
+                  <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                    We couldn’t load settlement history.
+                  </Text>
+                  <Pressable
+                    onPress={retrySettlementHistory}
+                    accessibilityRole="button"
+                    accessibilityLabel="Retry loading settlement history"
+                    style={({ pressed }) => [
+                      styles.secondaryActionBtn,
+                      styles.inlineRetryBtn,
+                      { borderColor: colors.border },
+                      pressed && { opacity: 0.9 },
+                    ]}
+                  >
+                    <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Retry</Text>
+                  </Pressable>
+                </View>
+              ) : settlementHistoryState.settlements.length === 0 ? (
+                <Text style={[styles.cardSub, { color: colors.textSecondary }]}>
+                  No settlements recorded yet.
+                </Text>
+              ) : (
+                <>
+                  <View style={styles.expenseListWrap}>
+                    {settlementHistoryState.settlements.map((settlement) => {
+                      const fromMember = resolveSettlementHistoryMember(settlement.fromUid);
+                      const toMember = resolveSettlementHistoryMember(settlement.toUid);
+                      const canReverse = canReverseSettlement(settlement);
+                      return (
+                        <React.Fragment key={settlement.id}>
+                          <SettlementRow
+                            from={fromMember}
+                            to={{ nameLabel: toMember.nameLabel }}
+                            amountMinor={settlement.amountMinor}
+                            methodLabel={SETTLEMENT_METHOD_LABELS[settlement.method]}
+                            timestampLabel={formatTransactionTimestamp(
+                              settlement.occurredAt ?? settlement.createdAt
+                            )}
+                            note={settlement.note}
+                            reversed={settlement.status === "reversed"}
+                            reversalReason={settlement.reversalReason}
+                            onReverse={
+                              canReverse ? () => openReverseSettlementDialog(settlement.id) : undefined
+                            }
+                            reverseAccessibilityLabel={
+                              canReverse
+                                ? `Reverse settlement from ${fromMember.nameLabel}`
+                                : undefined
+                            }
+                          />
+
+                          {/* Checkpoint 4E.7 §26: explicit recovery
+                              affordance for an unresolved (ambiguous-
+                              outcome) reversal request against THIS
+                              specific settlement - reachable even once
+                              the ordinary "Reverse settlement" action
+                              above has disappeared (the record already
+                              shows as reversed). Only ever fires from
+                              this explicit tap, never automatically. */}
+                          {pendingSettlementReversalId === settlement.id ? (
+                            <View style={styles.expenseErrorWrap}>
+                              <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                                We couldn’t confirm whether your reversal request went through.
+                              </Text>
+                              {settlementReversalVerifyError ? (
+                                <Text style={[styles.errorText, { color: dangerText }]}>
+                                  {settlementReversalVerifyError}
+                                </Text>
+                              ) : null}
+                              <Pressable
+                                onPress={verifyPendingSettlementReversal}
+                                disabled={settlementReversalVerifying}
+                                accessibilityRole="button"
+                                accessibilityLabel="Check reversal status"
+                                style={({ pressed }) => [
+                                  styles.secondaryActionBtn,
+                                  styles.inlineRetryBtn,
+                                  { borderColor: colors.border },
+                                  (pressed || settlementReversalVerifying) && { opacity: 0.85 },
+                                ]}
+                              >
+                                {settlementReversalVerifying ? (
+                                  <ActivityIndicator size="small" color={colors.textPrimary} />
+                                ) : (
+                                  <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>
+                                    Check reversal status
+                                  </Text>
+                                )}
+                              </Pressable>
+                            </View>
+                          ) : null}
+                        </React.Fragment>
+                      );
+                    })}
+                  </View>
+
+                  {settlementHistoryProfileState.status === "error" ? (
+                    <View style={styles.profileErrorRow}>
+                      <Text style={[styles.profileErrorText, { color: colors.textMuted }]}>
+                        Some member names couldn’t be loaded.
+                      </Text>
+                      <Pressable
+                        onPress={retrySettlementHistoryProfiles}
+                        accessibilityRole="button"
+                        accessibilityLabel="Retry loading member names"
+                      >
+                        <Text style={[styles.profileErrorRetryText, { color: colors.blue }]}>Retry</Text>
+                      </Pressable>
+                    </View>
+                  ) : null}
+                </>
+              )}
             </View>
           </View>
 
@@ -2558,6 +3175,23 @@ export default function TripDetails() {
       verificationMode={isExactAmbiguousSettlementReplay}
       onCancel={closeSettleUp}
       onConfirm={submitSettlement}
+      colors={colors}
+    />
+    <ReverseSettlementDialog
+      visible={reverseSettlementVisible}
+      fromNameLabel={
+        selectedSettlement ? resolveSettlementHistoryMember(selectedSettlement.fromUid).nameLabel : ""
+      }
+      toNameLabel={
+        selectedSettlement ? resolveSettlementHistoryMember(selectedSettlement.toUid).nameLabel : ""
+      }
+      amountMinor={selectedSettlement?.amountMinor ?? 0}
+      reasonText={settlementReasonText}
+      onChangeReasonText={changeSettlementReasonText}
+      submitting={settlementReversalSubmitting}
+      submitError={settlementReversalSubmitError}
+      onCancel={closeReverseSettlementDialog}
+      onConfirm={handleConfirmReverseSettlement}
       colors={colors}
     />
     </>
@@ -3160,6 +3794,14 @@ const styles = StyleSheet.create({
     gap: 2,
   },
   balancesPendingNoticeSub: { fontSize: 11, fontWeight: "600" },
+  // Checkpoint 4E.7: a subtle internal divider ahead of the "Settlement
+  // history" section heading, inside the same Balances card (no second
+  // giant card).
+  settlementHistoryDivider: {
+    height: StyleSheet.hairlineWidth,
+    marginTop: spacing.md,
+    marginBottom: spacing.xs,
+  },
 
   // --- Quick Analysis -----------------------------------------------
   groupLabel: {
