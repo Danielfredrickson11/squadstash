@@ -95,6 +95,15 @@ function isValidFirestoreDocumentId(id: string): boolean {
  * - Reversal is NOT gated on Trip archive state - correcting historical
  *   activity is deliberately allowed on an archived Trip (§6).
  * - This callable never reads or writes tripExpenseSplits (§12/§14).
+ * - Checkpoint 4F.2A: this callable only reverses
+ *   paymentSource === "member_out_of_pocket" Expenses. A "shared_stash"
+ *   Expense is rejected (failed-precondition) and must be reversed
+ *   through reverseSharedStashExpense instead, which also refunds the
+ *   Shared Stash ledger atomically - something this callable never does.
+ *   The idempotent-replay match (step B) also requires
+ *   paymentSource === "member_out_of_pocket", so a "shared_stash" Expense
+ *   can never be misclassified here as this callable's own successful
+ *   replay.
  */
 export const reverseTripExpense = onCall(async (request) => {
   const authUid = requireAuthenticatedUid(request.auth);
@@ -163,8 +172,18 @@ export async function reverseTripExpenseCore(
     // comparison can only ever evaluate to false, never throw - a
     // malformed stored reversedBy/reversalRequest safely falls through to
     // C exactly like a well-formed mismatch does.
+    // Checkpoint 4F.2A: paymentSource is included in this match. Without
+    // it, a "shared_stash" Expense that somehow carries a matching
+    // reversedBy/reversalRequest (e.g. forward-looking defensive
+    // robustness against a future bug, or a hand-edited/corrupt document)
+    // could be misclassified here as THIS callable's own successful
+    // ordinary reversal - which never refunds the Shared Stash ledger.
+    // Reversal of a "shared_stash" Expense is only ever legitimately
+    // performed by reverseSharedStashExpense; this callable must never
+    // reconcile one as its own replay.
     if (
       expenseData.status === "reversed" &&
+      expenseData.paymentSource === "member_out_of_pocket" &&
       expenseData.reversedBy === authUid &&
       reversalRequestsMatch(
         expenseData.reversalRequest,
@@ -253,6 +272,22 @@ export async function reverseTripExpenseCore(
       throw new HttpsError(
         "failed-precondition",
         "This expense has already been reversed."
+      );
+    }
+
+    // G2. Checkpoint 4F.2A: this callable only reverses
+    // "member_out_of_pocket" Expenses. A "shared_stash" Expense must be
+    // reversed through reverseSharedStashExpense instead, which also
+    // refunds the Shared Stash ledger atomically alongside the status
+    // flip - something this callable never does. Checked only AFTER
+    // authorization and status validation above, so an unauthorized
+    // caller or an already-reversed Expense's outcome is unaffected by
+    // this guard (preflight §15 disclosure ordering).
+    if (expenseData.paymentSource !== "member_out_of_pocket") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This expense is Shared-Stash-funded and must be reversed " +
+          "through the Shared Stash reversal operation."
       );
     }
 

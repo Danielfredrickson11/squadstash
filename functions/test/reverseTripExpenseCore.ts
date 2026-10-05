@@ -1314,3 +1314,91 @@ describe("reverseTripExpenseCore - input/document-id hardening regression (Check
     });
   }
 });
+
+// Checkpoint 4F.2A: this callable must never perform an ordinary Expense
+// reversal on a paymentSource === "shared_stash" Expense - that would mark
+// it reversed without ever refunding the Shared Stash ledger (only
+// reverseSharedStashExpense does that atomically). Hand-seeded directly
+// (never produced by going through recordTripExpenseCore, which rejects
+// "shared_stash" outright) - these fixtures simulate the shape
+// recordSharedStashExpenseCore actually persists.
+describe("reverseTripExpenseCore - Shared-Stash Expense guard (Checkpoint 4F.2A)", () => {
+  function seedSharedStashExpense(
+    overrides: Record<string, unknown> = {}
+  ): Promise<FirebaseFirestore.WriteResult> {
+    return seedExpense({
+      payerUid: null,
+      paymentSource: "shared_stash",
+      sharedStashTransactionId: "fake-withdrawal-id",
+      creationRequest: {
+        tripId: TRIP_ID,
+        amountMinor: 9000,
+        currency: "USD",
+        description: "Cabin rental",
+        category: null,
+        paymentSource: "shared_stash",
+        occurredAtInstantMs: null,
+      },
+      ...overrides,
+    });
+  }
+
+  it("an active Shared-Stash Expense cannot be reversed by its creator through this callable", async () => {
+    await expectNoMutation(
+      async () => {
+        await seedTrip();
+        await seedSharedStashExpense({createdBy: MEMBER_UID});
+      },
+      () => reverseTripExpenseCore(db, MEMBER_UID, baseReversalRequest()),
+      "failed-precondition"
+    );
+  });
+
+  it("an active Shared-Stash Expense cannot be reversed by the Trip owner through this callable either", async () => {
+    await expectNoMutation(
+      async () => {
+        await seedTrip();
+        await seedSharedStashExpense({createdBy: MEMBER_UID});
+      },
+      () => reverseTripExpenseCore(db, OWNER_UID, baseReversalRequest()),
+      "failed-precondition"
+    );
+  });
+
+  it("an already-reversed Shared-Stash Expense is never misclassified as this caller's own successful ordinary replay", async () => {
+    await seedTrip();
+    const clientRequestId = randomUUID();
+    await seedSharedStashExpense({
+      createdBy: MEMBER_UID,
+      status: "reversed",
+      reversedAt: new Date(),
+      reversedBy: MEMBER_UID,
+      reversalRequest: {clientRequestId, reversalReason: null},
+    });
+
+    // If paymentSource were not part of the replay match, this would
+    // incorrectly return success as "my own prior replay" instead of
+    // falling through to the already-reversed rejection - and the caller
+    // would wrongly believe an ordinary reversal (with no refund) is what
+    // actually happened.
+    await assertRejectsWithCode(
+      reverseTripExpenseCore(
+        db,
+        MEMBER_UID,
+        baseReversalRequest({clientRequestId})
+      ),
+      "failed-precondition"
+    );
+  });
+
+  it("valid historical member_out_of_pocket reversal behavior is unaffected", async () => {
+    await seedTrip();
+    await seedExpense({createdBy: MEMBER_UID}); // default: member_out_of_pocket
+    const result = await reverseTripExpenseCore(
+      db,
+      MEMBER_UID,
+      baseReversalRequest()
+    );
+    assert.equal(result.expenseId, EXPENSE_ID);
+  });
+});
