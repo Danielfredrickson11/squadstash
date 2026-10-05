@@ -54,10 +54,38 @@ import type {
 // null both mean "no reversal". Normalizing an absent key to null here
 // fulfills the canonical type's own contract without fabricating any
 // new information.
-function mapSavingsTransactionDocument(
+// Exported (Checkpoint 4F.3) so its linkedExpenseId round-trip can be
+// tested directly, matching mapExpenseDocument's own exported-mapper
+// convention in src/services/firebase/expenses.ts.
+export function mapSavingsTransactionDocument(
   id: string,
   data: DocumentData
 ): SavingsTransaction {
+  // Checkpoint 4F.3A: unlike every other field above (trusted as-is via a
+  // plain cast), linkedExpenseId is NOT cast-and-trusted - it is a second
+  // discriminant this file's own deriveMemberSavingsBalanceMinor consumer
+  // (src/domain/savingsBalance.ts) uses to decide whether a transaction
+  // counts toward personal attribution at all. A malformed value here
+  // (null, "", whitespace-only, a number, a boolean, an object) must fail
+  // visibly rather than being silently treated as "absent" - that would
+  // let a corrupted/malformed persisted fact quietly fall back to
+  // ordinary personal-attribution treatment for money that was actually
+  // Shared-Stash Expense activity, exactly the misattribution 4F.0/§5
+  // exists to prevent.
+  let linkedExpenseId: string | undefined;
+  if (data.linkedExpenseId !== undefined) {
+    if (
+      typeof data.linkedExpenseId !== "string" ||
+      data.linkedExpenseId.trim().length === 0
+    ) {
+      throw new Error(
+        `mapSavingsTransactionDocument: invalid savingsTransactions document "${id}" - ` +
+          "linkedExpenseId, when present, must be a non-empty string."
+      );
+    }
+    linkedExpenseId = data.linkedExpenseId;
+  }
+
   const base = {
     id,
     resourceType: data.resourceType as ResourceType,
@@ -70,6 +98,11 @@ function mapSavingsTransactionDocument(
     occurredAt: data.occurredAt as PersistedTimestamp | undefined,
     createdAt: data.createdAt as PersistedTimestamp,
     reversalOf: (data.reversalOf ?? null) as string | null,
+    // Checkpoint 4F.3: present only on a Shared-Stash-Expense-linked
+    // withdrawal/refund (see the type's own doc comment in
+    // src/types/domain/savingsTransaction.ts) - absent on every ordinary
+    // personal transaction. Already strictly validated above (4F.3A).
+    linkedExpenseId,
   };
 
   // type is intentionally NOT cast-and-trusted like the other fields

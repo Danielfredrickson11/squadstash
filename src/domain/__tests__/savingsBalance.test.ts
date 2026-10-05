@@ -35,6 +35,10 @@ type FactoryOverrides = {
   recordedBy?: string;
   reversalOf?: string | null;
   id?: string;
+  // Checkpoint 4F.3: when present, marks this fixture as a Shared-Stash
+  // Expense-linked withdrawal/refund rather than an ordinary personal
+  // transaction - see deriveMemberSavingsBalanceMinor's own doc comment.
+  linkedExpenseId?: string;
 };
 
 function makeContribution(overrides: FactoryOverrides): Contribution {
@@ -45,10 +49,11 @@ function makeContribution(overrides: FactoryOverrides): Contribution {
     recordedBy = memberUid,
     reversalOf = null,
     id,
+    linkedExpenseId,
   } = overrides;
   nextId += 1;
 
-  return {
+  const transaction: Contribution = {
     id: id ?? `txn-${nextId}`,
     type: "contribution",
     resourceType: "bucket",
@@ -60,6 +65,10 @@ function makeContribution(overrides: FactoryOverrides): Contribution {
     createdAt: FIXTURE_CREATED_AT,
     reversalOf,
   };
+  if (linkedExpenseId !== undefined) {
+    transaction.linkedExpenseId = linkedExpenseId;
+  }
+  return transaction;
 }
 
 function makeWithdrawal(overrides: FactoryOverrides): Withdrawal {
@@ -70,10 +79,11 @@ function makeWithdrawal(overrides: FactoryOverrides): Withdrawal {
     recordedBy = memberUid,
     reversalOf = null,
     id,
+    linkedExpenseId,
   } = overrides;
   nextId += 1;
 
-  return {
+  const transaction: Withdrawal = {
     id: id ?? `txn-${nextId}`,
     type: "withdrawal",
     resourceType: "bucket",
@@ -85,6 +95,10 @@ function makeWithdrawal(overrides: FactoryOverrides): Withdrawal {
     createdAt: FIXTURE_CREATED_AT,
     reversalOf,
   };
+  if (linkedExpenseId !== undefined) {
+    transaction.linkedExpenseId = linkedExpenseId;
+  }
+  return transaction;
 }
 
 describe("getSignedSavingsAmountMinor", () => {
@@ -259,5 +273,66 @@ describe("deriveMemberSavingsBalanceMinor", () => {
     // The gap is exactly the untracked opening balance - intentional,
     // not a bug (see ledgerOpeningBalanceMinor's doc comment).
     expect(resourceBalance - summedMemberBalances).toBe(openingBalanceMinor);
+  });
+
+  // Checkpoint 4F.3: a Shared-Stash Expense's own withdrawal/refund
+  // carries the SAME memberUid as the member who created/reversed the
+  // Expense (preflight §5's frozen attribution design), but that money
+  // was never personally moved by them - linkedExpenseId's presence must
+  // exclude it from their personal total regardless.
+  it("16. excludes a linked Shared-Stash withdrawal from personal attribution even though memberUid matches", () => {
+    const transactions = [
+      makeContribution({ amountMinor: 1000, memberUid: "daniel" }),
+      makeWithdrawal({
+        amountMinor: 400,
+        memberUid: "daniel",
+        linkedExpenseId: "expense-1",
+      }),
+    ];
+    // Without the exclusion this would be 1000 - 400 = 600.
+    expect(deriveMemberSavingsBalanceMinor(transactions, "daniel")).toBe(1000);
+  });
+
+  it("17. excludes a linked Shared-Stash refund (contribution) from personal attribution even though memberUid matches", () => {
+    const transactions = [
+      makeContribution({ amountMinor: 1000, memberUid: "daniel" }),
+      makeContribution({
+        amountMinor: 400,
+        memberUid: "daniel",
+        linkedExpenseId: "expense-1",
+        reversalOf: "withdrawal-1",
+      }),
+    ];
+    // Without the exclusion this would be 1000 + 400 = 1400.
+    expect(deriveMemberSavingsBalanceMinor(transactions, "daniel")).toBe(1000);
+  });
+
+  it("18. still counts every normal, unlinked transaction correctly alongside excluded linked ones", () => {
+    const transactions = [
+      makeContribution({ amountMinor: 2000, memberUid: "daniel" }),
+      makeWithdrawal({ amountMinor: 500, memberUid: "daniel" }),
+      makeWithdrawal({
+        amountMinor: 1200,
+        memberUid: "daniel",
+        linkedExpenseId: "expense-2", // Shared-Stash Expense, excluded
+      }),
+      makeContribution({ amountMinor: 300, memberUid: "jake" }),
+    ];
+    // Daniel: 2000 - 500 = 1500 (the linked 1200 withdrawal is excluded).
+    expect(deriveMemberSavingsBalanceMinor(transactions, "daniel")).toBe(1500);
+    expect(deriveMemberSavingsBalanceMinor(transactions, "jake")).toBe(300);
+  });
+
+  it("19. the resource-level total (deriveSavingsBalanceMinor) still includes linked transactions - only the per-member total excludes them", () => {
+    const transactions = [
+      makeContribution({ amountMinor: 2000, memberUid: "daniel" }),
+      makeWithdrawal({
+        amountMinor: 1200,
+        memberUid: "daniel",
+        linkedExpenseId: "expense-3",
+      }),
+    ];
+    expect(deriveSavingsBalanceMinor(transactions, 0)).toBe(800); // 2000 - 1200
+    expect(deriveMemberSavingsBalanceMinor(transactions, "daniel")).toBe(2000); // linked withdrawal excluded
   });
 });

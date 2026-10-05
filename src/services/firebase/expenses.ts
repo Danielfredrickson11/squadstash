@@ -297,16 +297,43 @@ export function mapExpenseDocument(id: string, data: DocumentData): Expense {
   } else if (
     data.reversedAt !== undefined ||
     data.reversedBy !== undefined ||
-    data.reversalReason !== undefined
+    data.reversalReason !== undefined ||
+    data.refundTransactionId !== undefined
   ) {
     // Reversal metadata belongs only to a "reversed" Expense - any of
-    // reversedAt/reversedBy/reversalReason present on an "active" record
-    // is itself a malformed document (Checkpoint 4D.1B.1 §3). This does
-    // NOT inspect the backend-internal reversalRequest field, which is
-    // never part of the public Expense mapper.
+    // reversedAt/reversedBy/reversalReason/refundTransactionId present on
+    // an "active" record is itself a malformed document (Checkpoint
+    // 4D.1B.1 §3, extended by 4F.3 to cover refundTransactionId). This
+    // does NOT inspect the backend-internal reversalRequest field, which
+    // is never part of the public Expense mapper.
     fail(
-      'reversedAt/reversedBy/reversalReason must not be present when status is "active"'
+      "reversedAt/reversedBy/reversalReason/refundTransactionId must not " +
+        'be present when status is "active"'
     );
+  }
+
+  // Checkpoint 4F.3: refundTransactionId (reverseSharedStashExpense's own
+  // trusted output) is required exactly when a "reversed" Expense's
+  // paymentSource is "shared_stash" - that reversal path always writes a
+  // refund in the same transaction as the status flip - and must be
+  // absent for a "member_out_of_pocket" reversal, which reverseTripExpense
+  // never writes one for.
+  let refundTransactionId: string | undefined;
+  if (data.status === "reversed") {
+    if (data.paymentSource === "shared_stash") {
+      if (!isNonEmptyString(data.refundTransactionId)) {
+        fail(
+          "refundTransactionId must be a non-empty string when status is " +
+            '"reversed" and paymentSource is "shared_stash"'
+        );
+      }
+      refundTransactionId = data.refundTransactionId;
+    } else if (data.refundTransactionId !== undefined) {
+      fail(
+        'refundTransactionId must not be present when paymentSource is ' +
+          '"member_out_of_pocket"'
+      );
+    }
   }
 
   // Correction-link ids - a non-empty valid Firestore document-id shape
@@ -358,6 +385,9 @@ export function mapExpenseDocument(id: string, data: DocumentData): Expense {
   if (replacesExpenseId !== undefined) expense.replacesExpenseId = replacesExpenseId;
   if (replacedByExpenseId !== undefined) {
     expense.replacedByExpenseId = replacedByExpenseId;
+  }
+  if (refundTransactionId !== undefined) {
+    expense.refundTransactionId = refundTransactionId;
   }
 
   return expense;
@@ -807,4 +837,188 @@ export async function reverseTripExpense(
   );
   const res = await callable(payload);
   return parseReverseTripExpenseResponse(res.data);
+}
+
+// ---------------------------------------------------------------------
+// recordSharedStashExpense (Checkpoint 4F.3, per docs/audits/
+// TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md, as implemented by
+// functions/src/callables/recordSharedStashExpense.ts)
+// ---------------------------------------------------------------------
+
+// Deliberately narrower than RecordTripExpenseInput: there is no payerUid
+// (the group fund pays, not a member), no splitStrategy/participants
+// (zero tripExpenseSplits are ever created for this payment source), and
+// no paymentSource/sharedStashTransactionId/createdBy - every one of
+// those is server-derived and this type simply has no way to carry a
+// client-supplied value for any of them.
+export type RecordSharedStashExpenseInput = {
+  tripId: string;
+  amountMinor: number;
+  currency: "USD";
+  description: string;
+  category?: string;
+  occurredAt?: Date;
+  clientRequestId: string;
+};
+
+type RecordSharedStashExpenseRequest = {
+  tripId: string;
+  amountMinor: number;
+  currency: "USD";
+  description: string;
+  category?: string;
+  occurredAt?: string;
+  clientRequestId: string;
+};
+
+// Pure request-shaping, exported for direct testing without any Firebase
+// mocking, mirroring buildRecordTripExpenseRequest's own conventions
+// exactly.
+export function buildRecordSharedStashExpenseRequest(
+  input: RecordSharedStashExpenseInput
+): RecordSharedStashExpenseRequest {
+  const request: RecordSharedStashExpenseRequest = {
+    tripId: input.tripId,
+    amountMinor: input.amountMinor,
+    currency: input.currency,
+    description: input.description,
+    clientRequestId: input.clientRequestId,
+  };
+  if (input.category !== undefined) {
+    request.category = input.category;
+  }
+  if (input.occurredAt !== undefined) {
+    if (Number.isNaN(input.occurredAt.getTime())) {
+      throw new Error(
+        "recordSharedStashExpense: occurredAt is an invalid Date."
+      );
+    }
+    request.occurredAt = input.occurredAt.toISOString();
+  }
+  return request;
+}
+
+export type RecordSharedStashExpenseResult = {
+  expenseId: string;
+  sharedStashTransactionId: string;
+};
+
+// Validates the callable's response field-by-field rather than trusting a
+// whole-object cast, matching every other response parser in this file.
+export function parseRecordSharedStashExpenseResponse(
+  data: unknown
+): RecordSharedStashExpenseResult {
+  if (typeof data !== "object" || data === null) {
+    throw new Error(
+      "recordSharedStashExpense: invalid response (expected an object)."
+    );
+  }
+  const {expenseId, sharedStashTransactionId} = data as Record<string, unknown>;
+  if (typeof expenseId !== "string" || expenseId.length === 0) {
+    throw new Error(
+      "recordSharedStashExpense: invalid response (expenseId must be a " +
+        "non-empty string)."
+    );
+  }
+  if (
+    typeof sharedStashTransactionId !== "string" ||
+    sharedStashTransactionId.length === 0
+  ) {
+    throw new Error(
+      "recordSharedStashExpense: invalid response " +
+        "(sharedStashTransactionId must be a non-empty string)."
+    );
+  }
+  return {expenseId, sharedStashTransactionId};
+}
+
+// The sole write path for creating a Shared-Stash-funded tripExpenses
+// document: invokes the trusted recordSharedStashExpense Cloud Function
+// via httpsCallable. Callable errors propagate unchanged, matching
+// recordTripExpense's own convention above.
+export async function recordSharedStashExpense(
+  input: RecordSharedStashExpenseInput
+): Promise<RecordSharedStashExpenseResult> {
+  const payload = buildRecordSharedStashExpenseRequest(input);
+  const callable = httpsCallable<RecordSharedStashExpenseRequest, unknown>(
+    functions,
+    "recordSharedStashExpense"
+  );
+  const res = await callable(payload);
+  return parseRecordSharedStashExpenseResponse(res.data);
+}
+
+// ---------------------------------------------------------------------
+// reverseSharedStashExpense (Checkpoint 4F.3, per
+// functions/src/callables/reverseSharedStashExpense.ts)
+// ---------------------------------------------------------------------
+
+// Deliberately no tripId - the backend derives it from the persisted
+// Expense document itself, exactly mirroring ReverseTripExpenseInput's
+// own convention.
+export type ReverseSharedStashExpenseInput = {
+  expenseId: string;
+  reversalReason?: string;
+  clientRequestId: string;
+};
+
+type ReverseSharedStashExpenseRequest = {
+  expenseId: string;
+  reversalReason?: string;
+  clientRequestId: string;
+};
+
+export type ReverseSharedStashExpenseResult = {
+  expenseId: string;
+  refundTransactionId: string;
+};
+
+export function parseReverseSharedStashExpenseResponse(
+  data: unknown
+): ReverseSharedStashExpenseResult {
+  if (typeof data !== "object" || data === null) {
+    throw new Error(
+      "reverseSharedStashExpense: invalid response (expected an object)."
+    );
+  }
+  const {expenseId, refundTransactionId} = data as Record<string, unknown>;
+  if (typeof expenseId !== "string" || expenseId.length === 0) {
+    throw new Error(
+      "reverseSharedStashExpense: invalid response (expenseId must be a " +
+        "non-empty string)."
+    );
+  }
+  if (
+    typeof refundTransactionId !== "string" ||
+    refundTransactionId.length === 0
+  ) {
+    throw new Error(
+      "reverseSharedStashExpense: invalid response (refundTransactionId " +
+        "must be a non-empty string)."
+    );
+  }
+  return {expenseId, refundTransactionId};
+}
+
+// The sole write path for reversing a Shared-Stash-funded tripExpenses
+// document. Never updates Firestore directly, never computes a refund
+// amount client-side - the backend remains the sole authority for all of
+// that. Callable errors propagate unchanged, matching reverseTripExpense's
+// own convention above.
+export async function reverseSharedStashExpense(
+  input: ReverseSharedStashExpenseInput
+): Promise<ReverseSharedStashExpenseResult> {
+  const payload: ReverseSharedStashExpenseRequest = {
+    expenseId: input.expenseId,
+    clientRequestId: input.clientRequestId,
+  };
+  if (input.reversalReason !== undefined) {
+    payload.reversalReason = input.reversalReason;
+  }
+  const callable = httpsCallable<ReverseSharedStashExpenseRequest, unknown>(
+    functions,
+    "reverseSharedStashExpense"
+  );
+  const res = await callable(payload);
+  return parseReverseSharedStashExpenseResponse(res.data);
 }

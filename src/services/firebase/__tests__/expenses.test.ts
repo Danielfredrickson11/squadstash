@@ -21,6 +21,7 @@
 // change required to work around it).
 import type { Expense, ExpenseSplit } from "../../../types/domain";
 import {
+  buildRecordSharedStashExpenseRequest,
   buildRecordTripExpenseRequest,
   expenseBelongsToTrip,
   fetchExpenseById,
@@ -28,13 +29,18 @@ import {
   generateExpenseClientRequestId,
   mapExpenseDocument,
   mapExpenseSplitDocument,
+  parseRecordSharedStashExpenseResponse,
   parseRecordTripExpenseResponse,
+  parseReverseSharedStashExpenseResponse,
   parseReverseTripExpenseResponse,
+  recordSharedStashExpense,
   recordTripExpense,
+  reverseSharedStashExpense,
   reverseTripExpense,
   sortExpensesForHistory,
   subscribeToExpenseById,
   subscribeToExpensesForTrip,
+  type RecordSharedStashExpenseInput,
   type RecordTripExpenseInput,
 } from "../expenses";
 import {
@@ -490,6 +496,74 @@ describe("mapExpenseDocument - payment-source metadata consistency (4D.1B.1 §5)
         validActiveExpenseData({paymentSource: "shared_stash", payerUid: null})
       )
     ).toThrow(/sharedStashTransactionId/);
+  });
+});
+
+// Checkpoint 4F.3: refundTransactionId (reverseSharedStashExpense's own
+// trusted output) is required exactly when a "reversed" Expense's
+// paymentSource is "shared_stash", and must be absent everywhere else -
+// mirroring the §5 sharedStashTransactionId consistency rules above.
+describe("mapExpenseDocument - refundTransactionId consistency (Checkpoint 4F.3)", () => {
+  it("active shared_stash Expense has no refundTransactionId", () => {
+    const expense = mapExpenseDocument(
+      "expense-1",
+      validActiveExpenseData({
+        paymentSource: "shared_stash",
+        payerUid: null,
+        sharedStashTransactionId: "txn-1",
+      })
+    );
+    expect(expense.refundTransactionId).toBeUndefined();
+  });
+
+  it("active member_out_of_pocket Expense rejects a stray refundTransactionId", () => {
+    expect(() =>
+      mapExpenseDocument(
+        "expense-1",
+        validActiveExpenseData({refundTransactionId: "refund-1"})
+      )
+    ).toThrow(/refundTransactionId/);
+  });
+
+  it("reversed shared_stash Expense + refundTransactionId maps", () => {
+    const expense = mapExpenseDocument(
+      "expense-1",
+      validReversedExpenseData({
+        paymentSource: "shared_stash",
+        payerUid: null,
+        sharedStashTransactionId: "txn-1",
+        refundTransactionId: "refund-1",
+      })
+    );
+    expect(expense.refundTransactionId).toBe("refund-1");
+    expect(expense.sharedStashTransactionId).toBe("txn-1");
+  });
+
+  it("reversed shared_stash Expense + missing refundTransactionId rejects", () => {
+    expect(() =>
+      mapExpenseDocument(
+        "expense-1",
+        validReversedExpenseData({
+          paymentSource: "shared_stash",
+          payerUid: null,
+          sharedStashTransactionId: "txn-1",
+        })
+      )
+    ).toThrow(/refundTransactionId/);
+  });
+
+  it("reversed member_out_of_pocket Expense rejects a stray refundTransactionId", () => {
+    expect(() =>
+      mapExpenseDocument(
+        "expense-1",
+        validReversedExpenseData({refundTransactionId: "refund-1"})
+      )
+    ).toThrow(/refundTransactionId/);
+  });
+
+  it("reversed member_out_of_pocket Expense has no refundTransactionId by default", () => {
+    const expense = mapExpenseDocument("expense-1", validReversedExpenseData());
+    expect(expense.refundTransactionId).toBeUndefined();
   });
 });
 
@@ -1058,6 +1132,158 @@ describe("recordTripExpense / reverseTripExpense callable wrappers", () => {
     const callable = jest.fn().mockResolvedValue({data: {expenseId: "expense-1"}});
     mockHttpsCallableFn.mockReturnValue(callable);
     await reverseTripExpense({expenseId: "expense-1", clientRequestId: "req-1"});
+    const sentPayload = callable.mock.calls[0][0] as Record<string, unknown>;
+    expect("tripId" in sentPayload).toBe(false);
+  });
+});
+
+// Checkpoint 4F.3: client wrappers for the already-deployed
+// recordSharedStashExpense/reverseSharedStashExpense callables, mirroring
+// the recordTripExpense/reverseTripExpense wrapper tests above exactly.
+describe("recordSharedStashExpense / reverseSharedStashExpense callable wrappers", () => {
+  const baseSharedStash: RecordSharedStashExpenseInput = {
+    tripId: "trip-1",
+    amountMinor: 2000,
+    currency: "USD",
+    description: "Groceries for the cabin",
+    clientRequestId: "req-1",
+  };
+
+  it("buildRecordSharedStashExpenseRequest never carries payerUid/splitStrategy/participants/paymentSource", () => {
+    const request = buildRecordSharedStashExpenseRequest(baseSharedStash);
+    expect("payerUid" in request).toBe(false);
+    expect("splitStrategy" in request).toBe(false);
+    expect("participants" in request).toBe(false);
+    expect("paymentSource" in request).toBe(false);
+    expect(request).toEqual({
+      tripId: "trip-1",
+      amountMinor: 2000,
+      currency: "USD",
+      description: "Groceries for the cabin",
+      clientRequestId: "req-1",
+    });
+  });
+
+  it("buildRecordSharedStashExpenseRequest serializes occurredAt to an ISO string", () => {
+    const occurredAt = new Date("2027-01-01T00:00:00Z");
+    const request = buildRecordSharedStashExpenseRequest({
+      ...baseSharedStash,
+      occurredAt,
+    });
+    expect(request.occurredAt).toBe("2027-01-01T00:00:00.000Z");
+  });
+
+  it("buildRecordSharedStashExpenseRequest rejects an invalid Date", () => {
+    expect(() =>
+      buildRecordSharedStashExpenseRequest({
+        ...baseSharedStash,
+        occurredAt: new Date(NaN),
+      })
+    ).toThrow(/invalid Date/);
+  });
+
+  it("parseRecordSharedStashExpenseResponse accepts a valid response", () => {
+    expect(
+      parseRecordSharedStashExpenseResponse({
+        expenseId: "expense-1",
+        sharedStashTransactionId: "txn-1",
+      })
+    ).toEqual({expenseId: "expense-1", sharedStashTransactionId: "txn-1"});
+  });
+
+  it("parseRecordSharedStashExpenseResponse rejects a missing sharedStashTransactionId", () => {
+    expect(() =>
+      parseRecordSharedStashExpenseResponse({expenseId: "expense-1"})
+    ).toThrow(/sharedStashTransactionId/);
+  });
+
+  it("parseRecordSharedStashExpenseResponse rejects a missing expenseId", () => {
+    expect(() =>
+      parseRecordSharedStashExpenseResponse({sharedStashTransactionId: "txn-1"})
+    ).toThrow(/expenseId/);
+  });
+
+  it("recordSharedStashExpense resolves with the parsed response on success", async () => {
+    const callable = jest.fn().mockResolvedValue({
+      data: {expenseId: "expense-1", sharedStashTransactionId: "txn-1"},
+    });
+    mockHttpsCallableFn.mockReturnValue(callable);
+    const result = await recordSharedStashExpense(baseSharedStash);
+    expect(result).toEqual({
+      expenseId: "expense-1",
+      sharedStashTransactionId: "txn-1",
+    });
+    expect(mockHttpsCallableFn).toHaveBeenCalledWith(
+      expect.anything(),
+      "recordSharedStashExpense"
+    );
+  });
+
+  it("recordSharedStashExpense propagates a raw callable error unchanged", async () => {
+    const originalError = Object.assign(new Error("failed-precondition"), {
+      code: "functions/failed-precondition",
+    });
+    const callable = jest.fn().mockRejectedValue(originalError);
+    mockHttpsCallableFn.mockReturnValue(callable);
+    await expect(recordSharedStashExpense(baseSharedStash)).rejects.toBe(
+      originalError
+    );
+  });
+
+  it("parseReverseSharedStashExpenseResponse accepts a valid response", () => {
+    expect(
+      parseReverseSharedStashExpenseResponse({
+        expenseId: "expense-1",
+        refundTransactionId: "refund-1",
+      })
+    ).toEqual({expenseId: "expense-1", refundTransactionId: "refund-1"});
+  });
+
+  it("parseReverseSharedStashExpenseResponse rejects a missing refundTransactionId", () => {
+    expect(() =>
+      parseReverseSharedStashExpenseResponse({expenseId: "expense-1"})
+    ).toThrow(/refundTransactionId/);
+  });
+
+  it("reverseSharedStashExpense resolves with the parsed response on success", async () => {
+    const callable = jest.fn().mockResolvedValue({
+      data: {expenseId: "expense-1", refundTransactionId: "refund-1"},
+    });
+    mockHttpsCallableFn.mockReturnValue(callable);
+    const result = await reverseSharedStashExpense({
+      expenseId: "expense-1",
+      clientRequestId: "req-1",
+    });
+    expect(result).toEqual({
+      expenseId: "expense-1",
+      refundTransactionId: "refund-1",
+    });
+    expect(mockHttpsCallableFn).toHaveBeenCalledWith(
+      expect.anything(),
+      "reverseSharedStashExpense"
+    );
+  });
+
+  it("reverseSharedStashExpense propagates a raw callable error unchanged", async () => {
+    const originalError = Object.assign(new Error("permission-denied"), {
+      code: "functions/permission-denied",
+    });
+    const callable = jest.fn().mockRejectedValue(originalError);
+    mockHttpsCallableFn.mockReturnValue(callable);
+    await expect(
+      reverseSharedStashExpense({expenseId: "expense-1", clientRequestId: "req-1"})
+    ).rejects.toBe(originalError);
+  });
+
+  it("reverseSharedStashExpense never sends tripId - the backend derives it from the persisted Expense", async () => {
+    const callable = jest.fn().mockResolvedValue({
+      data: {expenseId: "expense-1", refundTransactionId: "refund-1"},
+    });
+    mockHttpsCallableFn.mockReturnValue(callable);
+    await reverseSharedStashExpense({
+      expenseId: "expense-1",
+      clientRequestId: "req-1",
+    });
     const sentPayload = callable.mock.calls[0][0] as Record<string, unknown>;
     expect("tripId" in sentPayload).toBe(false);
   });

@@ -112,6 +112,19 @@ export type Expense = {
   // (A -> B -> C) - never multiple sibling replacements of the same
   // original (§9.2).
   replacedByExpenseId?: string;
+
+  // Checkpoint 4F.2/4F.3, per the approved docs/audits/
+  // TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md §13: present only on
+  // a "reversed" Expense whose paymentSource is "shared_stash" -
+  // identifies the offsetting savingsTransactions contribution
+  // (reverseSharedStashExpense's own refund) that restored the Shared
+  // Stash ledger. Trusted, server-computed output only, written
+  // atomically by the same transaction that flips status to "reversed" -
+  // never client-suppliable, mirroring replacedByExpenseId's own
+  // trusted-output convention. Absent for every "member_out_of_pocket"
+  // Expense (that payment source's reversal never writes a refund) and
+  // absent for any "active" Expense.
+  refundTransactionId?: string;
 };
 
 // Checkpoint 4B: reshaped to match the audit's approved flat top-level

@@ -55,12 +55,27 @@ export function deriveSavingsBalanceMinor(
 // historically contributed it), so summing every member's balance will
 // not, in general, equal deriveSavingsBalanceMinor's result whenever a
 // resource has a nonzero opening balance. That gap is intentional.
+//
+// Checkpoint 4F.3, per the approved docs/audits/
+// TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md §5: also excludes any
+// transaction carrying a `linkedExpenseId` - a Shared-Stash Expense's own
+// withdrawal/refund is Trip-level ledger activity the group fund paid or
+// was repaid, not a personal contribution/withdrawal the named memberUid
+// actually made. Including it here would falsely inflate/deflate that
+// member's personal total for money they never personally moved.
+// deriveSavingsBalanceMinor (the resource-level total, above) is
+// unaffected - the Trip's own total balance must reflect ALL activity,
+// linked or not.
 export function deriveMemberSavingsBalanceMinor(
   transactions: readonly SavingsTransaction[],
   memberUid: string
 ): number {
   return transactions
-    .filter((transaction) => transaction.memberUid === memberUid)
+    .filter(
+      (transaction) =>
+        transaction.memberUid === memberUid &&
+        transaction.linkedExpenseId === undefined
+    )
     .reduce(
       (total, transaction) => total + getSignedSavingsAmountMinor(transaction),
       0

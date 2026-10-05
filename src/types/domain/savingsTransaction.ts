@@ -24,6 +24,22 @@ export type SavingsTransactionBase = {
   occurredAt?: PersistedTimestamp;
   createdAt: PersistedTimestamp;
   reversalOf: string | null;
+  // Checkpoint 4F.1/4F.2/4F.3, per the approved docs/audits/
+  // TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md §5 (as corrected by
+  // its 4F.0A amendment): present only on a Shared-Stash-Expense-linked
+  // transaction - the original withdrawal recordSharedStashExpense
+  // writes, or the offsetting refund contribution reverseSharedStashExpense
+  // writes - identifying the linked tripExpenses document. Its presence
+  // is the authoritative discriminator that this transaction represents
+  // group-funded Expense activity, NOT a member's own personal
+  // contribution/withdrawal: memberUid remains required for schema
+  // compatibility, but when linkedExpenseId is present, memberUid does
+  // NOT mean personal attribution (see deriveMemberSavingsBalanceMinor in
+  // src/domain/savingsBalance.ts, which excludes these transactions from
+  // personal totals for exactly this reason). Absent for every ordinary
+  // personal contribution/withdrawal, including every transaction that
+  // predates this checkpoint.
+  linkedExpenseId?: string;
 };
 
 export type Contribution = SavingsTransactionBase & { type: "contribution" };
