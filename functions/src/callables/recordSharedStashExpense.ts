@@ -3,6 +3,12 @@ import {FieldValue, Timestamp, getFirestore} from "firebase-admin/firestore";
 import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError, onCall} from "firebase-functions/v2/https";
 import type {CallableRequest} from "firebase-functions/v2/https";
+import {
+  applyLedgerTransition,
+  classifyLedgerInitialization,
+  deriveLegacyLedgerInitialization,
+  resolveEffectiveCurrency,
+} from "../domain/savingsLedger";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -471,50 +477,46 @@ export async function recordSharedStashExpenseCore(
       }
     }
 
-    // E. Canonical currency resolution/match, reproduced exactly from
-    // recordSavingsTransaction.ts (preflight §4) - the Trip's own
-    // `currency` field if present, defaulting to "USD" only when entirely
-    // absent.
-    let effectiveCurrency = "USD";
-    if ("currency" in tripData) {
-      const tripCurrency = tripData.currency;
-      if (typeof tripCurrency !== "string" || tripCurrency.length === 0) {
+    // E/F/G. Checkpoint 4F.5: currency/ledger-state/transition
+    // interpretation is now delegated to the shared pure domain
+    // primitive (functions/src/domain/savingsLedger.ts), extracted from
+    // this exact logic (previously duplicated independently here and in
+    // recordSavingsTransaction.ts) per the approved docs/audits/
+    // TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md §4/§24. Every
+    // error code/message/ordering below is byte-for-byte identical to
+    // this callable's own pre-extraction behavior - only WHERE the
+    // interpretation happens moved, never WHAT it decides. A
+    // Shared-Stash Expense is always a withdrawal (the group fund paid) -
+    // never a client-displayed balance; the backend-authoritative
+    // overdraft rejection below is checked against the canonical balance
+    // obtained inside this same transaction (preflight §8/§12).
+    const currencyResult = resolveEffectiveCurrency(tripData, input.currency);
+    if (!currencyResult.ok) {
+      if (currencyResult.reason === "malformed_parent_currency") {
         throw new HttpsError(
           "failed-precondition",
           "Trip has a malformed currency field."
         );
       }
-      effectiveCurrency = tripCurrency;
-    }
-    if (input.currency !== effectiveCurrency) {
       throw new HttpsError(
         "failed-precondition",
-        `currency must match the Trip's currency (${effectiveCurrency}).`
+        "currency must match the Trip's currency " +
+          `(${currencyResult.effectiveCurrency}).`
       );
     }
-
-    // F. Canonical ledger-state classification, reproduced exactly from
-    // recordSavingsTransaction.ts (preflight §4 frozen invariant) - never
-    // a bare subtraction from ledgerBalanceMinor.
-    const hasOpening = "ledgerOpeningBalanceMinor" in tripData;
-    const hasBalance = "ledgerBalanceMinor" in tripData;
 
     let currentBalanceMinor: number;
     let initOpeningMinor: number | null = null;
 
-    if (hasOpening && hasBalance) {
-      const opening = tripData.ledgerOpeningBalanceMinor;
-      const balance = tripData.ledgerBalanceMinor;
-      const openingValid = Number.isSafeInteger(opening) && opening >= 0;
-      const balanceValid = Number.isSafeInteger(balance) && balance >= 0;
-      if (!openingValid || !balanceValid) {
-        throw new HttpsError(
-          "failed-precondition",
-          "Trip has an invalid trusted ledger state."
-        );
-      }
-      currentBalanceMinor = balance;
-    } else if (!hasOpening && !hasBalance) {
+    const initState = classifyLedgerInitialization(tripData);
+    if (initState.kind === "initialized") {
+      currentBalanceMinor = initState.currentBalanceMinor;
+    } else if (initState.kind === "invalid_initialized_state") {
+      throw new HttpsError(
+        "failed-precondition",
+        "Trip has an invalid trusted ledger state."
+      );
+    } else if (initState.kind === "uninitialized") {
       // Legacy/uninitialized Trip - guard against ambiguous prior history
       // before inventing an opening balance, exactly as
       // recordSavingsTransaction.ts does.
@@ -528,50 +530,47 @@ export async function recordSharedStashExpenseCore(
       }
 
       const legacyDollars = tripData.saved ?? 0;
-      const legacyValid =
-        typeof legacyDollars === "number" &&
-        Number.isFinite(legacyDollars) &&
-        legacyDollars >= 0;
-      if (!legacyValid) {
-        throw new HttpsError(
-          "failed-precondition",
-          "Trip has an invalid legacy compatibility balance."
-        );
-      }
-      const legacyMinor = Math.round(legacyDollars * 100);
-      if (!Number.isSafeInteger(legacyMinor)) {
+      const legacyResult = deriveLegacyLedgerInitialization(legacyDollars);
+      if (!legacyResult.ok) {
+        if (legacyResult.reason === "invalid_legacy_value") {
+          throw new HttpsError(
+            "failed-precondition",
+            "Trip has an invalid legacy compatibility balance."
+          );
+        }
         throw new HttpsError(
           "failed-precondition",
           "Legacy compatibility balance is too large to convert safely."
         );
       }
-      currentBalanceMinor = legacyMinor;
-      initOpeningMinor = legacyMinor;
+      currentBalanceMinor = legacyResult.currentBalanceMinor;
+      initOpeningMinor = legacyResult.initOpeningMinor;
     } else {
+      // partial_corrupt
       throw new HttpsError(
         "failed-precondition",
         "Trip has a partial/corrupt ledger initialization state."
       );
     }
 
-    // G. Balance transition - a Shared-Stash Expense is always a
-    // withdrawal (the group fund paid); backend-authoritative overdraft
-    // rejection, checked against the canonical balance obtained inside
-    // this same transaction (preflight §8/§12), never a client-displayed
-    // balance.
-    const newBalanceMinor = currentBalanceMinor - input.amountMinor;
-    if (!Number.isSafeInteger(newBalanceMinor)) {
-      throw new HttpsError(
-        "failed-precondition",
-        "Resulting balance is not a safe integer."
-      );
-    }
-    if (newBalanceMinor < 0) {
+    const transitionResult = applyLedgerTransition(
+      currentBalanceMinor,
+      "withdrawal",
+      input.amountMinor
+    );
+    if (!transitionResult.ok) {
+      if (transitionResult.reason === "unsafe_result") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Resulting balance is not a safe integer."
+        );
+      }
       throw new HttpsError(
         "failed-precondition",
         "Insufficient Shared Stash balance for this expense."
       );
     }
+    const newBalanceMinor = transitionResult.newBalanceMinor;
 
     // H. Persist all documents atomically - the Expense, its linked
     // withdrawal, and the Trip's cached ledger fields either all commit

@@ -2,6 +2,12 @@ import {FieldValue, Timestamp, getFirestore} from "firebase-admin/firestore";
 import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError, onCall} from "firebase-functions/v2/https";
 import type {CallableRequest} from "firebase-functions/v2/https";
+import {
+  applyLedgerTransition,
+  classifyLedgerInitialization,
+  deriveLegacyLedgerInitialization,
+  resolveEffectiveCurrency,
+} from "../domain/savingsLedger";
 
 type ResourceType = "bucket" | "trip";
 type SavingsTransactionType = "contribution" | "withdrawal";
@@ -201,43 +207,41 @@ export async function recordSavingsTransactionCore(
       );
     }
 
-    let effectiveCurrency = "USD";
-    if ("currency" in parentData) {
-      const parentCurrency = parentData.currency;
-      if (typeof parentCurrency !== "string" || parentCurrency.length === 0) {
+    // Checkpoint 4F.5: currency/ledger-state/transition interpretation is
+    // now delegated to the shared pure domain primitive
+    // (functions/src/domain/savingsLedger.ts), extracted from this exact
+    // logic per the approved docs/audits/
+    // TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md §4/§24. Every
+    // error code/message/ordering below is byte-for-byte identical to
+    // this callable's own pre-extraction behavior - only WHERE the
+    // interpretation happens moved, never WHAT it decides.
+    const currencyResult = resolveEffectiveCurrency(parentData, input.currency);
+    if (!currencyResult.ok) {
+      if (currencyResult.reason === "malformed_parent_currency") {
         throw new HttpsError(
           "failed-precondition",
           "Parent resource has a malformed currency field."
         );
       }
-      effectiveCurrency = parentCurrency;
-    }
-    if (input.currency !== effectiveCurrency) {
       throw new HttpsError(
         "failed-precondition",
-        `currency must match the resource's currency (${effectiveCurrency}).`
+        "currency must match the resource's currency " +
+          `(${currencyResult.effectiveCurrency}).`
       );
     }
-
-    const hasOpening = "ledgerOpeningBalanceMinor" in parentData;
-    const hasBalance = "ledgerBalanceMinor" in parentData;
 
     let currentBalanceMinor: number;
     let initOpeningMinor: number | null = null;
 
-    if (hasOpening && hasBalance) {
-      const opening = parentData.ledgerOpeningBalanceMinor;
-      const balance = parentData.ledgerBalanceMinor;
-      const openingValid = Number.isSafeInteger(opening) && opening >= 0;
-      const balanceValid = Number.isSafeInteger(balance) && balance >= 0;
-      if (!openingValid || !balanceValid) {
-        throw new HttpsError(
-          "failed-precondition",
-          "Parent resource has an invalid trusted ledger state."
-        );
-      }
-      currentBalanceMinor = balance;
-    } else if (!hasOpening && !hasBalance) {
+    const initState = classifyLedgerInitialization(parentData);
+    if (initState.kind === "initialized") {
+      currentBalanceMinor = initState.currentBalanceMinor;
+    } else if (initState.kind === "invalid_initialized_state") {
+      throw new HttpsError(
+        "failed-precondition",
+        "Parent resource has an invalid trusted ledger state."
+      );
+    } else if (initState.kind === "uninitialized") {
       // Uninitialized resource - guard against ambiguous prior history
       // before inventing an opening balance.
       const historySnap = await tx.get(historyQuery);
@@ -252,24 +256,23 @@ export async function recordSavingsTransactionCore(
       const legacyDollars = input.resourceType === "bucket" ?
         parentData.balance :
         (parentData.saved ?? 0);
-      const legacyValid = typeof legacyDollars === "number" &&
-        Number.isFinite(legacyDollars) && legacyDollars >= 0;
-      if (!legacyValid) {
-        throw new HttpsError(
-          "failed-precondition",
-          "Parent resource has an invalid legacy compatibility balance."
-        );
-      }
-      const legacyMinor = Math.round(legacyDollars * 100);
-      if (!Number.isSafeInteger(legacyMinor)) {
+      const legacyResult = deriveLegacyLedgerInitialization(legacyDollars);
+      if (!legacyResult.ok) {
+        if (legacyResult.reason === "invalid_legacy_value") {
+          throw new HttpsError(
+            "failed-precondition",
+            "Parent resource has an invalid legacy compatibility balance."
+          );
+        }
         throw new HttpsError(
           "failed-precondition",
           "Legacy compatibility balance is too large to convert safely."
         );
       }
-      currentBalanceMinor = legacyMinor;
-      initOpeningMinor = legacyMinor;
+      currentBalanceMinor = legacyResult.currentBalanceMinor;
+      initOpeningMinor = legacyResult.initOpeningMinor;
     } else {
+      // partial_corrupt
       throw new HttpsError(
         "failed-precondition",
         "Parent resource has a partial/corrupt ledger initialization " +
@@ -277,21 +280,24 @@ export async function recordSavingsTransactionCore(
       );
     }
 
-    const signedDelta =
-      input.type === "contribution" ? input.amountMinor : -input.amountMinor;
-    const newBalanceMinor = currentBalanceMinor + signedDelta;
-    if (!Number.isSafeInteger(newBalanceMinor)) {
-      throw new HttpsError(
-        "failed-precondition",
-        "Resulting balance is not a safe integer."
-      );
-    }
-    if (newBalanceMinor < 0) {
+    const transitionResult = applyLedgerTransition(
+      currentBalanceMinor,
+      input.type,
+      input.amountMinor
+    );
+    if (!transitionResult.ok) {
+      if (transitionResult.reason === "unsafe_result") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Resulting balance is not a safe integer."
+        );
+      }
       throw new HttpsError(
         "failed-precondition",
         "Insufficient balance for this withdrawal."
       );
     }
+    const newBalanceMinor = transitionResult.newBalanceMinor;
 
     const transactionData: Record<string, unknown> = {
       resourceType: input.resourceType,
