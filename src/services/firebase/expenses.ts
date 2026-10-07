@@ -851,6 +851,11 @@ export async function reverseTripExpense(
 // no paymentSource/sharedStashTransactionId/createdBy - every one of
 // those is server-derived and this type simply has no way to carry a
 // client-supplied value for any of them.
+// Checkpoint 4F.4A: replacesExpenseId identifies the OLD (already-
+// reversed) Shared-Stash Expense this new Expense corrects/replaces -
+// mirrors RecordTripExpenseInput's own identical field exactly. Omitted
+// for ordinary (non-correction) creation. NOT replacedByExpenseId - that
+// field is trusted server output only and is never client-suppliable.
 export type RecordSharedStashExpenseInput = {
   tripId: string;
   amountMinor: number;
@@ -859,6 +864,7 @@ export type RecordSharedStashExpenseInput = {
   category?: string;
   occurredAt?: Date;
   clientRequestId: string;
+  replacesExpenseId?: string;
 };
 
 type RecordSharedStashExpenseRequest = {
@@ -869,6 +875,7 @@ type RecordSharedStashExpenseRequest = {
   category?: string;
   occurredAt?: string;
   clientRequestId: string;
+  replacesExpenseId?: string;
 };
 
 // Pure request-shaping, exported for direct testing without any Firebase
@@ -886,6 +893,9 @@ export function buildRecordSharedStashExpenseRequest(
   };
   if (input.category !== undefined) {
     request.category = input.category;
+  }
+  if (input.replacesExpenseId !== undefined) {
+    request.replacesExpenseId = input.replacesExpenseId;
   }
   if (input.occurredAt !== undefined) {
     if (Number.isNaN(input.occurredAt.getTime())) {

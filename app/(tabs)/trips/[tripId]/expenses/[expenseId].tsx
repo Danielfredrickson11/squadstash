@@ -30,6 +30,7 @@ import {
   fetchExpenseById,
   fetchExpenseSplitsForExpense,
   generateExpenseClientRequestId,
+  reverseSharedStashExpense,
   reverseTripExpense,
   subscribeToExpenseById,
 } from "../../../../../src/services/firebase/expenses";
@@ -41,6 +42,7 @@ import {
   normalizeReversalReason,
   reduceReversalOutcome,
   resolveExpenseReversalClientRequestId,
+  selectReversalCallableKind,
   type ExpenseReversalFacts,
   type PendingExpenseReversalRequest,
   type ReversalOutcomeResult,
@@ -77,6 +79,27 @@ function reversalErrorMessage(e: unknown, knownAlreadyReversed: boolean): string
       return "We couldn't reach the server, so we can't confirm this went through — it's safe to try again.";
     default:
       return "We couldn't reach the server, so we can't confirm this went through — it's safe to try again.";
+  }
+}
+
+// Checkpoint 4F.4 §10: routes to the trusted callable that matches the
+// Expense's OWN persisted paymentSource - never reverseTripExpense for a
+// Shared-Stash Expense (which would never refund the Shared Stash
+// ledger) and never reverseSharedStashExpense for a member-funded one.
+// The backend already rejects a misrouted call (Checkpoint 4F.2A's own
+// wrong-callable guard), but the client selects correctly too so a
+// Shared Stash reversal doesn't surface a confusing rejection instead of
+// actually reversing. Both callables resolve to a compatible
+// `{expenseId: string}`-shaped success; this function's only job is
+// picking the right one, never interpreting the result.
+async function callReversalForExpense(
+  callableKind: ReturnType<typeof selectReversalCallableKind>,
+  payload: { expenseId: string; reversalReason?: string; clientRequestId: string }
+): Promise<void> {
+  if (callableKind === "shared_stash") {
+    await reverseSharedStashExpense(payload);
+  } else {
+    await reverseTripExpense(payload);
   }
 }
 
@@ -501,7 +524,16 @@ export default function ExpenseDetailScreen() {
         setReverseDialogVisible(false);
         setReversalSubmitError(null);
         setVerifyError(null);
-        announceExpenseSuccess("Expense reversed.");
+        // Checkpoint 4F.4 §10: names the Shared Stash refund explicitly
+        // rather than a generic "Expense reversed." - and never as
+        // restoring an old historical balance (the refund is always
+        // applied against the CURRENT balance at reversal time, per the
+        // approved preflight §13).
+        const latest = expenseStateRef.current;
+        const isSharedStash = latest.status === "ready" && latest.expense.paymentSource === "shared_stash";
+        announceExpenseSuccess(
+          isSharedStash ? "Expense reversed — the amount was returned to the Shared Stash." : "Expense reversed."
+        );
       } else if (result.action === "reversed_by_other") {
         pendingReversalRef.current = null;
         setHasPendingReversal(false);
@@ -639,15 +671,16 @@ export default function ExpenseDetailScreen() {
     setReversalSubmitError(null);
 
     try {
-      await reverseTripExpense({
+      await callReversalForExpense(selectReversalCallableKind(expense.paymentSource), {
         expenseId: facts.expenseId,
         ...(facts.reversalReason !== undefined ? { reversalReason: facts.reversalReason } : {}),
         clientRequestId,
       });
       if (!isMountedRef.current) return;
       // The existing live Expense subscription independently reconciles
-      // the real persisted Reversed status/reversedAt/reversalReason -
-      // no optimistic/fabricated mutation is ever applied here.
+      // the real persisted Reversed status/reversedAt/reversalReason (and,
+      // for a Shared-Stash Expense, the refund's own effect on the Trip's
+      // ledger) - no optimistic/fabricated mutation is ever applied here.
       applyReversalOutcome(reduceReversalOutcome({ type: "callable_success" }, true));
     } catch (e) {
       if (!isMountedRef.current) return;
@@ -674,13 +707,20 @@ export default function ExpenseDetailScreen() {
     if (reversalInFlightRef.current) return;
     const pending = pendingReversalRef.current;
     if (!pending) return;
+    // paymentSource is immutable once an Expense is created, so reading
+    // it from whatever snapshot is freshest right now (never from a
+    // stale closure) is always correct - this mirrors
+    // classifyReversalFailure's own use of expenseStateRef exactly.
+    const latest = expenseStateRef.current;
+    if (latest.status !== "ready") return;
+    const callableKind = selectReversalCallableKind(latest.expense.paymentSource);
 
     reversalInFlightRef.current = true;
     setVerifying(true);
     setVerifyError(null);
 
     try {
-      await reverseTripExpense({
+      await callReversalForExpense(callableKind, {
         expenseId: pending.expenseId,
         ...(pending.reversalReason !== undefined ? { reversalReason: pending.reversalReason } : {}),
         clientRequestId: pending.clientRequestId,
@@ -821,11 +861,18 @@ export default function ExpenseDetailScreen() {
 
                 <DetailFieldRow label="Date" value={timestampText} colors={colors} />
                 <DetailFieldRow label="Category" value={categoryText} colors={colors} />
-                <DetailFieldRow
-                  label="Split strategy"
-                  value={SPLIT_STRATEGY_LABELS[expense.splitStrategy]}
-                  colors={colors}
-                />
+                {/* Checkpoint 4F.4 §9: a Shared-Stash Expense has no
+                    splits at all (the group fund paid in full) - showing
+                    a "Split strategy" value here would be a meaningless
+                    residual field implying debt/participants that don't
+                    exist. */}
+                {expense.paymentSource === "member_out_of_pocket" ? (
+                  <DetailFieldRow
+                    label="Split strategy"
+                    value={SPLIT_STRATEGY_LABELS[expense.splitStrategy]}
+                    colors={colors}
+                  />
+                ) : null}
 
                 {isReversed ? (
                   <View style={styles.reversalWrap}>
@@ -857,6 +904,12 @@ export default function ExpenseDetailScreen() {
                   </View>
                 ) : null}
 
+                {/* Checkpoint 4F.4 §9: zero tripExpenseSplits ever exist
+                    for a Shared-Stash Expense, so this whole section is
+                    omitted rather than rendering an empty "Split
+                    breakdown" header for nothing. */}
+                {expense.paymentSource === "member_out_of_pocket" ? (
+                  <>
                 <Text style={[styles.sectionLabel, { color: colors.textSecondary }]}>
                   Split breakdown
                 </Text>
@@ -906,6 +959,8 @@ export default function ExpenseDetailScreen() {
                     })}
                   </View>
                 )}
+                  </>
+                ) : null}
 
                 {expense.replacesExpenseId || expense.replacedByExpenseId ? (
                   <>
@@ -1068,6 +1123,7 @@ export default function ExpenseDetailScreen() {
         onCancel={closeReverseDialog}
         onConfirm={handleConfirmReverse}
         colors={colors}
+        isSharedStash={expense.paymentSource === "shared_stash"}
       />
     ) : null}
     </>

@@ -7,6 +7,7 @@
 // same precedent src/domain/expenseSubmission.ts already followed for
 // Add Expense.
 import { deriveCurrentMemberUids } from "./expenseSubmission";
+import type { ExpensePaymentSource } from "../types/domain";
 
 // ---------------------------------------------------------------------
 // REASON NORMALIZATION (reversal preflight §8.2/§14)
@@ -79,6 +80,28 @@ export function resolveExpenseReversalClientRequestId(
   const clientRequestId = generateClientRequestId();
   pendingRef.current = { ...facts, clientRequestId };
   return clientRequestId;
+}
+
+// ---------------------------------------------------------------------
+// REVERSAL CALLABLE ROUTING (Checkpoint 4F.4)
+// ---------------------------------------------------------------------
+//
+// Which trusted callable must reverse a given Expense is determined
+// ENTIRELY by its own persisted paymentSource - never inferred,
+// defaulted, or left to the caller to track separately. A
+// "member_out_of_pocket" Expense must go through reverseTripExpense; a
+// "shared_stash" Expense must go through reverseSharedStashExpense
+// (which also atomically refunds the Shared Stash ledger - something
+// reverseTripExpense never does). The backend itself already rejects a
+// misrouted call (Checkpoint 4F.2A's own wrong-callable guard), but the
+// client must still select correctly so a Shared Stash reversal doesn't
+// surface a confusing rejection instead of actually reversing.
+export type ReversalCallableKind = "member_out_of_pocket" | "shared_stash";
+
+export function selectReversalCallableKind(
+  paymentSource: ExpensePaymentSource
+): ReversalCallableKind {
+  return paymentSource === "shared_stash" ? "shared_stash" : "member_out_of_pocket";
 }
 
 // ---------------------------------------------------------------------

@@ -3,6 +3,7 @@ import {
   canonicalizeCustomParticipants,
   canonicalizeEqualParticipants,
   canonicalizePercentageParticipants,
+  checkSharedStashAvailableBalance,
   defaultParticipantSelection,
   deriveCurrentMemberUids,
   expenseCreationFactsEqual,
@@ -10,11 +11,17 @@ import {
   parseExpenseShareMoneyInput,
   parsePercentageToBasisPoints,
   resolveExpenseClientRequestId,
+  resolveSharedStashCorrectionAvailableBalanceMinor,
+  resolveSharedStashExpenseClientRequestId,
+  sharedStashExpenseCreationFactsEqual,
+  sharedStashExpenseErrorMessage,
   sumSafeIntegers,
   validateExpenseCategory,
   validateExpenseDescription,
   type ExpenseCreationFacts,
   type PendingExpenseCreationRequest,
+  type PendingSharedStashExpenseCreationRequest,
+  type SharedStashExpenseCreationFacts,
 } from "../expenseSubmission";
 
 // =======================================================================
@@ -909,5 +916,271 @@ describe("resolveExpenseClientRequestId across split strategies", () => {
     const first = resolveExpenseClientRequestId(pendingRef, facts, generator);
     const second = resolveExpenseClientRequestId(pendingRef, changed, generator);
     expect(second).not.toBe(first);
+  });
+});
+
+// =======================================================================
+// SHARED-STASH EXPENSE CREATION FACTS / IDEMPOTENCY (Checkpoint 4F.4)
+// =======================================================================
+
+function baseSharedStashFacts(
+  overrides: Partial<SharedStashExpenseCreationFacts> = {}
+): SharedStashExpenseCreationFacts {
+  return {
+    tripId: "trip-1",
+    amountMinor: 2000,
+    currency: "USD",
+    description: "Groceries",
+    category: null,
+    replacesExpenseId: null,
+    occurredAtInstantMs: null,
+    ...overrides,
+  };
+}
+
+describe("sharedStashExpenseCreationFactsEqual", () => {
+  it("is true for identical facts", () => {
+    expect(sharedStashExpenseCreationFactsEqual(baseSharedStashFacts(), baseSharedStashFacts())).toBe(
+      true
+    );
+  });
+
+  it.each([
+    ["tripId", { tripId: "trip-2" }],
+    ["amountMinor", { amountMinor: 500 }],
+    ["description", { description: "Taxi" }],
+    ["category", { category: "Food" }],
+    ["replacesExpenseId", { replacesExpenseId: "old-expense-1" }],
+    ["occurredAtInstantMs", { occurredAtInstantMs: 1700000000000 }],
+  ] as const)("is false when %s differs", (_label, override) => {
+    expect(
+      sharedStashExpenseCreationFactsEqual(baseSharedStashFacts(), baseSharedStashFacts(override))
+    ).toBe(false);
+  });
+});
+
+describe("resolveSharedStashExpenseClientRequestId", () => {
+  function makeGenerator() {
+    let counter = 0;
+    return () => `shared-stash-generated-${++counter}`;
+  }
+
+  it("generates a fresh id on first use and retains it as pending", () => {
+    const pendingRef = { current: null as PendingSharedStashExpenseCreationRequest | null };
+    const id = resolveSharedStashExpenseClientRequestId(
+      pendingRef,
+      baseSharedStashFacts(),
+      makeGenerator()
+    );
+    expect(id).toBe("shared-stash-generated-1");
+    expect(pendingRef.current?.clientRequestId).toBe("shared-stash-generated-1");
+  });
+
+  it("reuses the same id when the facts are unchanged (retry)", () => {
+    const generator = makeGenerator();
+    const pendingRef = { current: null as PendingSharedStashExpenseCreationRequest | null };
+    const first = resolveSharedStashExpenseClientRequestId(pendingRef, baseSharedStashFacts(), generator);
+    const second = resolveSharedStashExpenseClientRequestId(pendingRef, baseSharedStashFacts(), generator);
+    expect(second).toBe(first);
+  });
+
+  it("mints a fresh id when amountMinor genuinely changes (a new Expense attempt)", () => {
+    const generator = makeGenerator();
+    const pendingRef = { current: null as PendingSharedStashExpenseCreationRequest | null };
+    const first = resolveSharedStashExpenseClientRequestId(pendingRef, baseSharedStashFacts(), generator);
+    const second = resolveSharedStashExpenseClientRequestId(
+      pendingRef,
+      baseSharedStashFacts({ amountMinor: 5000 }),
+      generator
+    );
+    expect(second).not.toBe(first);
+  });
+
+  it("mints a fresh id when the description changes", () => {
+    const generator = makeGenerator();
+    const pendingRef = { current: null as PendingSharedStashExpenseCreationRequest | null };
+    const first = resolveSharedStashExpenseClientRequestId(pendingRef, baseSharedStashFacts(), generator);
+    const second = resolveSharedStashExpenseClientRequestId(
+      pendingRef,
+      baseSharedStashFacts({ description: "Taxi" }),
+      generator
+    );
+    expect(second).not.toBe(first);
+  });
+
+  it("mints a fresh id when the category changes", () => {
+    const generator = makeGenerator();
+    const pendingRef = { current: null as PendingSharedStashExpenseCreationRequest | null };
+    const first = resolveSharedStashExpenseClientRequestId(pendingRef, baseSharedStashFacts(), generator);
+    const second = resolveSharedStashExpenseClientRequestId(
+      pendingRef,
+      baseSharedStashFacts({ category: "Food" }),
+      generator
+    );
+    expect(second).not.toBe(first);
+  });
+
+  it("mints a fresh id when the tripId changes", () => {
+    const generator = makeGenerator();
+    const pendingRef = { current: null as PendingSharedStashExpenseCreationRequest | null };
+    const first = resolveSharedStashExpenseClientRequestId(pendingRef, baseSharedStashFacts(), generator);
+    const second = resolveSharedStashExpenseClientRequestId(
+      pendingRef,
+      baseSharedStashFacts({ tripId: "trip-2" }),
+      generator
+    );
+    expect(second).not.toBe(first);
+  });
+
+  it("mints a fresh id when replacesExpenseId changes (Checkpoint 4F.4A correction)", () => {
+    const generator = makeGenerator();
+    const pendingRef = { current: null as PendingSharedStashExpenseCreationRequest | null };
+    const first = resolveSharedStashExpenseClientRequestId(pendingRef, baseSharedStashFacts(), generator);
+    const second = resolveSharedStashExpenseClientRequestId(
+      pendingRef,
+      baseSharedStashFacts({ replacesExpenseId: "old-expense-1" }),
+      generator
+    );
+    expect(second).not.toBe(first);
+  });
+
+  it("reuses the same id for an identical correction retry (same replacesExpenseId)", () => {
+    const generator = makeGenerator();
+    const pendingRef = { current: null as PendingSharedStashExpenseCreationRequest | null };
+    const facts = baseSharedStashFacts({ replacesExpenseId: "old-expense-1" });
+    const first = resolveSharedStashExpenseClientRequestId(pendingRef, facts, generator);
+    const second = resolveSharedStashExpenseClientRequestId(pendingRef, { ...facts }, generator);
+    expect(second).toBe(first);
+  });
+});
+
+// =======================================================================
+// SHARED-STASH EXPENSE ERROR MAPPING (Checkpoint 4F.4)
+// =======================================================================
+
+describe("sharedStashExpenseErrorMessage", () => {
+  it("maps insufficient-funds failed-precondition to a specific, friendly message", () => {
+    const error = { code: "functions/failed-precondition", message: "Insufficient Shared Stash balance for this expense." };
+    expect(sharedStashExpenseErrorMessage(error, false)).toBe(
+      "There isn't enough money in the Shared Stash for this expense."
+    );
+  });
+
+  it("matches the insufficient-funds message case-insensitively", () => {
+    const error = { code: "functions/failed-precondition", message: "INSUFFICIENT funds." };
+    expect(sharedStashExpenseErrorMessage(error, false)).toBe(
+      "There isn't enough money in the Shared Stash for this expense."
+    );
+  });
+
+  it("maps a non-insufficient-funds failed-precondition on an archived Trip to the archived-Trip message", () => {
+    const error = { code: "functions/failed-precondition", message: "This trip is archived and no longer accepts new expenses." };
+    expect(sharedStashExpenseErrorMessage(error, true)).toBe(
+      "This trip is archived and no longer accepts new expenses."
+    );
+  });
+
+  it("maps a non-insufficient-funds failed-precondition on a non-archived Trip to the generic retry message", () => {
+    const error = { code: "functions/failed-precondition", message: "Trip has a partial/corrupt ledger initialization state." };
+    expect(sharedStashExpenseErrorMessage(error, false)).toBe(
+      "We couldn't save this expense because its trip or member information changed. Refresh and try again."
+    );
+  });
+
+  it("maps permission-denied without exposing any backend detail", () => {
+    const error = { code: "functions/permission-denied", message: "You must be a current member of this Trip to record an expense." };
+    expect(sharedStashExpenseErrorMessage(error, false)).toBe("You don't have permission to do that.");
+  });
+
+  it("maps invalid-argument", () => {
+    expect(sharedStashExpenseErrorMessage({ code: "functions/invalid-argument" }, false)).toBe(
+      "That information isn't valid — please check and try again."
+    );
+  });
+
+  it("maps not-found", () => {
+    expect(sharedStashExpenseErrorMessage({ code: "functions/not-found" }, false)).toBe(
+      "This expense or trip could not be found."
+    );
+  });
+
+  it("maps already-exists", () => {
+    expect(sharedStashExpenseErrorMessage({ code: "functions/already-exists" }, false)).toBe(
+      "We couldn't safely reconcile this expense request. Review it and try again."
+    );
+  });
+
+  it.each(["functions/unavailable", "functions/deadline-exceeded"])(
+    "maps an ambiguous transport failure (%s) to a safe-to-retry message",
+    (code) => {
+      expect(sharedStashExpenseErrorMessage({ code }, false)).toBe(
+        "We couldn't reach the server, so we can't confirm this went through — it's safe to try again."
+      );
+    }
+  );
+
+  it("maps an unknown/unexpected error without exposing it, rather than swallowing it silently", () => {
+    const error = new Error("some internal backend stack trace detail");
+    expect(sharedStashExpenseErrorMessage(error, false)).toBe(
+      "We couldn't reach the server, so we can't confirm this went through — it's safe to try again."
+    );
+  });
+
+  it("never echoes the raw backend error message in its returned string", () => {
+    const rawMessage = "Trip has an unusual internal diagnostic marker XYZ123";
+    const error = { code: "functions/failed-precondition", message: rawMessage };
+    expect(sharedStashExpenseErrorMessage(error, false)).not.toContain("XYZ123");
+  });
+});
+
+// =======================================================================
+// SHARED-STASH ADVISORY INSUFFICIENT-FUNDS CHECK (Checkpoint 4F.4B)
+// =======================================================================
+
+describe("checkSharedStashAvailableBalance", () => {
+  it("11. allows an amount equal to or less than the available balance", () => {
+    expect(checkSharedStashAvailableBalance(2000, 2000)).toEqual({ ok: true });
+    expect(checkSharedStashAvailableBalance(1000, 2000)).toEqual({ ok: true });
+  });
+
+  it("12. blocks an amount greater than the available balance", () => {
+    const result = checkSharedStashAvailableBalance(2001, 2000);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("There isn't enough money in the Shared Stash for this expense.");
+    }
+  });
+
+  it("never fabricates a balance - a null (unknown/loading) balance always allows the request to proceed", () => {
+    expect(checkSharedStashAvailableBalance(999999999, null)).toEqual({ ok: true });
+  });
+
+  it("allows an amount of exactly zero gap (amount === available) at the boundary", () => {
+    expect(checkSharedStashAvailableBalance(5000, 5000)).toEqual({ ok: true });
+  });
+});
+
+describe("resolveSharedStashCorrectionAvailableBalanceMinor", () => {
+  it("credits the original Expense amount back when the original is still active (reversal has not run yet)", () => {
+    expect(resolveSharedStashCorrectionAvailableBalanceMinor(8000, "active", 2000)).toBe(10000);
+  });
+
+  it("does NOT credit anything when the original is already reversed (the credit already happened)", () => {
+    expect(resolveSharedStashCorrectionAvailableBalanceMinor(10000, "reversed", 2000)).toBe(10000);
+  });
+
+  it("never fabricates a balance - passes null through unchanged regardless of status", () => {
+    expect(resolveSharedStashCorrectionAvailableBalanceMinor(null, "active", 2000)).toBeNull();
+    expect(resolveSharedStashCorrectionAvailableBalanceMinor(null, "reversed", 2000)).toBeNull();
+  });
+});
+
+describe("checkSharedStashAvailableBalance + resolveSharedStashCorrectionAvailableBalanceMinor together (correction scenario)", () => {
+  it("17. a correction that increases the amount is blocked once it exceeds the post-reversal available balance", () => {
+    // Current balance 8000 (the original $20 withdrawal already applied),
+    // original amount 2000 -> post-reversal available = 10000.
+    const available = resolveSharedStashCorrectionAvailableBalanceMinor(8000, "active", 2000);
+    expect(checkSharedStashAvailableBalance(10000, available)).toEqual({ ok: true });
+    expect(checkSharedStashAvailableBalance(10001, available).ok).toBe(false);
   });
 });

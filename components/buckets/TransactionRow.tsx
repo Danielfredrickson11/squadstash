@@ -4,18 +4,43 @@
 // touches Firestore itself. Deliberately shows only type/amount/
 // timestamp/note: no document id, clientRequestId, recordedBy, or
 // memberUid is rendered (see the checkpoint's field-exposure limits).
+//
+// Checkpoint 4F.4A: the "Contribution"/"Withdrawal" label itself is now
+// resolved via resolveSavingsTransactionLabel (src/domain/
+// savingsTransactionAttribution.ts) rather than a bare type check inline
+// - when the transaction carries linkedExpenseId (Shared-Stash Expense
+// activity), it renders as "Spent on <description>"/"Refunded from
+// <description>" (or a safe institutional fallback) instead, and NEVER
+// as personal member attribution. No Bucket transaction carries
+// linkedExpenseId today (Expenses are Trip-only), so every existing call
+// site's rendering is completely unchanged.
 import React from "react";
 import { StyleSheet, View } from "react-native";
 import { Text, useTheme } from "react-native-paper";
 
+import { resolveSavingsTransactionLabel } from "../../src/domain/savingsTransactionAttribution";
 import type { SavingsTransaction } from "../../src/types/domain";
 import { formatCurrency, formatTransactionTimestamp } from "../../utils/format";
 
-export function TransactionRow({ transaction }: { transaction: SavingsTransaction }) {
+export function TransactionRow({
+  transaction,
+  // Checkpoint 4F.4A: the linked Expense's own description, when this
+  // transaction carries a linkedExpenseId - resolved by the CALLER
+  // (never fetched here), matching this component's own existing "no
+  // Firestore reads" discipline. Every existing call site omits this
+  // (undefined), so ordinary personal contribution/withdrawal rendering
+  // is completely unchanged - this prop only ever affects a transaction
+  // that actually carries linkedExpenseId, which no Bucket transaction
+  // ever does today.
+  linkedExpenseDescription,
+}: {
+  transaction: SavingsTransaction;
+  linkedExpenseDescription?: string | null;
+}) {
   const theme = useTheme();
 
   const isContribution = transaction.type === "contribution";
-  const label = isContribution ? "Contribution" : "Withdrawal";
+  const label = resolveSavingsTransactionLabel(transaction, linkedExpenseDescription);
   const sign = isContribution ? "+" : "-";
   const amountColor = isContribution ? theme.colors.primary : theme.colors.error;
   // amountMinor is an integer minor-unit value (5000 = $50.00) - dividing

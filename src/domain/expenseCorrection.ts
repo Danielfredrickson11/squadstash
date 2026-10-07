@@ -332,6 +332,62 @@ export function buildCorrectionPrefill(
 }
 
 // ---------------------------------------------------------------------
+// SHARED-STASH CORRECTION PREFILL (Checkpoint 4F.4A, per the approved
+// docs/audits/TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md §15) -
+// the Shared-Stash analogue of buildCorrectionPrefill above. Deliberately
+// a SEPARATE, smaller function rather than a branch inside
+// buildCorrectionPrefill: a Shared-Stash original has no payer, no
+// participants, no split strategy/debt data to validate or prefill at
+// all - the group fund paid in full, so there is nothing resembling
+// buildCorrectionPrefill's own Split-integrity cross-checks to perform.
+// ---------------------------------------------------------------------
+
+export type SharedStashCorrectionPrefillData = {
+  description: string;
+  amountMinor: number;
+  amountText: string;
+  category: string;
+  occurredAtInstantMs: number | null;
+};
+
+export type SharedStashCorrectionPrefillResult =
+  | { ok: true; data: SharedStashCorrectionPrefillData }
+  | { ok: false; error: string };
+
+export function buildSharedStashCorrectionPrefill(
+  oldExpense: CorrectionSourceExpense
+): SharedStashCorrectionPrefillResult {
+  // This function's own scope is "existing Shared-Stash Trip Expenses"
+  // only - a member_out_of_pocket original must go through
+  // buildCorrectionPrefill above instead, mirroring that function's own
+  // reciprocal payment-source guard exactly, never silently cross-
+  // prefilling the wrong shape.
+  if (oldExpense.paymentSource !== "shared_stash") {
+    return {
+      ok: false,
+      error: "This expense was paid by a member and can't be corrected here.",
+    };
+  }
+  if (oldExpense.payerUid !== null) {
+    return {
+      ok: false,
+      error: "This expense has unexpected payer information and can't be corrected.",
+    };
+  }
+
+  return {
+    ok: true,
+    data: {
+      description: oldExpense.description,
+      amountMinor: oldExpense.amountMinor,
+      amountText: formatMinorUnitsForInput(oldExpense.amountMinor),
+      category: oldExpense.category ?? "",
+      occurredAtInstantMs: oldExpense.occurredAtInstantMs,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------
 // TWO-STEP MUTATION PHASE (Checkpoint 4D.7A §5) - the smallest pure
 // extraction of the correction confirm handler's own step-skipping
 // contract, proven here without mocking React/Firebase. The actual

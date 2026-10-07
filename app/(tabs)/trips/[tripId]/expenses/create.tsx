@@ -19,6 +19,7 @@ import { BAR_HEIGHT, CENTER_BUTTON_SIZE } from "../../../../../components/naviga
 import { initialsFromName } from "../../../../../components/buckets/AvatarCircle";
 import {
   AddExpenseForm,
+  type ExpensePaymentSourceValue,
   type MemberOption,
   type SplitStrategyValue,
 } from "../../../../../components/expenses/AddExpenseForm";
@@ -32,7 +33,9 @@ import {
   fetchExpenseById,
   fetchExpenseSplitsForExpense,
   generateExpenseClientRequestId,
+  recordSharedStashExpense,
   recordTripExpense,
+  reverseSharedStashExpense,
   reverseTripExpense,
   type RecordTripExpenseInput,
 } from "../../../../../src/services/firebase/expenses";
@@ -42,21 +45,28 @@ import {
   canonicalizeCustomParticipants,
   canonicalizeEqualParticipants,
   canonicalizePercentageParticipants,
+  checkSharedStashAvailableBalance,
   defaultParticipantSelection,
   deriveCurrentMemberUids,
   parseExpenseMoneyInput,
   parseExpenseShareMoneyInput,
   parsePercentageToBasisPoints,
   resolveExpenseClientRequestId,
+  resolveSharedStashCorrectionAvailableBalanceMinor,
+  resolveSharedStashExpenseClientRequestId,
+  sharedStashExpenseErrorMessage,
   sumSafeIntegers,
   validateExpenseCategory,
   validateExpenseDescription,
   type ExpenseCreationFacts,
   type PendingExpenseCreationRequest,
+  type PendingSharedStashExpenseCreationRequest,
+  type SharedStashExpenseCreationFacts,
 } from "../../../../../src/domain/expenseSubmission";
 import {
   CORRECTION_REVERSAL_REASON,
   buildCorrectionPrefill,
+  buildSharedStashCorrectionPrefill,
   canClaimCorrection,
   initialCorrectionPhase,
   partitionParticipantsByEligibility,
@@ -271,6 +281,15 @@ export default function AddExpenseScreen() {
 
   const isArchived = tripState.status === "ready" && !!tripState.trip.archivedAt;
 
+  // Checkpoint 4F.4 §5: surfaces the Trip's ALREADY-authoritative Shared
+  // Stash balance (never a second, independently-computed total) near the
+  // Shared Stash payment option. The backend remains the sole authority
+  // for insufficient-funds enforcement regardless of what this displays.
+  const sharedStashAvailableMinor =
+    tripState.status === "ready" && typeof tripState.trip.saved === "number"
+      ? Math.round(tripState.trip.saved * 100)
+      : null;
+
   // Current Trip-member set (§8): ownerId UNION memberIds, deduped,
   // malformed/empty ids ignored. Never a security boundary - the backend
   // remains authoritative regardless of this client-side derivation.
@@ -324,6 +343,15 @@ export default function AddExpenseScreen() {
 
   const oldExpense = oldExpenseState.status === "ready" ? oldExpenseState.expense : null;
 
+  // Checkpoint 4F.4A, per the approved docs/audits/
+  // TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md §15: whether THIS
+  // correction is replacing a Shared-Stash-funded original - the SOLE
+  // discriminant the correction submit/confirm logic below branches on
+  // (never the `paymentSource` form-state variable, which only exists to
+  // drive AddExpenseForm's own rendering and is set FROM this fact, never
+  // the other way around).
+  const isSharedStashCorrection = isCorrectionRoute && oldExpense?.paymentSource === "shared_stash";
+
   // Advisory-only correction-link authorization/state gating (§1/§27),
   // reusing the EXACT same pure logic Expense Detail uses to decide
   // whether to offer "Correct expense"/"Finish correction" in the first
@@ -351,9 +379,16 @@ export default function AddExpenseScreen() {
 
   // Pure prefill mapping (§3/§5/§26) - a VALIDATOR, never a repairer;
   // malformed persisted split data surfaces as an explicit error rather
-  // than a silently-guessed form.
+  // than a silently-guessed form. Checkpoint 4F.4A: only computed for a
+  // member_out_of_pocket original - a Shared-Stash original is handled
+  // entirely by sharedStashPrefillResult below instead, so this never
+  // runs buildCorrectionPrefill's own payment-source rejection against a
+  // Shared-Stash original at all (which would otherwise surface a
+  // confusing "can't be corrected here" error for a case that now IS
+  // supported, just via a different, smaller prefill function).
   const prefillResult = useMemo(() => {
     if (!oldExpense || oldExpenseState.status !== "ready") return null;
+    if (isSharedStashCorrection) return null;
 
     // Checkpoint 4D.7A §3: fail closed rather than silently truncating
     // any sub-millisecond precision a persisted occurredAt Timestamp
@@ -386,7 +421,24 @@ export default function AddExpenseScreen() {
       percentageBasisPoints: s.percentageBasisPoints,
     }));
     return buildCorrectionPrefill(sourceExpense, sourceSplits);
-  }, [oldExpense, oldExpenseState]);
+  }, [oldExpense, oldExpenseState, isSharedStashCorrection]);
+
+  // Checkpoint 4F.4A: the Shared-Stash analogue of prefillResult above -
+  // only computed when correcting a Shared-Stash original. No Splits are
+  // read/validated at all (none exist for this payment source).
+  const sharedStashPrefillResult = useMemo(() => {
+    if (!oldExpense || !isSharedStashCorrection) return null;
+    const sourceExpense: CorrectionSourceExpense = {
+      paymentSource: oldExpense.paymentSource,
+      payerUid: oldExpense.payerUid,
+      description: oldExpense.description,
+      amountMinor: oldExpense.amountMinor,
+      category: oldExpense.category,
+      splitStrategy: oldExpense.splitStrategy,
+      occurredAtInstantMs: oldExpense.occurredAt ? oldExpense.occurredAt.toMillis() : null,
+    };
+    return buildSharedStashCorrectionPrefill(sourceExpense);
+  }, [oldExpense, isSharedStashCorrection]);
 
   // Historical participants (§4) no longer among the CURRENT Trip member
   // set - never silently dropped/transferred. AddExpenseForm's own
@@ -497,6 +549,13 @@ export default function AddExpenseScreen() {
   const [description, setDescription] = useState("");
   const [amountText, setAmountText] = useState("");
   const [category, setCategory] = useState("");
+  // Checkpoint 4F.4: explicit payment-source choice, defaulting to the
+  // existing member-funded path - never inferred later from payerUid.
+  // Correction mode never shows this selector (AddExpenseForm's own
+  // showPaymentSourceSelector={false} below), so it simply stays at this
+  // default for the lifetime of a correction-route instance of this
+  // screen.
+  const [paymentSource, setPaymentSource] = useState<ExpensePaymentSourceValue>("member_out_of_pocket");
   const [payerUid, setPayerUid] = useState<string | null>(null);
   const [selectedParticipants, setSelectedParticipants] = useState<Set<string> | null>(null);
 
@@ -583,6 +642,39 @@ export default function AddExpenseScreen() {
     setCustomInputs(data.customInputs);
     correctionInitializedRef.current = true;
   }, [isCorrectionRoute, user, tripState, currentMemberUids, prefillResult, eligibilityPartition]);
+
+  // Checkpoint 4F.4A: the Shared-Stash analogue of the correction-mode
+  // initialization effect above - mirrors its own "exactly once, never
+  // clobbers later edits, requires a confirmed current member" discipline
+  // exactly, but prefills far less (no payer/participants/split strategy
+  // exist for this payment source). Forces `paymentSource` to
+  // "shared_stash" as part of this same one-time initialization - the
+  // correction flow locks the payment source to match the original;
+  // AddExpenseForm's own showPaymentSourceSelector={!isCorrectionRoute}
+  // already hides the selector, so the user never sees (or can change)
+  // this choice.
+  const sharedStashCorrectionInitializedRef = useRef(false);
+  useEffect(() => {
+    if (!isSharedStashCorrection) return;
+    if (sharedStashCorrectionInitializedRef.current) return;
+    if (!user) return;
+    if (tripState.status !== "ready") return;
+    if (!currentMemberUids.includes(user.uid)) return;
+    if (!sharedStashPrefillResult || !sharedStashPrefillResult.ok) return;
+
+    const { data } = sharedStashPrefillResult;
+    setDescription(data.description);
+    setAmountText(data.amountText);
+    setCategory(data.category);
+    setPaymentSource("shared_stash");
+    // No payer/participants/split strategy exist for this payment source
+    // - selectedParticipants is set to an empty, unused Set purely to
+    // clear this screen's own "Loading trip members…" render gate, which
+    // only exists for the member-funded path's own payer/participant
+    // selectors.
+    setSelectedParticipants(new Set());
+    sharedStashCorrectionInitializedRef.current = true;
+  }, [isSharedStashCorrection, user, tripState, currentMemberUids, sharedStashPrefillResult]);
 
   const changeSplitStrategy = useCallback(
     (next: SplitStrategyValue) => {
@@ -785,6 +877,7 @@ export default function AddExpenseScreen() {
   // mirroring src/hooks/useSavingsMoneyAction.tsx's submit() exactly.
   // ------------------------------------------------------------------
   const pendingRef = useRef<PendingExpenseCreationRequest | null>(null);
+  const pendingSharedStashRef = useRef<PendingSharedStashExpenseCreationRequest | null>(null);
   const inFlightRef = useRef(false);
 
   const handleSubmit = useCallback(async () => {
@@ -798,11 +891,139 @@ export default function AddExpenseScreen() {
     const descResult = validateExpenseDescription(description);
     const amountResult = parseExpenseMoneyInput(amountText);
     const categoryResult = validateExpenseCategory(category);
-    const participants = selectedParticipants ? Array.from(selectedParticipants) : [];
 
     setDescriptionError(descResult.ok ? null : descResult.error);
     setAmountError(amountResult.ok ? null : amountResult.error);
     setCategoryError(categoryResult.ok ? null : categoryResult.error);
+
+    // Checkpoint 4F.4A: Shared-Stash CORRECTION follows the exact same
+    // "hold validated facts, open the confirm dialog, the dialog's own
+    // Confirm triggers the actual reverse-then-create" pattern as the
+    // member-funded correction branch further below - never submitting
+    // directly from this validation pass. isSharedStashCorrection is
+    // derived from the OLD Expense's own persisted paymentSource, never
+    // from the `paymentSource` form-state variable.
+    if (isSharedStashCorrection) {
+      setParticipantsError(null);
+      if (!descResult.ok || !amountResult.ok || !categoryResult.ok) return;
+      if (!oldExpense) return;
+
+      // Checkpoint 4F.4B §2: advisory only - the backend remains
+      // authoritative. A correction's reversal step credits the original
+      // amount back FIRST, so the balance actually available to the
+      // replacement is the currently displayed balance PLUS that credit
+      // whenever the original hasn't been reversed yet (resolved by
+      // resolveSharedStashCorrectionAvailableBalanceMinor above).
+      const correctionAvailableMinor = resolveSharedStashCorrectionAvailableBalanceMinor(
+        sharedStashAvailableMinor,
+        oldExpense.status,
+        oldExpense.amountMinor
+      );
+      const balanceCheck = checkSharedStashAvailableBalance(
+        amountResult.amountMinor,
+        correctionAvailableMinor
+      );
+      if (!balanceCheck.ok) {
+        setSubmitError(balanceCheck.error);
+        return;
+      }
+
+      const sharedStashCorrectionFacts: SharedStashExpenseCreationFacts = {
+        tripId,
+        amountMinor: amountResult.amountMinor,
+        currency: "USD",
+        description: descResult.value,
+        category: categoryResult.value,
+        replacesExpenseId: oldExpense.id,
+        occurredAtInstantMs:
+          sharedStashPrefillResult && sharedStashPrefillResult.ok
+            ? sharedStashPrefillResult.data.occurredAtInstantMs
+            : null,
+      };
+      pendingSharedStashCorrectionFactsRef.current = sharedStashCorrectionFacts;
+      setCorrectionSubmitError(null);
+      setCorrectDialogVisible(true);
+      return;
+    }
+
+    // Checkpoint 4F.4: the Shared-Stash CREATE path is validated/
+    // submitted entirely separately from the member-funded path below -
+    // there is no payer/participants/split strategy to collect or
+    // validate.
+    if (!isCorrectionRoute && paymentSource === "shared_stash") {
+      setParticipantsError(null);
+      if (!descResult.ok || !amountResult.ok || !categoryResult.ok) return;
+
+      // Checkpoint 4F.4B §2: advisory only - never a security boundary,
+      // never fabricates a balance (sharedStashAvailableMinor stays null
+      // until the Trip's own canonical balance has actually loaded, in
+      // which case this always lets the request proceed to the backend).
+      // A race may still change the real balance after this check; the
+      // backend's own insufficient-funds rejection (surfaced via
+      // sharedStashExpenseErrorMessage below) remains fully intact.
+      const balanceCheck = checkSharedStashAvailableBalance(
+        amountResult.amountMinor,
+        sharedStashAvailableMinor
+      );
+      if (!balanceCheck.ok) {
+        setSubmitError(balanceCheck.error);
+        return;
+      }
+
+      const sharedStashFacts: SharedStashExpenseCreationFacts = {
+        tripId,
+        amountMinor: amountResult.amountMinor,
+        currency: "USD",
+        description: descResult.value,
+        category: categoryResult.value,
+        replacesExpenseId: null,
+        occurredAtInstantMs: null,
+      };
+      const sharedStashClientRequestId = resolveSharedStashExpenseClientRequestId(
+        pendingSharedStashRef,
+        sharedStashFacts,
+        generateExpenseClientRequestId
+      );
+
+      inFlightRef.current = true;
+      setSubmitting(true);
+      setSubmitError(null);
+
+      try {
+        await recordSharedStashExpense({
+          tripId: sharedStashFacts.tripId,
+          amountMinor: sharedStashFacts.amountMinor,
+          currency: sharedStashFacts.currency,
+          description: sharedStashFacts.description,
+          ...(sharedStashFacts.category !== null ? { category: sharedStashFacts.category } : {}),
+          clientRequestId: sharedStashClientRequestId,
+        });
+
+        // Success clears the pending record - a later submission is a
+        // new logical request and must get a new id.
+        pendingSharedStashRef.current = null;
+        announceExpenseSuccess(`Added ${formatCurrency(sharedStashFacts.amountMinor / 100)} expense`);
+        // The live history subscription on the Expense list reconciles
+        // the real persisted Expense - no optimistic/fake row, and no
+        // manual balance mutation, is ever applied here.
+        goToExpenseList();
+      } catch (e) {
+        console.error("Failed to record Shared Stash expense:", e);
+        // already-exists is DEFINITIVE - clear the pending record so the
+        // next attempt mints a fresh id, matching the member-funded
+        // path's own convention exactly.
+        if ((e as { code?: string } | null | undefined)?.code === "functions/already-exists") {
+          pendingSharedStashRef.current = null;
+        }
+        setSubmitError(sharedStashExpenseErrorMessage(e, isArchived));
+        setSubmitting(false);
+      } finally {
+        inFlightRef.current = false;
+      }
+      return;
+    }
+
+    const participants = selectedParticipants ? Array.from(selectedParticipants) : [];
     setParticipantsError(participants.length > 0 ? null : "Select at least one participant.");
 
     // Checkpoint 4D.7A §1: explicit resolution gates for correction mode
@@ -1009,7 +1230,12 @@ export default function AddExpenseScreen() {
     isCurrentMember,
     isArchived,
     isCorrectionRoute,
+    isSharedStashCorrection,
+    oldExpense,
+    paymentSource,
     prefillResult,
+    sharedStashPrefillResult,
+    sharedStashAvailableMinor,
     replacesExpenseId,
     eligibilityPartition,
     removedParticipantsAcknowledged,
@@ -1041,6 +1267,12 @@ export default function AddExpenseScreen() {
   // issued merely by opening this dialog or navigating to this screen.
   // ------------------------------------------------------------------
   const pendingCorrectionFactsRef = useRef<ExpenseCreationFacts | null>(null);
+  // Checkpoint 4F.4A: the Shared-Stash analogue of pendingCorrectionFactsRef
+  // above - a SEPARATE ref (never the same one) since the two facts
+  // shapes are genuinely different and mutually exclusive per correction
+  // attempt (a single old Expense is either member_out_of_pocket or
+  // shared_stash, never both).
+  const pendingSharedStashCorrectionFactsRef = useRef<SharedStashExpenseCreationFacts | null>(null);
   const pendingReversalRef = useRef<PendingExpenseReversalRequest | null>(null);
   const correctionInFlightRef = useRef(false);
   const [correctDialogVisible, setCorrectDialogVisible] = useState(false);
@@ -1072,9 +1304,106 @@ export default function AddExpenseScreen() {
     setCorrectDialogVisible(false);
   }, []);
 
-  const handleConfirmCorrection = useCallback(async () => {
-    if (correctionInFlightRef.current) return;
-    if (!tripId) return;
+  // Checkpoint 4F.4A: Shared-Stash correction's own reverse-then-create
+  // confirm handler - a SEPARATE branch (checked FIRST) from the
+  // pre-existing member_out_of_pocket logic below, mirroring its exact
+  // two-step phase-skipping discipline (§8/§24 step H.1/H.2,
+  // initialCorrectionPhase) but routed through
+  // reverseSharedStashExpense/recordSharedStashExpense instead of
+  // reverseTripExpense/recordTripExpense, and through
+  // sharedStashExpenseErrorMessage for the create-step's own error
+  // mapping (so insufficient-funds is named specifically here too, same
+  // as the ordinary Shared-Stash create path).
+  const handleConfirmSharedStashCorrection = useCallback(async () => {
+    const facts = pendingSharedStashCorrectionFactsRef.current;
+    if (!facts || !facts.replacesExpenseId || !tripId) return;
+    const oldExpenseId = facts.replacesExpenseId;
+
+    correctionInFlightRef.current = true;
+    setCorrectionSubmitting(true);
+    setCorrectionSubmitError(null);
+
+    try {
+      if (
+        oldExpenseState.status === "ready" &&
+        initialCorrectionPhase(oldExpenseState.expense.status) === "reverse"
+      ) {
+        const reversalFacts: ExpenseReversalFacts = {
+          expenseId: oldExpenseId,
+          reversalReason: CORRECTION_REVERSAL_REASON,
+        };
+        const reversalClientRequestId = resolveExpenseReversalClientRequestId(
+          pendingReversalRef,
+          reversalFacts,
+          generateExpenseClientRequestId
+        );
+        try {
+          await reverseSharedStashExpense({
+            expenseId: reversalFacts.expenseId,
+            reversalReason: reversalFacts.reversalReason,
+            clientRequestId: reversalClientRequestId,
+          });
+        } catch (e) {
+          if (!isMountedRef.current) return;
+          console.error(
+            "Failed to reverse original Shared Stash expense during correction:",
+            e
+          );
+          const message = await classifyCorrectionReverseFailure(e, tripId, oldExpenseId);
+          if (!isMountedRef.current) return;
+          setCorrectionSubmitError(message);
+          return;
+        }
+        if (!isMountedRef.current) return;
+        pendingReversalRef.current = null;
+        setOldExpenseState((prev) =>
+          prev.status === "ready" ? { ...prev, expense: { ...prev.expense, status: "reversed" } } : prev
+        );
+      }
+
+      const clientRequestId = resolveSharedStashExpenseClientRequestId(
+        pendingSharedStashRef,
+        facts,
+        generateExpenseClientRequestId
+      );
+      try {
+        await recordSharedStashExpense({
+          tripId: facts.tripId,
+          amountMinor: facts.amountMinor,
+          currency: facts.currency,
+          description: facts.description,
+          ...(facts.category !== null ? { category: facts.category } : {}),
+          ...(facts.occurredAtInstantMs !== null
+            ? { occurredAt: new Date(facts.occurredAtInstantMs) }
+            : {}),
+          replacesExpenseId: oldExpenseId,
+          clientRequestId,
+        });
+      } catch (e) {
+        if (!isMountedRef.current) return;
+        console.error("Failed to save corrected Shared Stash expense:", e);
+        if ((e as { code?: string } | null | undefined)?.code === "functions/already-exists") {
+          pendingSharedStashRef.current = null;
+        }
+        setCorrectionSubmitError(sharedStashExpenseErrorMessage(e, isArchived));
+        return;
+      }
+
+      if (!isMountedRef.current) return;
+      pendingSharedStashRef.current = null;
+      pendingSharedStashCorrectionFactsRef.current = null;
+      setCorrectDialogVisible(false);
+      announceExpenseSuccess(`Saved corrected expense`);
+      goToExpenseList();
+    } finally {
+      if (isMountedRef.current) {
+        correctionInFlightRef.current = false;
+        setCorrectionSubmitting(false);
+      }
+    }
+  }, [tripId, oldExpenseState, isArchived, announceExpenseSuccess, goToExpenseList]);
+
+  const handleConfirmMemberCorrection = useCallback(async () => {
     const facts = pendingCorrectionFactsRef.current;
     if (!facts || !facts.replacesExpenseId) return;
     const oldExpenseId = facts.replacesExpenseId;
@@ -1167,6 +1496,21 @@ export default function AddExpenseScreen() {
       }
     }
   }, [tripId, oldExpenseState, isArchived, announceExpenseSuccess, goToExpenseList]);
+
+  // Checkpoint 4F.4A: single dispatcher the dialog's onConfirm prop
+  // calls - routes to whichever branch actually has a pending request
+  // (a single old Expense is either member_out_of_pocket or shared_stash,
+  // never both, so at most one of the two refs is ever populated at a
+  // time). correctionInFlightRef's own guard lives inside each specific
+  // handler, mirroring the pre-4F.4A single-handler shape exactly.
+  const handleConfirmCorrection = useCallback(async () => {
+    if (correctionInFlightRef.current) return;
+    if (pendingSharedStashCorrectionFactsRef.current) {
+      await handleConfirmSharedStashCorrection();
+    } else {
+      await handleConfirmMemberCorrection();
+    }
+  }, [handleConfirmSharedStashCorrection, handleConfirmMemberCorrection]);
 
   return (
     <>
@@ -1380,6 +1724,28 @@ export default function AddExpenseScreen() {
                   </Text>
                 </Pressable>
               </View>
+            ) : isCorrectionRoute && sharedStashPrefillResult && !sharedStashPrefillResult.ok ? (
+              // Checkpoint 4F.4A: the Shared-Stash analogue of the
+              // prefillResult error branch above.
+              <View style={styles.stateWrap}>
+                <Text style={[styles.stateTitle, { color: colors.textPrimary }]}>
+                  {sharedStashPrefillResult.error}
+                </Text>
+                <Pressable
+                  onPress={goToExpenseList}
+                  accessibilityRole="button"
+                  accessibilityLabel="Back to Expense history"
+                  style={({ pressed }) => [
+                    styles.primaryActionBtn,
+                    { backgroundColor: colors.mint },
+                    pressed && { opacity: 0.9 },
+                  ]}
+                >
+                  <Text style={[styles.primaryActionText, { color: colors.onMint }]}>
+                    Back to Expense history
+                  </Text>
+                </Pressable>
+              </View>
             ) : selectedParticipants === null ? (
               // Checkpoint 4D.7A §1: payerUid is deliberately EXCLUDED
               // from this gate - in correction mode it can legitimately
@@ -1457,6 +1823,10 @@ export default function AddExpenseScreen() {
                   if (categoryError) setCategoryError(null);
                 }}
                 categoryError={categoryError}
+                paymentSource={paymentSource}
+                onChangePaymentSource={setPaymentSource}
+                showPaymentSourceSelector={!isCorrectionRoute}
+                sharedStashAvailableMinor={sharedStashAvailableMinor}
                 payerUid={payerUid}
                 onSelectPayer={setPayerUid}
                 selectedParticipantUids={selectedParticipants}

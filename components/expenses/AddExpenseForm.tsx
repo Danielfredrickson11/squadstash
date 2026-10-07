@@ -39,6 +39,18 @@ const STRATEGY_OPTIONS: { value: SplitStrategyValue; label: string }[] = [
   { value: "custom", label: "Custom" },
 ];
 
+// Checkpoint 4F.4, per the approved docs/audits/
+// TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md: who/what funds this
+// Expense - an explicit state the controller owns, never inferred later
+// from payerUid (payerUid is always null for "shared_stash", by the
+// frozen domain contract, so inferring the reverse would be circular).
+export type ExpensePaymentSourceValue = "member_out_of_pocket" | "shared_stash";
+
+const PAYMENT_SOURCE_OPTIONS: { value: ExpensePaymentSourceValue; label: string }[] = [
+  { value: "member_out_of_pocket", label: "Paid by a member" },
+  { value: "shared_stash", label: "Paid from Shared Stash" },
+];
+
 export type AddExpenseFormProps = {
   colors: SemanticColors;
   members: MemberOption[];
@@ -55,6 +67,25 @@ export type AddExpenseFormProps = {
   category: string;
   onChangeCategory: (value: string) => void;
   categoryError: string | null;
+
+  // Checkpoint 4F.4: explicit payment-source choice. Omitting both props
+  // preserves the exact pre-4F.4 behavior (every existing call site keeps
+  // working unchanged): the selector defaults to showing, defaulting to
+  // "member_out_of_pocket", and every member-funded control below renders
+  // exactly as it always has. Correction mode (expenses/create.tsx) hides
+  // the selector entirely via showPaymentSourceSelector={false} - a
+  // Shared-Stash Expense cannot be corrected through this checkpoint's
+  // backend, so offering the choice there would only lead to a dead end.
+  paymentSource?: ExpensePaymentSourceValue;
+  onChangePaymentSource?: (value: ExpensePaymentSourceValue) => void;
+  showPaymentSourceSelector?: boolean;
+  // The Trip's own already-authoritative Shared Stash balance (minor
+  // units), if the caller already has it loaded - this component never
+  // computes or fetches a balance itself (preflight §5: "do not create a
+  // second financial calculation"). null/undefined simply omits the
+  // availability line; the backend remains authoritative for
+  // insufficient-funds enforcement regardless of what this displays.
+  sharedStashAvailableMinor?: number | null;
 
   // Checkpoint 4D.7A: null represents "not yet explicitly chosen" - used
   // by the correction flow when the original payer is no longer a
@@ -136,6 +167,10 @@ export function AddExpenseForm({
   category,
   onChangeCategory,
   categoryError,
+  paymentSource = "member_out_of_pocket",
+  onChangePaymentSource,
+  showPaymentSourceSelector = true,
+  sharedStashAvailableMinor,
   payerUid,
   onSelectPayer,
   selectedParticipantUids,
@@ -265,199 +300,263 @@ export function AddExpenseForm({
         <Text style={[styles.errorText, { color: colors.coral }]}>{categoryError}</Text>
       ) : null}
 
-      {profileErrorVisible ? (
-        <View style={styles.profileErrorRow}>
-          <Text style={[styles.profileErrorText, { color: colors.textMuted }]}>
-            Some member names couldn’t be loaded.
-          </Text>
-          <Pressable onPress={onRetryProfiles} accessibilityRole="button" accessibilityLabel="Retry loading member names">
-            <Text style={[styles.profileErrorRetryText, { color: colors.blue }]}>Retry</Text>
-          </Pressable>
-        </View>
-      ) : null}
-
-      <Text style={[styles.sectionLabel, { color: colors.textSecondary, marginTop: spacing.lg }]}>
-        Paid by
-      </Text>
-      <View style={[styles.selectorBorder, { borderColor: colors.border }]} accessibilityRole="radiogroup">
-        <ScrollView style={styles.selectorScroll} nestedScrollEnabled>
-          {members.map((member) => {
-            const selected = member.uid === payerUid;
-            return (
-              <MemberSelectRow
-                key={member.uid}
-                member={member}
-                colors={colors}
-                selected={selected}
-                disabled={submitting}
-                iconName={selected ? "radiobox-marked" : "radiobox-blank"}
-                role="radio"
-                onPress={() => onSelectPayer(member.uid)}
-              />
-            );
-          })}
-        </ScrollView>
-      </View>
-
-      <View style={styles.participantsHeaderRow}>
-        <Text style={[styles.sectionLabel, { color: colors.textSecondary }]}>
-          Participants
-        </Text>
-        {!isOverCapacity ? (
-          <View style={styles.selectorActionsRow}>
-            <Pressable
-              onPress={onSelectAllParticipants}
-              disabled={submitting}
-              accessibilityRole="button"
-              accessibilityLabel="Select all participants"
-            >
-              <Text style={[styles.selectorActionText, { color: colors.blue }]}>Select all</Text>
-            </Pressable>
-            <Pressable
-              onPress={onClearAllParticipants}
-              disabled={submitting}
-              accessibilityRole="button"
-              accessibilityLabel="Clear all participants"
-            >
-              <Text style={[styles.selectorActionText, { color: colors.blue }]}>Clear</Text>
-            </Pressable>
-          </View>
-        ) : null}
-      </View>
-
-      {isOverCapacity ? (
+      {/* Checkpoint 4F.4: explicit payment-source choice, shown ABOVE
+          every member-funded control below so it reads as a fork, not an
+          afterthought. Hidden entirely in correction mode (§2 of the
+          checkpoint prompt: Shared-Stash Expenses can't be corrected
+          through this checkpoint's backend). Member-funded stays the
+          default - selecting it again is a no-op via onChangePaymentSource
+          itself, matching STRATEGY_OPTIONS's own idempotent-select
+          convention above. */}
+      {showPaymentSourceSelector && onChangePaymentSource ? (
         <>
-          <Text style={[styles.capacityNote, { color: colors.textMuted }]}>
-            This expense can include up to {MAX_EXPENSE_PARTICIPANTS} people. Choose the members
-            sharing this expense.
+          <Text style={[styles.sectionLabel, { color: colors.textSecondary, marginTop: spacing.lg }]}>
+            Payment source
           </Text>
-          <Text style={[styles.capacityCounter, { color: colors.textSecondary }]}>
-            {selectedParticipantList.length} of {MAX_EXPENSE_PARTICIPANTS} selected
-          </Text>
+          <View style={styles.strategyRow} accessibilityRole="radiogroup">
+            {PAYMENT_SOURCE_OPTIONS.map(({ value, label }) => {
+              const selected = paymentSource === value;
+              return (
+                <Pressable
+                  key={value}
+                  onPress={() => onChangePaymentSource(value)}
+                  disabled={submitting}
+                  accessibilityRole="radio"
+                  accessibilityLabel={label}
+                  accessibilityState={{ checked: selected }}
+                  style={({ pressed }) => [
+                    styles.strategyPill,
+                    { borderColor: selected ? colors.blue : colors.border },
+                    selected && { backgroundColor: colors.bluePale },
+                    pressed && !submitting && { opacity: 0.85 },
+                  ]}
+                >
+                  {selected ? <MaterialCommunityIcons name="check" size={14} color={colors.blue} /> : null}
+                  <Text
+                    style={[styles.strategyPillText, { color: selected ? colors.blue : colors.textPrimary }]}
+                  >
+                    {label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
         </>
       ) : null}
 
-      <View style={[styles.selectorBorder, { borderColor: colors.border }]}>
-        <ScrollView style={styles.selectorScroll} nestedScrollEnabled>
-          {members.map((member) => {
-            const selected = selectedParticipantUids.has(member.uid);
-            const atCap =
-              isOverCapacity && !selected && selectedParticipantList.length >= MAX_EXPENSE_PARTICIPANTS;
-            return (
-              <MemberSelectRow
-                key={member.uid}
-                member={member}
-                colors={colors}
-                selected={selected}
-                disabled={submitting || atCap}
-                iconName={selected ? "checkbox-marked" : "checkbox-blank-outline"}
-                role="checkbox"
-                onPress={() => onToggleParticipant(member.uid)}
-              />
-            );
-          })}
-        </ScrollView>
-      </View>
-      {participantsError ? (
-        <Text style={[styles.errorText, { color: colors.coral }]}>{participantsError}</Text>
-      ) : null}
-
-      {/* Checkpoint 4D.4 §5: strategy selector, after participant
-          selection and before the preview. Selection is conveyed by more
-          than color - a check icon plus a distinct border/tint.
-          Checkpoint 4D.8: accessibilityRole is "radio" (a mutually-
-          exclusive single-select group of 3 options), not "button" -
-          state is conveyed via accessibilityState.checked, matching the
-          same convention now used for MemberSelectRow below. */}
-      <Text style={[styles.sectionLabel, { color: colors.textSecondary, marginTop: spacing.lg }]}>
-        Split strategy
-      </Text>
-      <View style={styles.strategyRow} accessibilityRole="radiogroup">
-        {STRATEGY_OPTIONS.map(({ value, label }) => {
-          const selected = splitStrategy === value;
-          return (
-            <Pressable
-              key={value}
-              onPress={() => onChangeSplitStrategy(value)}
-              disabled={submitting}
-              accessibilityRole="radio"
-              accessibilityLabel={label}
-              accessibilityState={{ checked: selected }}
-              style={({ pressed }) => [
-                styles.strategyPill,
-                { borderColor: selected ? colors.blue : colors.border },
-                selected && { backgroundColor: colors.bluePale },
-                pressed && !submitting && { opacity: 0.85 },
-              ]}
-            >
-              {selected ? <MaterialCommunityIcons name="check" size={14} color={colors.blue} /> : null}
-              <Text
-                style={[styles.strategyPillText, { color: selected ? colors.blue : colors.textPrimary }]}
-              >
-                {label}
-              </Text>
-            </Pressable>
-          );
-        })}
-      </View>
-
-      {splitStrategy === "percentage" ? (
-        <PercentageSplitInputs
-          colors={colors}
-          participants={selectedMembers}
-          values={percentageValues}
-          errors={percentageErrors}
-          onChangeValue={onChangePercentageValue}
-          aggregateText={percentageAggregateText}
-          aggregateError={percentageAggregateError}
-          disabled={submitting}
-        />
-      ) : splitStrategy === "custom" ? (
-        <CustomSplitInputs
-          colors={colors}
-          participants={selectedMembers}
-          values={customValues}
-          errors={customErrors}
-          onChangeValue={onChangeCustomValue}
-          aggregateText={customAggregateText}
-          aggregateError={customAggregateError}
-          disabled={submitting}
-        />
-      ) : null}
-
-      {preview && payerMember ? (
-        <View style={[styles.previewCard, { backgroundColor: colors.bluePale }]}>
-          <Text style={[styles.previewHeadline, { color: colors.textPrimary }]}>
-            Paid by {payerMember.nameLabel}
+      {paymentSource === "shared_stash" ? (
+        // Checkpoint 4F.4 §4: no payer, no participants, no split
+        // strategy are collected or shown - the group fund paid in
+        // full, so there is no reimbursement edge to configure or
+        // preview. This note is the ONLY Shared-Stash-specific content
+        // in the form.
+        <View style={[styles.sharedStashNote, { backgroundColor: colors.bluePale }]}>
+          <Text style={[styles.sharedStashNoteText, { color: colors.textPrimary }]}>
+            Paid from Shared Stash — this amount will be deducted from the Trip balance.
           </Text>
-          <Text style={[styles.previewSub, { color: colors.textSecondary }]}>
-            {preview.kind === "equal"
-              ? "Split equally between:"
-              : preview.kind === "percentage"
-                ? "Split by percentage:"
-                : "Custom split:"}
-          </Text>
-          {preview.allocations.map((allocation) => {
-            const member = memberByUid.get(allocation.uid);
-            const label = member?.nameLabel ?? "Trip member";
-            return (
-              <View key={allocation.uid} style={styles.previewRow}>
-                <Text style={[styles.previewName, { color: colors.textPrimary }]} numberOfLines={1}>
-                  {label}
-                </Text>
-                {preview.kind === "percentage" && allocation.percentageBasisPoints !== undefined ? (
-                  <Text style={[styles.previewPercent, { color: colors.textSecondary }]}>
-                    {(allocation.percentageBasisPoints / 100).toFixed(2)}%
-                  </Text>
-                ) : null}
-                <Text style={[styles.previewAmount, { color: colors.textPrimary }]}>
-                  {formatCurrency(allocation.amountMinor / 100)}
-                </Text>
-              </View>
-            );
-          })}
+          {sharedStashAvailableMinor != null ? (
+            <Text style={[styles.sharedStashBalanceText, { color: colors.textSecondary }]}>
+              Available in Shared Stash: {formatCurrency(sharedStashAvailableMinor / 100)}
+            </Text>
+          ) : null}
         </View>
-      ) : null}
+      ) : (
+        <>
+          {profileErrorVisible ? (
+            <View style={styles.profileErrorRow}>
+              <Text style={[styles.profileErrorText, { color: colors.textMuted }]}>
+                Some member names couldn’t be loaded.
+              </Text>
+              <Pressable onPress={onRetryProfiles} accessibilityRole="button" accessibilityLabel="Retry loading member names">
+                <Text style={[styles.profileErrorRetryText, { color: colors.blue }]}>Retry</Text>
+              </Pressable>
+            </View>
+          ) : null}
+
+          <Text style={[styles.sectionLabel, { color: colors.textSecondary, marginTop: spacing.lg }]}>
+            Paid by
+          </Text>
+          <View style={[styles.selectorBorder, { borderColor: colors.border }]} accessibilityRole="radiogroup">
+            <ScrollView style={styles.selectorScroll} nestedScrollEnabled>
+              {members.map((member) => {
+                const selected = member.uid === payerUid;
+                return (
+                  <MemberSelectRow
+                    key={member.uid}
+                    member={member}
+                    colors={colors}
+                    selected={selected}
+                    disabled={submitting}
+                    iconName={selected ? "radiobox-marked" : "radiobox-blank"}
+                    role="radio"
+                    onPress={() => onSelectPayer(member.uid)}
+                  />
+                );
+              })}
+            </ScrollView>
+          </View>
+
+          <View style={styles.participantsHeaderRow}>
+            <Text style={[styles.sectionLabel, { color: colors.textSecondary }]}>
+              Participants
+            </Text>
+            {!isOverCapacity ? (
+              <View style={styles.selectorActionsRow}>
+                <Pressable
+                  onPress={onSelectAllParticipants}
+                  disabled={submitting}
+                  accessibilityRole="button"
+                  accessibilityLabel="Select all participants"
+                >
+                  <Text style={[styles.selectorActionText, { color: colors.blue }]}>Select all</Text>
+                </Pressable>
+                <Pressable
+                  onPress={onClearAllParticipants}
+                  disabled={submitting}
+                  accessibilityRole="button"
+                  accessibilityLabel="Clear all participants"
+                >
+                  <Text style={[styles.selectorActionText, { color: colors.blue }]}>Clear</Text>
+                </Pressable>
+              </View>
+            ) : null}
+          </View>
+
+          {isOverCapacity ? (
+            <>
+              <Text style={[styles.capacityNote, { color: colors.textMuted }]}>
+                This expense can include up to {MAX_EXPENSE_PARTICIPANTS} people. Choose the members
+                sharing this expense.
+              </Text>
+              <Text style={[styles.capacityCounter, { color: colors.textSecondary }]}>
+                {selectedParticipantList.length} of {MAX_EXPENSE_PARTICIPANTS} selected
+              </Text>
+            </>
+          ) : null}
+
+          <View style={[styles.selectorBorder, { borderColor: colors.border }]}>
+            <ScrollView style={styles.selectorScroll} nestedScrollEnabled>
+              {members.map((member) => {
+                const selected = selectedParticipantUids.has(member.uid);
+                const atCap =
+                  isOverCapacity && !selected && selectedParticipantList.length >= MAX_EXPENSE_PARTICIPANTS;
+                return (
+                  <MemberSelectRow
+                    key={member.uid}
+                    member={member}
+                    colors={colors}
+                    selected={selected}
+                    disabled={submitting || atCap}
+                    iconName={selected ? "checkbox-marked" : "checkbox-blank-outline"}
+                    role="checkbox"
+                    onPress={() => onToggleParticipant(member.uid)}
+                  />
+                );
+              })}
+            </ScrollView>
+          </View>
+          {participantsError ? (
+            <Text style={[styles.errorText, { color: colors.coral }]}>{participantsError}</Text>
+          ) : null}
+
+          {/* Checkpoint 4D.4 §5: strategy selector, after participant
+              selection and before the preview. Selection is conveyed by more
+              than color - a check icon plus a distinct border/tint.
+              Checkpoint 4D.8: accessibilityRole is "radio" (a mutually-
+              exclusive single-select group of 3 options), not "button" -
+              state is conveyed via accessibilityState.checked, matching the
+              same convention now used for MemberSelectRow below. */}
+          <Text style={[styles.sectionLabel, { color: colors.textSecondary, marginTop: spacing.lg }]}>
+            Split strategy
+          </Text>
+          <View style={styles.strategyRow} accessibilityRole="radiogroup">
+            {STRATEGY_OPTIONS.map(({ value, label }) => {
+              const selected = splitStrategy === value;
+              return (
+                <Pressable
+                  key={value}
+                  onPress={() => onChangeSplitStrategy(value)}
+                  disabled={submitting}
+                  accessibilityRole="radio"
+                  accessibilityLabel={label}
+                  accessibilityState={{ checked: selected }}
+                  style={({ pressed }) => [
+                    styles.strategyPill,
+                    { borderColor: selected ? colors.blue : colors.border },
+                    selected && { backgroundColor: colors.bluePale },
+                    pressed && !submitting && { opacity: 0.85 },
+                  ]}
+                >
+                  {selected ? <MaterialCommunityIcons name="check" size={14} color={colors.blue} /> : null}
+                  <Text
+                    style={[styles.strategyPillText, { color: selected ? colors.blue : colors.textPrimary }]}
+                  >
+                    {label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+
+          {splitStrategy === "percentage" ? (
+            <PercentageSplitInputs
+              colors={colors}
+              participants={selectedMembers}
+              values={percentageValues}
+              errors={percentageErrors}
+              onChangeValue={onChangePercentageValue}
+              aggregateText={percentageAggregateText}
+              aggregateError={percentageAggregateError}
+              disabled={submitting}
+            />
+          ) : splitStrategy === "custom" ? (
+            <CustomSplitInputs
+              colors={colors}
+              participants={selectedMembers}
+              values={customValues}
+              errors={customErrors}
+              onChangeValue={onChangeCustomValue}
+              aggregateText={customAggregateText}
+              aggregateError={customAggregateError}
+              disabled={submitting}
+            />
+          ) : null}
+
+          {preview && payerMember ? (
+            <View style={[styles.previewCard, { backgroundColor: colors.bluePale }]}>
+              <Text style={[styles.previewHeadline, { color: colors.textPrimary }]}>
+                Paid by {payerMember.nameLabel}
+              </Text>
+              <Text style={[styles.previewSub, { color: colors.textSecondary }]}>
+                {preview.kind === "equal"
+                  ? "Split equally between:"
+                  : preview.kind === "percentage"
+                    ? "Split by percentage:"
+                    : "Custom split:"}
+              </Text>
+              {preview.allocations.map((allocation) => {
+                const member = memberByUid.get(allocation.uid);
+                const label = member?.nameLabel ?? "Trip member";
+                return (
+                  <View key={allocation.uid} style={styles.previewRow}>
+                    <Text style={[styles.previewName, { color: colors.textPrimary }]} numberOfLines={1}>
+                      {label}
+                    </Text>
+                    {preview.kind === "percentage" && allocation.percentageBasisPoints !== undefined ? (
+                      <Text style={[styles.previewPercent, { color: colors.textSecondary }]}>
+                        {(allocation.percentageBasisPoints / 100).toFixed(2)}%
+                      </Text>
+                    ) : null}
+                    <Text style={[styles.previewAmount, { color: colors.textPrimary }]}>
+                      {formatCurrency(allocation.amountMinor / 100)}
+                    </Text>
+                  </View>
+                );
+              })}
+            </View>
+          ) : null}
+        </>
+      )}
 
       {submitError ? <Text style={[styles.errorText, { color: colors.coral }]}>{submitError}</Text> : null}
 
@@ -612,6 +711,14 @@ const styles = StyleSheet.create({
   previewName: { flex: 1, fontSize: 13, fontWeight: "700", marginRight: spacing.sm },
   previewPercent: { fontSize: 12, fontWeight: "700", marginRight: spacing.sm },
   previewAmount: { fontSize: 13, fontWeight: "800" },
+
+  sharedStashNote: {
+    marginTop: spacing.sm,
+    borderRadius: radii.md,
+    padding: spacing.md,
+  },
+  sharedStashNoteText: { fontSize: 13, fontWeight: "700", lineHeight: 18 },
+  sharedStashBalanceText: { fontSize: 12, fontWeight: "600", marginTop: spacing.xs },
 
   strategyRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.xs },
   strategyPill: {

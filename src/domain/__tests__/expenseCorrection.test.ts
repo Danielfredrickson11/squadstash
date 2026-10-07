@@ -1,6 +1,7 @@
 import {
   CORRECTION_REVERSAL_REASON,
   buildCorrectionPrefill,
+  buildSharedStashCorrectionPrefill,
   canClaimCorrection,
   formatBasisPointsForInput,
   formatMinorUnitsForInput,
@@ -352,6 +353,74 @@ describe("buildCorrectionPrefill", () => {
       { userId: "user-2", amountMinor: 6666, percentageBasisPoints: 6666 },
     ]);
     expect(result.ok).toBe(true);
+  });
+});
+
+// Checkpoint 4F.4A: the Shared-Stash analogue of buildCorrectionPrefill
+// above - a Shared-Stash original has no payer/participants/split
+// strategy to validate or prefill at all.
+describe("buildSharedStashCorrectionPrefill", () => {
+  const sharedStashExpense: CorrectionSourceExpense = {
+    paymentSource: "shared_stash",
+    payerUid: null,
+    description: "Groceries",
+    amountMinor: 2000,
+    category: "Food",
+    splitStrategy: "equal",
+    occurredAtInstantMs: 1700000000000,
+  };
+
+  it("1. is accepted for a Shared-Stash original", () => {
+    const result = buildSharedStashCorrectionPrefill(sharedStashExpense);
+    expect(result.ok).toBe(true);
+  });
+
+  it("2/4. prefills description/amount/category/occurredAt only - no payer, no participants, no split data", () => {
+    const result = buildSharedStashCorrectionPrefill(sharedStashExpense);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.data).toEqual({
+      description: "Groceries",
+      amountMinor: 2000,
+      amountText: "20.00",
+      category: "Food",
+      occurredAtInstantMs: 1700000000000,
+    });
+    expect("payerUid" in result.data).toBe(false);
+    expect("participantUids" in result.data).toBe(false);
+    expect("splitStrategy" in result.data).toBe(false);
+  });
+
+  it("omits category as an empty string when the original Expense has none", () => {
+    const result = buildSharedStashCorrectionPrefill({ ...sharedStashExpense, category: undefined });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.data.category).toBe("");
+  });
+
+  it("preserves a null occurredAtInstantMs when the original Expense never recorded one", () => {
+    const result = buildSharedStashCorrectionPrefill({
+      ...sharedStashExpense,
+      occurredAtInstantMs: null,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.data.occurredAtInstantMs).toBeNull();
+  });
+
+  it("rejects a member_out_of_pocket original - that belongs to buildCorrectionPrefill instead", () => {
+    const result = buildSharedStashCorrectionPrefill({
+      ...sharedStashExpense,
+      paymentSource: "member_out_of_pocket",
+      payerUid: "payer-1",
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects a shared_stash original with an unexpected non-null payerUid (malformed persisted data)", () => {
+    const result = buildSharedStashCorrectionPrefill({
+      ...sharedStashExpense,
+      payerUid: "unexpected-payer",
+    });
+    expect(result.ok).toBe(false);
   });
 });
 

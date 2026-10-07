@@ -5,6 +5,7 @@ import {
   normalizeReversalReason,
   reduceReversalOutcome,
   resolveExpenseReversalClientRequestId,
+  selectReversalCallableKind,
   type ExpenseReversalFacts,
   type PendingExpenseReversalRequest,
 } from "../expenseReversal";
@@ -495,5 +496,27 @@ describe("isDefinitiveDifferentRequestFailure", () => {
         liveStatusIsReversed: false,
       })
     ).toBe(false);
+  });
+});
+
+// =======================================================================
+// REVERSAL CALLABLE ROUTING (Checkpoint 4F.4)
+// =======================================================================
+
+describe("selectReversalCallableKind", () => {
+  it("selects member_out_of_pocket for a member_out_of_pocket Expense", () => {
+    expect(selectReversalCallableKind("member_out_of_pocket")).toBe("member_out_of_pocket");
+  });
+
+  it("selects shared_stash for a shared_stash Expense", () => {
+    expect(selectReversalCallableKind("shared_stash")).toBe("shared_stash");
+  });
+
+  it("never selects shared_stash for a member_out_of_pocket Expense (wrong callable guard)", () => {
+    expect(selectReversalCallableKind("member_out_of_pocket")).not.toBe("shared_stash");
+  });
+
+  it("never selects member_out_of_pocket for a shared_stash Expense (wrong callable guard)", () => {
+    expect(selectReversalCallableKind("shared_stash")).not.toBe("member_out_of_pocket");
   });
 });

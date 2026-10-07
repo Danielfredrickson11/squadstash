@@ -31,11 +31,13 @@ import {
   subscribeToBucketById,
 } from "../../../../src/services/firebase/buckets";
 import { subscribeToExpensesForTrip } from "../../../../src/services/firebase/expenses";
+import { buildExpenseDescriptionIndex } from "../../../../src/domain/savingsTransactionAttribution";
 import { subscribeToPublicUsersByIdsChunked } from "../../../../src/services/firebase/users";
 import {
   generateSavingsClientRequestId,
   MAX_TRANSACTION_NOTE_LENGTH,
   recordSavingsTransaction,
+  subscribeToSavingsTransactionsForResource,
 } from "../../../../src/services/firebase/savingsTransactions";
 import {
   formatCanonicalDateShort,
@@ -84,6 +86,7 @@ import type {
   Bucket,
   Expense,
   PublicProfile,
+  SavingsTransaction,
   SavingsTransactionType,
   Settlement,
   SettlementMethod,
@@ -91,6 +94,7 @@ import type {
 } from "../../../../src/types/domain";
 import { formatTransactionTimestamp } from "../../../../utils/format";
 import { initialsFromName } from "../../../../components/buckets/AvatarCircle";
+import { TransactionRow } from "../../../../components/buckets/TransactionRow";
 import { ExpenseRow, type ExpenseRowPayer } from "../../../../components/expenses/ExpenseRow";
 import { BalanceRow, type BalanceRowFromMember } from "../../../../components/balances/BalanceRow";
 import { RecordSettlementDialog } from "../../../../components/balances/RecordSettlementDialog";
@@ -967,6 +971,68 @@ export default function TripDetails() {
       expenseUnsubRef.current = null;
     };
   }, [tripId, expenseRetryNonce]);
+
+  // ==========================================================================
+  // Checkpoint 4F.4B: SHARED STASH ACTIVITY card, per the approved
+  // docs/audits/TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md §17.
+  // Reuses the EXACT same trusted, live, resource-scoped
+  // subscribeToSavingsTransactionsForResource query Bucket Detail already
+  // relies on for its own Activity card (components/buckets/
+  // [bucketId].tsx) - resourceType: "trip", resourceId: tripId - never a
+  // new Firestore query shape, never a new index.
+  // ==========================================================================
+  type SharedStashActivityState =
+    | { status: "loading" }
+    | { status: "error" }
+    | { status: "ready"; transactions: SavingsTransaction[] };
+
+  const [sharedStashActivityState, setSharedStashActivityState] = useState<SharedStashActivityState>({
+    status: "loading",
+  });
+  const sharedStashActivityUnsubRef = useRef<(() => void) | null>(null);
+  const [sharedStashActivityRetryNonce, setSharedStashActivityRetryNonce] = useState(0);
+  const retrySharedStashActivity = useCallback(() => setSharedStashActivityRetryNonce((n) => n + 1), []);
+
+  useEffect(() => {
+    sharedStashActivityUnsubRef.current?.();
+    sharedStashActivityUnsubRef.current = null;
+    if (!tripId) return undefined;
+    setSharedStashActivityState({ status: "loading" });
+    sharedStashActivityUnsubRef.current = subscribeToSavingsTransactionsForResource(
+      "trip",
+      tripId,
+      (transactions) => setSharedStashActivityState({ status: "ready", transactions }),
+      (err) => {
+        console.error("Shared Stash activity subscription error:", err);
+        setSharedStashActivityState({ status: "error" });
+      }
+    );
+    return () => {
+      sharedStashActivityUnsubRef.current?.();
+      sharedStashActivityUnsubRef.current = null;
+    };
+  }, [tripId, sharedStashActivityRetryNonce]);
+
+  // Most-recent-first already (the query's own createdAt-descending
+  // order) - shows a bounded recent slice, matching the Expenses card's
+  // own "recentExpenses" convention exactly rather than an unbounded list.
+  const recentSharedStashActivity = useMemo(
+    () => (sharedStashActivityState.status === "ready" ? sharedStashActivityState.transactions.slice(0, 5) : []),
+    [sharedStashActivityState]
+  );
+
+  // Checkpoint 4F.4B: expenseId -> description, built ENTIRELY from the
+  // Expenses card's own already-loaded, already-live expenseState.expenses
+  // list above (the FULL subscribed list, not just recentExpenses' 3-item
+  // slice) - zero additional Firestore reads of any kind. A linked
+  // transaction whose Expense isn't found here (not yet loaded, or
+  // genuinely missing) safely falls through to
+  // resolveSavingsTransactionLabel's own institutional fallback rather
+  // than fetching it independently.
+  const expenseDescriptionById = useMemo(
+    () => buildExpenseDescriptionIndex(expenseState.status === "ready" ? expenseState.expenses : []),
+    [expenseState]
+  );
 
   // Summary card only ever shows the 3 most recent - deriving the payer
   // uid set from exactly this rendered slice (not the whole subscribed
@@ -2401,6 +2467,87 @@ export default function TripDetails() {
                       <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Cancel</Text>
                     </Pressable>
                   </View>
+                </View>
+              )}
+            </View>
+
+            {/* Checkpoint 4F.4B: SHARED STASH ACTIVITY - every
+                contribution/withdrawal against this Trip's Shared Stash,
+                including Shared-Stash-Expense-linked withdrawals/refunds.
+                A linked transaction NEVER renders its memberUid/creator
+                as though they personally withdrew/refunded the money -
+                resolveSavingsTransactionLabel (via TransactionRow) always
+                names the linked Expense instead, or falls back to a
+                truthful institutional label when it can't be resolved. */}
+            <View
+              style={[
+                styles.card,
+                { backgroundColor: theme.colors.surface, borderColor: colors.border },
+                cardShadowFor(theme.dark),
+              ]}
+            >
+              <View style={styles.cardHeaderRow}>
+                <View style={[styles.iconBubble, { backgroundColor: colors.bluePale }]}>
+                  <MaterialCommunityIcons name="history" size={18} color={colors.blue} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.cardTitle, { color: colors.textPrimary }]}>
+                    Shared Stash Activity
+                  </Text>
+                  <Text style={[styles.cardSub, { color: colors.textMuted }]}>
+                    Contributions, withdrawals, and expenses
+                  </Text>
+                </View>
+              </View>
+
+              {sharedStashActivityState.status === "loading" ? (
+                <View style={styles.stashLoadingWrap}>
+                  <ActivityIndicator size="small" />
+                  <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                    Loading activity…
+                  </Text>
+                </View>
+              ) : sharedStashActivityState.status === "error" ? (
+                <View style={styles.expenseErrorWrap}>
+                  <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                    We couldn’t load Shared Stash activity.
+                  </Text>
+                  <Pressable
+                    onPress={retrySharedStashActivity}
+                    accessibilityRole="button"
+                    accessibilityLabel="Retry loading Shared Stash activity"
+                    style={({ pressed }) => [
+                      styles.secondaryActionBtn,
+                      styles.inlineRetryBtn,
+                      { borderColor: colors.border },
+                      pressed && { opacity: 0.9 },
+                    ]}
+                  >
+                    <Text style={[styles.secondaryActionText, { color: colors.textPrimary }]}>Retry</Text>
+                  </Pressable>
+                </View>
+              ) : recentSharedStashActivity.length === 0 ? (
+                <View style={styles.stashEmptyWrap}>
+                  <Text style={[styles.cardSub, { color: colors.textSecondary }]}>
+                    No Shared Stash activity yet.
+                  </Text>
+                  <Text style={[styles.expenseStateText, { color: colors.textMuted }]}>
+                    Contributions, withdrawals, and Shared-Stash-funded expenses will appear here.
+                  </Text>
+                </View>
+              ) : (
+                <View style={styles.expenseListWrap}>
+                  {recentSharedStashActivity.map((transaction) => (
+                    <TransactionRow
+                      key={transaction.id}
+                      transaction={transaction}
+                      linkedExpenseDescription={
+                        transaction.linkedExpenseId
+                          ? expenseDescriptionById.get(transaction.linkedExpenseId)
+                          : undefined
+                      }
+                    />
+                  ))}
                 </View>
               )}
             </View>

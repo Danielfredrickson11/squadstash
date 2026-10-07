@@ -6,10 +6,13 @@
 // recordTripExpenseCore.ts/recordSavingsTransactionCore.ts already rely
 // on).
 //
-// Checkpoint 4F.1 coverage only (docs/audits/
+// Checkpoint 4F.1 coverage (docs/audits/
 // TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md, as corrected by its
-// 4F.0A amendment) - reversal/refund (reverseSharedStashExpense) is a
-// separate, not-yet-built checkpoint and is not exercised here.
+// 4F.0A amendment), extended by Checkpoint 4F.4A's own correction-link
+// (replacesExpenseId/replacedByExpenseId) coverage near the end of this
+// file - full reversal coverage lives in reverseSharedStashExpenseCore.ts;
+// reverseSharedStashExpenseCore is imported here ONLY to build realistic
+// "already-reversed" fixtures for the correction tests.
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { after, before, beforeEach, describe, it } from "node:test";
@@ -23,6 +26,7 @@ import {
   recordSharedStashExpenseCore,
   requireAuthenticatedUid,
 } from "../src/callables/recordSharedStashExpense";
+import { reverseSharedStashExpenseCore } from "../src/callables/reverseSharedStashExpense";
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
   throw new Error(
@@ -741,5 +745,290 @@ describe("recordSharedStashExpenseCore - atomic failure leaves no partial state"
       baseRequest({ clientRequestId, amountMinor: 5000 })
     );
     assert.equal(result.expenseId, clientRequestId);
+  });
+});
+
+// Checkpoint 4F.4A: Shared-Stash Expense correction (reverse-then-create)
+// mirrors recordTripExpense.ts's own replacesExpenseId/replacedByExpenseId
+// correction-link model exactly. Builds genuine "already-reversed shared
+// stash Expense" fixtures via the real create+reverse callables (never
+// hand-seeded), so every field is exactly what production would produce.
+async function createAndReverseSharedStashExpense(
+  creatorUid: string,
+  reverserUid: string,
+  amountMinor = 2000
+): Promise<{ oldExpenseId: string; amountMinor: number }> {
+  const createResult = await recordSharedStashExpenseCore(
+    db,
+    creatorUid,
+    baseRequest({ amountMinor })
+  );
+  await reverseSharedStashExpenseCore(db, reverserUid, {
+    expenseId: createResult.expenseId,
+    clientRequestId: randomUUID(),
+  });
+  return { oldExpenseId: createResult.expenseId, amountMinor };
+}
+
+describe("recordSharedStashExpenseCore - correction link (Checkpoint 4F.4A)", () => {
+  it("accepts a correction replacing a reversed Shared-Stash Expense on the same Trip, by the original creator", async () => {
+    await seedTrip();
+    const { oldExpenseId, amountMinor } = await createAndReverseSharedStashExpense(
+      MEMBER_UID,
+      MEMBER_UID
+    );
+
+    const result = await recordSharedStashExpenseCore(
+      db,
+      MEMBER_UID,
+      baseRequest({ amountMinor, replacesExpenseId: oldExpenseId })
+    );
+
+    const newExpenseSnap = await db
+      .collection("tripExpenses")
+      .doc(result.expenseId)
+      .get();
+    assert.equal(newExpenseSnap.data()!.replacesExpenseId, oldExpenseId);
+
+    const oldExpenseSnap = await db
+      .collection("tripExpenses")
+      .doc(oldExpenseId)
+      .get();
+    assert.equal(oldExpenseSnap.data()!.replacedByExpenseId, result.expenseId);
+  });
+
+  it("2. the Trip's current owner may claim the correction even though they did not create or reverse the original", async () => {
+    await seedTrip();
+    const { oldExpenseId, amountMinor } = await createAndReverseSharedStashExpense(
+      MEMBER_UID,
+      MEMBER_UID
+    );
+    const result = await recordSharedStashExpenseCore(
+      db,
+      OWNER_UID,
+      baseRequest({ amountMinor, replacesExpenseId: oldExpenseId })
+    );
+    assert.notEqual(result.expenseId, oldExpenseId);
+  });
+
+  it("3. a creator/reverser who has since left the Trip loses correction-claim authority, but the owner can still claim it", async () => {
+    // reverseSharedStashExpenseCore's own authority rule is
+    // isOwner || isOriginalCreatorStillMember - the reverser of an
+    // Expense can therefore only ever be the owner or the original
+    // creator (never a third uid), so isOldReverserStillMember is only
+    // ever reachable as "the creator, who also reversed their own
+    // Expense, is STILL a member" vs. "...is no longer a member." This
+    // test exercises the latter: once the creator/reverser departs, both
+    // isOldCreatorStillMember and isOldReverserStillMember fail together
+    // (same uid, same membership check) - only isOwner remains.
+    await seedTrip();
+    const { oldExpenseId, amountMinor } = await createAndReverseSharedStashExpense(
+      MEMBER_UID,
+      MEMBER_UID
+    );
+    await db.collection("trips").doc(TRIP_ID).update({
+      memberIds: [OWNER_UID, OTHER_MEMBER_UID], // MEMBER_UID removed
+    });
+
+    await assertRejectsWithCode(
+      recordSharedStashExpenseCore(
+        db,
+        MEMBER_UID,
+        baseRequest({ amountMinor, replacesExpenseId: oldExpenseId })
+      ),
+      "permission-denied"
+    );
+
+    const result = await recordSharedStashExpenseCore(
+      db,
+      OWNER_UID,
+      baseRequest({ amountMinor, replacesExpenseId: oldExpenseId })
+    );
+    assert.ok(result.expenseId);
+  });
+
+  it("13. rejects a correction attempt by an unrelated member (not owner, not creator, not reverser)", async () => {
+    await seedTrip();
+    const { oldExpenseId, amountMinor } = await createAndReverseSharedStashExpense(
+      MEMBER_UID,
+      MEMBER_UID
+    );
+    await assertRejectsWithCode(
+      recordSharedStashExpenseCore(
+        db,
+        OTHER_MEMBER_UID,
+        baseRequest({ amountMinor, replacesExpenseId: oldExpenseId })
+      ),
+      "permission-denied"
+    );
+  });
+
+  it("11. rejects a replacement targeting an Expense on a different Trip", async () => {
+    await seedTrip();
+    const { oldExpenseId, amountMinor } = await createAndReverseSharedStashExpense(
+      MEMBER_UID,
+      MEMBER_UID
+    );
+    const SECOND_TRIP_ID = "second-trip";
+    await db.collection("trips").doc(SECOND_TRIP_ID).set({
+      ownerId: OWNER_UID,
+      memberIds: [OWNER_UID, MEMBER_UID, OTHER_MEMBER_UID],
+      title: "Second Trip",
+      saved: 100,
+    });
+    await assertRejectsWithCode(
+      recordSharedStashExpenseCore(
+        db,
+        MEMBER_UID,
+        baseRequest({
+          tripId: SECOND_TRIP_ID,
+          amountMinor,
+          replacesExpenseId: oldExpenseId,
+        })
+      ),
+      "failed-precondition"
+    );
+  });
+
+  it("12. rejects a replacement whose old Expense is member_out_of_pocket, not shared_stash", async () => {
+    await seedTrip();
+    const outOfPocketId = "out-of-pocket-old";
+    await db.collection("tripExpenses").doc(outOfPocketId).set({
+      tripId: TRIP_ID,
+      payerUid: MEMBER_UID,
+      createdBy: MEMBER_UID,
+      amountMinor: 2000,
+      currency: "USD",
+      description: "Dinner",
+      splitStrategy: "equal",
+      paymentSource: "member_out_of_pocket",
+      status: "reversed",
+      reversedAt: new Date(),
+      reversedBy: MEMBER_UID,
+      createdAt: new Date(),
+    });
+    await assertRejectsWithCode(
+      recordSharedStashExpenseCore(
+        db,
+        MEMBER_UID,
+        baseRequest({ replacesExpenseId: outOfPocketId })
+      ),
+      "failed-precondition"
+    );
+  });
+
+  it("rejects a replacement whose old Expense is still active (not yet reversed)", async () => {
+    await seedTrip();
+    const activeResult = await recordSharedStashExpenseCore(
+      db,
+      MEMBER_UID,
+      baseRequest({ amountMinor: 1000 })
+    );
+    await assertRejectsWithCode(
+      recordSharedStashExpenseCore(
+        db,
+        MEMBER_UID,
+        baseRequest({ amountMinor: 1000, replacesExpenseId: activeResult.expenseId })
+      ),
+      "failed-precondition"
+    );
+  });
+
+  it("10. rejects a replacement whose old Expense already has a canonical replacement (duplicate replacement attempt)", async () => {
+    await seedTrip();
+    const { oldExpenseId, amountMinor } = await createAndReverseSharedStashExpense(
+      MEMBER_UID,
+      MEMBER_UID
+    );
+    const first = await recordSharedStashExpenseCore(
+      db,
+      MEMBER_UID,
+      baseRequest({ amountMinor, replacesExpenseId: oldExpenseId })
+    );
+
+    await assertRejectsWithCode(
+      recordSharedStashExpenseCore(
+        db,
+        MEMBER_UID,
+        baseRequest({ amountMinor, replacesExpenseId: oldExpenseId })
+      ),
+      "failed-precondition"
+    );
+
+    // The old Expense's canonical replacement link is still the FIRST
+    // one - never silently overwritten by the rejected second attempt.
+    const oldSnap = await db.collection("tripExpenses").doc(oldExpenseId).get();
+    assert.equal(oldSnap.data()!.replacedByExpenseId, first.expenseId);
+  });
+
+  it("rejects a replacesExpenseId that does not reference an existing expense", async () => {
+    await seedTrip();
+    await assertRejectsWithCode(
+      recordSharedStashExpenseCore(
+        db,
+        MEMBER_UID,
+        baseRequest({ replacesExpenseId: "does-not-exist" })
+      ),
+      "failed-precondition"
+    );
+  });
+
+  it("14. an exact replay (same clientRequestId, same facts including replacesExpenseId) stays idempotent", async () => {
+    await seedTrip();
+    const { oldExpenseId, amountMinor } = await createAndReverseSharedStashExpense(
+      MEMBER_UID,
+      MEMBER_UID
+    );
+    const clientRequestId = randomUUID();
+    const request = baseRequest({ amountMinor, replacesExpenseId: oldExpenseId, clientRequestId });
+    const first = await recordSharedStashExpenseCore(db, MEMBER_UID, request);
+    const second = await recordSharedStashExpenseCore(db, MEMBER_UID, request);
+    assert.deepEqual(first, second);
+  });
+
+  it("a reused clientRequestId with a DIFFERENT replacesExpenseId is a different-request collision", async () => {
+    await seedTrip();
+    const { oldExpenseId: oldA, amountMinor } = await createAndReverseSharedStashExpense(
+      MEMBER_UID,
+      MEMBER_UID
+    );
+    const { oldExpenseId: oldB } = await createAndReverseSharedStashExpense(
+      MEMBER_UID,
+      MEMBER_UID,
+      amountMinor
+    );
+    const clientRequestId = randomUUID();
+    await recordSharedStashExpenseCore(
+      db,
+      MEMBER_UID,
+      baseRequest({ amountMinor, replacesExpenseId: oldA, clientRequestId })
+    );
+    await assertRejectsWithCode(
+      recordSharedStashExpenseCore(
+        db,
+        MEMBER_UID,
+        baseRequest({ amountMinor, replacesExpenseId: oldB, clientRequestId })
+      ),
+      "already-exists"
+    );
+  });
+
+  it("an ordinary (non-correction) create still succeeds with replacesExpenseId omitted", async () => {
+    await seedTrip();
+    const result = await recordSharedStashExpenseCore(db, MEMBER_UID, baseRequest());
+    const snap = await db.collection("tripExpenses").doc(result.expenseId).get();
+    assert.equal("replacesExpenseId" in snap.data()!, false);
+  });
+
+  it("rejects a malformed replacesExpenseId at input validation", async () => {
+    await seedTrip();
+    await assertRejectsWithCode(
+      recordSharedStashExpenseCore(
+        db,
+        MEMBER_UID,
+        baseRequest({ replacesExpenseId: "" })
+      ),
+      "invalid-argument"
+    );
   });
 });

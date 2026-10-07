@@ -33,6 +33,14 @@ export function ReverseExpenseDialog({
   onCancel,
   onConfirm,
   colors,
+  // Checkpoint 4F.4: when true, shows an additional line clarifying that
+  // reversal returns the amount to the Trip's Shared Stash - never
+  // described as restoring an old historical balance (preflight §13: the
+  // invariant is adding the amount back to the CURRENT balance, which
+  // reverseSharedStashExpense's own atomic refund already guarantees).
+  // Defaults to false so every existing member-funded call site renders
+  // exactly as it always has.
+  isSharedStash = false,
 }: {
   visible: boolean;
   expenseDescription: string;
@@ -44,6 +52,7 @@ export function ReverseExpenseDialog({
   onCancel: () => void;
   onConfirm: () => void;
   colors: SemanticColors;
+  isSharedStash?: boolean;
 }) {
   // Dismissal (backdrop tap, Cancel, hardware back) is ignored outright
   // while a request is still unresolved - the server may have already
@@ -83,6 +92,11 @@ export function ReverseExpenseDialog({
             This expense will stop counting toward balances. Its history will remain — nothing is
             deleted.
           </Text>
+          {isSharedStash ? (
+            <Text style={[styles.dialogBody, styles.sharedStashBody, { color: colors.textMuted }]}>
+              {formatCurrency(expenseAmountMinor / 100)} will be returned to the Trip’s Shared Stash.
+            </Text>
+          ) : null}
 
           <TextInput
             mode="outlined"
@@ -159,6 +173,7 @@ const styles = StyleSheet.create({
   summaryAmount: { fontSize: 20, fontWeight: "800", marginTop: 2 },
 
   dialogBody: { fontSize: 14, lineHeight: 20, marginBottom: spacing.md },
+  sharedStashBody: { marginTop: -spacing.sm },
   reasonInput: { minHeight: 44 },
   errorText: { fontSize: 12, fontWeight: "700", marginTop: spacing.xs },
 

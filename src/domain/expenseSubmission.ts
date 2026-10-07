@@ -427,3 +427,174 @@ export function resolveExpenseClientRequestId(
   pendingRef.current = { ...facts, clientRequestId };
   return clientRequestId;
 }
+
+// ---------------------------------------------------------------------
+// SHARED-STASH EXPENSE CREATION ERROR MAPPING (Checkpoint 4F.4)
+// ---------------------------------------------------------------------
+//
+// Mirrors expenses/create.tsx's own expenseErrorMessage table exactly,
+// plus one addition: a specific, honest insufficient-funds message. The
+// backend (functions/src/callables/recordSharedStashExpense.ts) returns
+// failed-precondition for several distinct reasons (archived trip,
+// malformed ledger state, insufficient funds, a partial/corrupt ledger
+// state, etc.) - the code alone can't distinguish them, so this
+// additionally inspects the error's own message text for the one case
+// this UI can usefully name specifically. The raw backend message itself
+// is NEVER returned to the caller either way - every branch below
+// returns one of this function's own fixed, pre-written strings.
+// `knownArchived` lets the caller show the SPECIFIC archived-Trip copy
+// only when it independently already knows that fact (matching
+// expenseErrorMessage's own convention) - never guessed from the error
+// code alone.
+export function sharedStashExpenseErrorMessage(e: unknown, knownArchived: boolean): string {
+  const code = (e as { code?: string } | null | undefined)?.code;
+  const message = (e as { message?: string } | null | undefined)?.message ?? "";
+  if (code === "functions/failed-precondition" && /insufficient/i.test(message)) {
+    return "There isn't enough money in the Shared Stash for this expense.";
+  }
+  switch (code) {
+    case "functions/invalid-argument":
+      return "That information isn't valid — please check and try again.";
+    case "functions/permission-denied":
+      return "You don't have permission to do that.";
+    case "functions/failed-precondition":
+      return knownArchived
+        ? "This trip is archived and no longer accepts new expenses."
+        : "We couldn't save this expense because its trip or member information changed. Refresh and try again.";
+    case "functions/not-found":
+      return "This expense or trip could not be found.";
+    case "functions/already-exists":
+      return "We couldn't safely reconcile this expense request. Review it and try again.";
+    case "functions/unavailable":
+    case "functions/deadline-exceeded":
+      return "We couldn't reach the server, so we can't confirm this went through — it's safe to try again.";
+    default:
+      return "We couldn't reach the server, so we can't confirm this went through — it's safe to try again.";
+  }
+}
+
+// ---------------------------------------------------------------------
+// SHARED-STASH ADVISORY INSUFFICIENT-FUNDS CHECK (Checkpoint 4F.4B, per
+// the approved docs/audits/TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md
+// §17) - ADVISORY ONLY, exactly matching canReverseExpense's own "never a
+// security boundary" framing. recordSharedStashExpense.ts independently
+// re-validates against the real, authoritative balance server-side
+// regardless of what this returns; this exists purely so the UI can give
+// honest, immediate feedback (and avoid a round trip that would only ever
+// fail) using the Trip's own already-loaded canonical balance - never a
+// second, independently-computed total.
+// ---------------------------------------------------------------------
+
+export type SharedStashBalanceCheckResult = { ok: true } | { ok: false; error: string };
+
+// `availableMinor === null` means the canonical balance isn't loaded yet
+// (or couldn't be determined) - this NEVER fabricates a balance to check
+// against, so it always lets the request proceed to the backend, which
+// remains authoritative regardless.
+export function checkSharedStashAvailableBalance(
+  amountMinor: number,
+  availableMinor: number | null
+): SharedStashBalanceCheckResult {
+  if (availableMinor === null) return { ok: true };
+  if (amountMinor > availableMinor) {
+    return { ok: false, error: "There isn't enough money in the Shared Stash for this expense." };
+  }
+  return { ok: true };
+}
+
+// Checkpoint 4F.4B: a Shared-Stash correction's own atomic sequence
+// first REVERSES the original (crediting its amount back to the Trip's
+// CURRENT balance) and only then creates the replacement - so the
+// balance actually available to the replacement is the CURRENTLY
+// displayed balance PLUS the original amount, not the currently
+// displayed balance alone, whenever the original is still "active" (the
+// reversal step has not yet run). Once the original is already
+// "reversed" (the "Finish correction" path), that credit has already
+// happened, so the currently displayed balance is already correct as-is.
+export function resolveSharedStashCorrectionAvailableBalanceMinor(
+  currentAvailableMinor: number | null,
+  oldExpenseStatus: "active" | "reversed",
+  oldExpenseAmountMinor: number
+): number | null {
+  if (currentAvailableMinor === null) return null;
+  return oldExpenseStatus === "active"
+    ? currentAvailableMinor + oldExpenseAmountMinor
+    : currentAvailableMinor;
+}
+
+// ---------------------------------------------------------------------
+// SHARED-STASH EXPENSE CREATION FACTS / IDEMPOTENCY (Checkpoint 4F.4)
+// ---------------------------------------------------------------------
+//
+// Deliberately NOT a variant of ExpenseCreationFacts above - a
+// Shared-Stash-funded Expense has no payerUid, no participants, no
+// splitStrategy (the group fund paid in full; zero tripExpenseSplits are
+// ever created, per the approved docs/audits/
+// TRIP_SHARED_STASH_EXPENSE_PREFLIGHT_2026-09-30.md §11). Folding this
+// into the existing discriminated union would force every member_out_of_
+// pocket-only consumer (canonicalizeEqualParticipants callers, the split
+// preview, etc.) to handle a shape that doesn't apply to them for no
+// benefit - a separate, smaller facts type mirrors the backend's own
+// recordSharedStashExpense contract exactly instead.
+
+export type SharedStashExpenseCreationFacts = {
+  tripId: string;
+  amountMinor: number;
+  currency: "USD";
+  description: string;
+  category: string | null;
+  // Checkpoint 4F.4A: identifies the OLD (already-reversed) Shared-Stash
+  // Expense this request corrects/replaces - null for ordinary creation.
+  // Mirrors ExpenseCreationFacts's own identical field exactly, and is
+  // part of this request's exact identity for idempotency purposes
+  // (recordSharedStashExpense.ts's own creationRequest.replacesExpenseId
+  // is compared on replay the same way).
+  replacesExpenseId: string | null;
+  // Checkpoint 4F.4A: preserves the ORIGINAL Expense's own occurredAt for
+  // a correction's replacement - null for ordinary creation (which, like
+  // ExpenseCreationFacts's own ordinary-creation path, never collects a
+  // NEW occurredAt; only a correction ever preserves an EXISTING one).
+  occurredAtInstantMs: number | null;
+};
+
+export type PendingSharedStashExpenseCreationRequest = SharedStashExpenseCreationFacts & {
+  clientRequestId: string;
+};
+
+// Field-by-field comparison, mirroring expenseCreationFactsEqual's own
+// discipline exactly.
+export function sharedStashExpenseCreationFactsEqual(
+  a: SharedStashExpenseCreationFacts,
+  b: SharedStashExpenseCreationFacts
+): boolean {
+  return (
+    a.tripId === b.tripId &&
+    a.amountMinor === b.amountMinor &&
+    a.currency === b.currency &&
+    a.description === b.description &&
+    a.category === b.category &&
+    a.replacesExpenseId === b.replacesExpenseId &&
+    a.occurredAtInstantMs === b.occurredAtInstantMs
+  );
+}
+
+// Reuses the previous attempt's clientRequestId if the retained pending
+// request has the EXACT same facts (a retry of a failed/ambiguous
+// submit); otherwise generates a fresh id via the injected generator and
+// replaces the pending record (a genuinely new logical request). Mirrors
+// resolveExpenseClientRequestId exactly, for the Shared-Stash creation
+// path.
+export function resolveSharedStashExpenseClientRequestId(
+  pendingRef: { current: PendingSharedStashExpenseCreationRequest | null },
+  facts: SharedStashExpenseCreationFacts,
+  generateClientRequestId: () => string
+): string {
+  const pending = pendingRef.current;
+  if (pending && sharedStashExpenseCreationFactsEqual(pending, facts)) {
+    return pending.clientRequestId;
+  }
+
+  const clientRequestId = generateClientRequestId();
+  pendingRef.current = { ...facts, clientRequestId };
+  return clientRequestId;
+}
