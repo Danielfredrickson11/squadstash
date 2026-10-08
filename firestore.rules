@@ -416,6 +416,73 @@ service cloud.firestore {
         );
     }
 
+    // Checkpoint 5A (docs/audits/TRIP_WALLET_MILESTONE_PREFLIGHT_
+    // 2026-10-06.md, as hardened by its 5.0A amendment): a cross-
+    // collection "is the caller currently this Trip's owner" check,
+    // parameterized like canAccessTripById above (and declared at this
+    // same outer scope so tripTerms/tripInvitations/
+    // tripMembershipAcceptances can all share it). Used only by the three
+    // new inert match blocks below - never by trips/tripExpenses/
+    // tripExpenseSplits/tripSettlements, whose own existing isTripOwner()
+    // is untouched.
+    function isTripOwnerById(tripId) {
+      return signedIn()
+        && tripId is string
+        && exists(/databases/$(database)/documents/trips/$(tripId))
+        && get(/databases/$(database)/documents/trips/$(tripId)).data.ownerId
+            == request.auth.uid;
+    }
+
+    // Checkpoint 5A: true if the CALLER holds any tripInvitations record
+    // (regardless of status - pending, accepted, declined, or cancelled)
+    // for this Trip, via the deterministic `{tripId}_{inviteeUid}` id
+    // (see match /tripInvitations below). Lets an invited-but-not-yet-
+    // accepted user read that Trip's terms for pre-join disclosure
+    // (Master Spec §12.2) without granting them canAccessTripById's
+    // membership-scoped access to anything else - this function is never
+    // used by any financial collection's Rules.
+    function hasTripInvitationRecord(tripId) {
+      return signedIn()
+        && tripId is string
+        && exists(
+          /databases/$(database)/documents/tripInvitations/$(tripId + '_' + request.auth.uid)
+        );
+    }
+
+    // Checkpoint 5A.1 (item 4): a STRICTER version of
+    // hasTripInvitationRecord, used only by tripMembershipAcceptances'
+    // create rule below - a cancelled, declined, or expired-while-still-
+    // "pending" invitation must never be usable to manufacture a fresh
+    // terms-acceptance record. Deliberately permits BOTH orderings a
+    // future 5C might choose between ("terms acceptance, then invitation
+    // acceptance" vs. "invitation acceptance, then terms acceptance"):
+    // the invitation may be either still "pending" (and unexpired) OR
+    // already "accepted" - either represents a live, un-revoked
+    // invitation relationship. hasTripInvitationRecord itself (above) is
+    // intentionally left permissive for tripTerms' own pre-join-
+    // disclosure read access, which has no such abuse concern (reading
+    // disclosure content grants nothing).
+    function hasActionableTripInvitationRecord(tripId) {
+      return signedIn()
+        && tripId is string
+        && exists(
+          /databases/$(database)/documents/tripInvitations/$(tripId + '_' + request.auth.uid)
+        )
+        && (
+          get(
+            /databases/$(database)/documents/tripInvitations/$(tripId + '_' + request.auth.uid)
+          ).data.status == 'accepted'
+          || (
+            get(
+              /databases/$(database)/documents/tripInvitations/$(tripId + '_' + request.auth.uid)
+            ).data.status == 'pending'
+            && get(
+              /databases/$(database)/documents/tripInvitations/$(tripId + '_' + request.auth.uid)
+            ).data.expiresAt > request.time
+          )
+        );
+    }
+
     match /tripExpenses/{expenseId} {
       // Document id conveys no authority whatsoever - access follows
       // ONLY the resource's own tripId field, checked fresh against that
@@ -464,6 +531,238 @@ service cloud.firestore {
         && canAccessTripById(resource.data.tripId);
 
       allow create, update, delete: if false;
+    }
+
+    // ---------------------------------------
+    // TRIP TERMS / INVITATIONS / MEMBERSHIP ACCEPTANCE (Checkpoint 5A,
+    // docs/audits/TRIP_WALLET_MILESTONE_PREFLIGHT_2026-10-06.md as
+    // hardened by its 5.0A amendment)
+    //
+    // FROZEN INVARIANT, enforced by every rule in this section: none of
+    // these three collections grants Trip financial authorization. None
+    // is read by, written by, or referenced from any trusted financial
+    // callable (recordSavingsTransaction, recordSharedStashExpense,
+    // reverseSharedStashExpense, recordTripExpense, reverseTripExpense,
+    // recordTripSettlement, reverseTripSettlement). None of these rules
+    // ever writes to, or is consulted by, `trips.memberIds`. Activating
+    // real financial membership from an accepted invitation is explicitly
+    // deferred to a future checkpoint (5C), gated on a withdrawal-ceiling
+    // checkpoint (5B) landing first - see the preflight's revised §10.
+    // ---------------------------------------
+
+    // TRIP TERMS: immutable, append-only disclosure/agreement content.
+    // Checkpoint 5A.1 (item 5): publishing is now EXCLUSIVELY a trusted
+    // callable (functions/src/callables/publishTripTerms.ts) - direct
+    // client creation is closed, matching every other financial/record
+    // collection's posture in this file. This exists because a
+    // client-computed "max version + 1" is not an authoritative answer
+    // Rules can verify, and concurrent publishes could otherwise produce
+    // two competing "version N" documents. The trusted callable instead
+    // maintains the tripTermsCurrent/{tripId} pointer document (below)
+    // inside the SAME Firestore transaction that creates each new
+    // version - Firestore's transaction conflict detection guarantees
+    // concurrent publish attempts serialize against that one pointer
+    // document, so version numbers can never collide or skip
+    // ambiguously. "The current version" is never stored on the Trip
+    // document itself - this checkpoint makes zero changes to the
+    // `trips` collection or its Rules.
+    match /tripTerms/{termsId} {
+      // A current Trip member/owner may read every version (historical
+      // included); an invited-but-not-yet-accepted user may also read
+      // (pre-join disclosure, Master Spec §12.2) via
+      // hasTripInvitationRecord - never a stranger with neither relation.
+      allow get, list: if resource.data.tripId is string
+        && (
+          canAccessTripById(resource.data.tripId)
+          || hasTripInvitationRecord(resource.data.tripId)
+        );
+
+      // Trusted callable only (Admin SDK bypasses these Rules) - see the
+      // match-block comment above for why a direct client create can
+      // never safely express "exactly one authoritative next version."
+      allow create: if false;
+
+      // Historical versions must never be mutable - no exception for
+      // any role, including the Trip owner who created the document.
+      allow update, delete: if false;
+    }
+
+    // TRIP TERMS CURRENT POINTER: one document per Trip
+    // (tripTermsCurrent/{tripId} - the Trip's own id IS this document's
+    // id, never a field inside it), naming the single authoritative
+    // "current" TripTerms document. Checkpoint 5A.1 (items 5/6): this is
+    // what lets tripMembershipAcceptances' create rule (below) verify
+    // "the referenced termsDocId is the CURRENTLY required version"
+    // without ever trusting a client-computed max - it reads this exact
+    // document instead. Written only inside publishTripTerms.ts's own
+    // transaction, atomically alongside the new tripTerms document it
+    // names - never out of step with it.
+    match /tripTermsCurrent/{tripId} {
+      allow get: if canAccessTripById(tripId) || hasTripInvitationRecord(tripId);
+
+      allow create, update, delete: if false;
+    }
+
+    // TRIP INVITATIONS: deterministic id `{tripId}_{inviteeUid}` - the
+    // entire uniqueness mechanism for "at most one invitation record ever
+    // exists for a given (tripId, inviteeUid) pair" (mirrors
+    // createBucket.ts's own deterministic-id convention). Client creation
+    // is permanently closed: issuing an invitation requires resolving
+    // inviteeEmail to a uid server-side (reusing lookupUserByEmail's own
+    // Admin-SDK lookup pattern, never a public Firestore email-query
+    // surface) - see functions/src/callables/createTripInvitation.ts.
+    // Responding to an already-issued invitation (accept/decline/cancel),
+    // by contrast, is a direct client write: each is a one-way terminal
+    // status transition with zero financial consequence, so no trusted
+    // callable is needed for it (mirrors the archivedAt one-way-
+    // transition pattern already used for Trips).
+    match /tripInvitations/{invitationId} {
+      // Only the named invitee or the Trip owner may read an invitation -
+      // never an outsider, and never by guessing another trip's id (every
+      // check below re-derives authorization from the document's own
+      // tripId/inviteeUid fields, exactly like every other Trip-scoped
+      // collection in this file).
+      //
+      // Checkpoint 5A.1 (item 8): deliberately NOT a single `tripId is
+      // string && (...)` guard wrapping both branches (as every other
+      // collection in this file uses) - Firestore evaluates a `list`
+      // query's rule using ONLY the query's own filters, never real
+      // per-document data, so a blanket `resource.data.tripId is string`
+      // prefix makes ANY query that does not itself filter on tripId
+      // (such as the invitee's own fetchPendingInvitationsForUser, which
+      // filters by inviteeUid only) unconditionally fail with
+      // "property tripId is undefined," even though every real document
+      // actually has that field - a Firestore list-rule limitation, not
+      // a data problem. Structuring the invitee's own branch so it can be
+      // proven true (or false) directly from the query's inviteeUid
+      // filter ALONE, with no reference to tripId at all, is what lets
+      // that query (and the symmetric owner-by-tripId query, which
+      // equally never touches inviteeUid) each succeed from their own
+      // query's constraints independently.
+      allow get, list: if signedIn()
+        && (
+          resource.data.inviteeUid == request.auth.uid
+          || (resource.data.tripId is string && isTripOwnerById(resource.data.tripId))
+        );
+
+      allow create: if false;
+
+      // Invitee: pending + UNEXPIRED -> accepted only (Checkpoint 5A.1,
+      // item 2). An expired invitation must never become "accepted" -
+      // expiry is enforced here, at the actual write boundary, not only
+      // by the domain-layer isTripInvitationExpired helper the UI uses
+      // for display. `resource.data.expiresAt > request.time` reads the
+      // ALREADY-PERSISTED expiresAt (immutable - see the unchanged-field
+      // checks below) against the server's own clock at write time, so
+      // this can never be spoofed by a stale client-side "now".
+      allow update: if signedIn()
+        && resource.data.status == 'pending'
+        && resource.data.inviteeUid == request.auth.uid
+        && resource.data.expiresAt > request.time
+        && request.resource.data.tripId == resource.data.tripId
+        && request.resource.data.inviteeUid == resource.data.inviteeUid
+        && request.resource.data.inviterUid == resource.data.inviterUid
+        && request.resource.data.inviteeEmail == resource.data.inviteeEmail
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.expiresAt == resource.data.expiresAt
+        && request.resource.data.status == 'accepted'
+        && request.resource.data.respondedAt == request.time
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'respondedAt']);
+
+      // Invitee: pending -> declined, REGARDLESS of expiry (Checkpoint
+      // 5A.1, item 2's documented choice: declining an already-expired
+      // invitation is harmless bookkeeping - it only ever narrows what
+      // the invitee is recorded as having wanted, never grants anything,
+      // so there is no reason to block it once expired).
+      allow update: if signedIn()
+        && resource.data.status == 'pending'
+        && resource.data.inviteeUid == request.auth.uid
+        && request.resource.data.tripId == resource.data.tripId
+        && request.resource.data.inviteeUid == resource.data.inviteeUid
+        && request.resource.data.inviterUid == resource.data.inviterUid
+        && request.resource.data.inviteeEmail == resource.data.inviteeEmail
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.expiresAt == resource.data.expiresAt
+        && request.resource.data.status == 'declined'
+        && request.resource.data.respondedAt == request.time
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'respondedAt']);
+
+      // Owner: pending -> cancelled, regardless of expiry (Checkpoint
+      // 5A.1, item 2's documented choice: cancelling a (possibly already
+      // expired) pending invitation is always safe - it only ever closes
+      // off access, never grants it, so the owner may use it to clean up
+      // a stale invite). Same one-way shape as the invitee
+      // transition above, but owner-only and only to "cancelled".
+      allow update: if isTripOwnerById(resource.data.tripId)
+        && resource.data.status == 'pending'
+        && request.resource.data.tripId == resource.data.tripId
+        && request.resource.data.inviteeUid == resource.data.inviteeUid
+        && request.resource.data.inviterUid == resource.data.inviterUid
+        && request.resource.data.inviteeEmail == resource.data.inviteeEmail
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.expiresAt == resource.data.expiresAt
+        && request.resource.data.status == 'cancelled'
+        && request.resource.data.respondedAt == request.time
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'respondedAt']);
+
+      allow delete: if false;
+    }
+
+    // TRIP MEMBERSHIP ACCEPTANCE: immutable, append-only proof that `uid`
+    // accepted the EXACT tripTerms document `termsDocId` at `acceptedAt`.
+    // Deterministic id `{tripId}_{uid}_{termsDocId}` - a member may hold
+    // more than one of these over a Trip's lifetime (one per terms
+    // version they've accepted); none is ever updated or deleted, so a
+    // later terms edit can never retroactively imply a member accepted
+    // content they never saw. Creating an acceptance record also requires
+    // an existing tripInvitations record for (tripId, caller) - this ties
+    // acceptance to a real invitation without requiring it to be in any
+    // particular status, keeping this checkpoint's model minimal.
+    match /tripMembershipAcceptances/{acceptanceId} {
+      allow get, list: if resource.data.tripId is string
+        && (
+          (signedIn() && resource.data.uid == request.auth.uid)
+          || isTripOwnerById(resource.data.tripId)
+        );
+
+      // Checkpoint 5A.1 (items 4/6): create requires (a) an un-revoked,
+      // unexpired invitation relationship (hasActionableTripInvitationRecord,
+      // not the looser hasTripInvitationRecord used for terms reads), and
+      // (b) that termsDocId is EXACTLY the Trip's current authoritative
+      // version per tripTermsCurrent/{tripId} - never a stale historical
+      // version, and never a value the client alone decided was "current".
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.tripId is string
+        && request.resource.data.termsDocId is string
+        && request.resource.data.acceptedTermsVersion is number
+        && request.resource.data.acceptedAt == request.time
+        && hasActionableTripInvitationRecord(request.resource.data.tripId)
+        && exists(
+          /databases/$(database)/documents/tripTerms/$(request.resource.data.termsDocId)
+        )
+        && get(
+          /databases/$(database)/documents/tripTerms/$(request.resource.data.termsDocId)
+        ).data.tripId == request.resource.data.tripId
+        && get(
+          /databases/$(database)/documents/tripTerms/$(request.resource.data.termsDocId)
+        ).data.version == request.resource.data.acceptedTermsVersion
+        && exists(
+          /databases/$(database)/documents/tripTermsCurrent/$(request.resource.data.tripId)
+        )
+        && get(
+          /databases/$(database)/documents/tripTermsCurrent/$(request.resource.data.tripId)
+        ).data.currentTermsDocId == request.resource.data.termsDocId
+        && acceptanceId == request.resource.data.tripId + '_'
+            + request.resource.data.uid + '_' + request.resource.data.termsDocId
+        && request.resource.data.keys().hasOnly([
+          'tripId', 'uid', 'termsDocId', 'acceptedTermsVersion', 'acceptedAt'
+        ]);
+
+      allow update, delete: if false;
     }
 
     // ---------------------------------------
