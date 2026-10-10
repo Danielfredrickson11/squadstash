@@ -1,8 +1,19 @@
 import {createHash} from "crypto";
-import {FieldValue, getFirestore} from "firebase-admin/firestore";
+import {FieldValue, Timestamp, getFirestore} from "firebase-admin/firestore";
 import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError, onCall} from "firebase-functions/v2/https";
 import type {CallableRequest} from "firebase-functions/v2/https";
+import type {MemberOwnershipBalance} from "../domain/tripOwnershipAccounting";
+import {restoreSharedStashDepletion} from "../domain/tripOwnershipAccounting";
+import {
+  isValidTripOwnershipAllocationIdentity,
+  validateTripOwnershipAllocationShape,
+} from "../domain/tripOwnershipAllocation";
+import {classifyOwnershipMutationGate} from "../domain/tripOwnershipModel";
+import {
+  isValidOwnershipMinor,
+  tripMemberOwnershipId,
+} from "../domain/tripMemberOwnership";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -321,6 +332,31 @@ export async function reverseSharedStashExpenseCore(
       );
     }
 
+    // H2. Checkpoint 5B.3: the ownership-model-state gate, right after
+    // authorization/status/paymentSource are all confirmed, and before
+    // any further validation. A "migrating"/"needs_reconciliation" Trip
+    // rejects every new reversal outright; a corrupt/unsupported-version
+    // Trip fails closed. A "legacy" Trip falls through with zero
+    // behavior change - older legacy expenses may have no allocation
+    // record at all, and none is ever required on a legacy Trip.
+    const ownershipGate = classifyOwnershipMutationGate(
+      tripData.ownershipModelState,
+      tripData.ownershipModelVersion
+    );
+    if (ownershipGate.kind === "blocked") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip's ownership model is currently being migrated or " +
+          "reconciled; expense reversal is temporarily unavailable."
+      );
+    }
+    if (ownershipGate.kind === "fail_closed") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip has an unsupported or corrupt ownership model state."
+      );
+    }
+
     // I. Validate the trusted financial facts this transaction is about
     // to use arithmetically.
     if (
@@ -403,6 +439,160 @@ export async function reverseSharedStashExpenseCore(
         "The linked Shared Stash withdrawal does not correspond to this " +
           "expense."
       );
+    }
+
+    // J2. Checkpoint 5B.3, items 18-21: for an "initialized" Trip only,
+    // locate the ONE immutable tripOwnershipAllocations record this
+    // Expense's original withdrawal created, cross-validate it against
+    // the Expense/withdrawal we just verified, read every uid it names
+    // (missing row fails closed - 5B.3 never reconstructs one), and
+    // compute the exact restoration - NEVER recomputed proportions.
+    let restoredOwnership: MemberOwnershipBalance[] | null = null;
+    if (ownershipGate.kind === "initialized") {
+      const allocationRef = db
+        .collection("tripOwnershipAllocations")
+        .doc(expenseData.sharedStashTransactionId);
+      const allocationSnap = await tx.get(allocationRef);
+      if (!allocationSnap.exists) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This expense's ownership allocation record is missing and " +
+            "cannot be reversed."
+        );
+      }
+      const allocationData =
+        allocationSnap.data() as FirebaseFirestore.DocumentData;
+
+      // Checkpoint 5B.3A, item 8: full persisted-record validation,
+      // reusing the existing 5B.1 shape validator rather than
+      // re-deriving ad-hoc field checks - proves the record is an
+      // internally well-formed allocation (canonical ascending uid
+      // order, no duplicates, positive entries, exact sum, a
+      // recognized provenance) before any of this callable's OWN
+      // cross-document linkage checks below are even attempted.
+      // Deliberately accepts EITHER "original" or "migrated"
+      // provenance - 5B.4 will backfill historical allocations as
+      // "migrated", and reversal must restore those identically to a
+      // live "original" one; this must never regress into silently
+      // requiring provenance === "original".
+      const shapeResult = validateTripOwnershipAllocationShape({
+        tripId: allocationData.tripId,
+        expenseId: allocationData.expenseId,
+        withdrawalTransactionId: allocationData.withdrawalTransactionId,
+        amountMinor: allocationData.amountMinor,
+        currency: allocationData.currency,
+        allocations: allocationData.allocations,
+        provenance: allocationData.provenance,
+      });
+      if (!shapeResult.ok) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This expense's ownership allocation record is malformed."
+        );
+      }
+
+      // Cross-document validation (item 19) - facts the shape
+      // validator cannot know, since it only proves internal
+      // well-formedness, never that THIS record correctly links to
+      // THIS Expense/withdrawal. Any disagreement fails closed; no
+      // partial reversal.
+      if (
+        allocationData.tripId !== tripId ||
+        allocationData.expenseId !== input.expenseId ||
+        allocationData.withdrawalTransactionId !==
+          expenseData.sharedStashTransactionId ||
+        !isValidTripOwnershipAllocationIdentity(
+          allocationSnap.id,
+          allocationData.withdrawalTransactionId
+        ) ||
+        allocationData.amountMinor !== expenseData.amountMinor ||
+        allocationData.currency !== expenseData.currency
+      ) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This expense's ownership allocation record is inconsistent " +
+            "with the expense and cannot be reversed."
+        );
+      }
+
+      // Checkpoint 5B.3A, item 8: runtime-only timestamp validation the
+      // pure 5B.1 shape validator intentionally cannot perform - it
+      // operates on the pre-write CANDIDATE shape, which carries no
+      // timestamps at all (tripOwnershipAllocation.ts's own
+      // TripOwnershipAllocationCandidate type). Validated here instead,
+      // against the frozen persisted-schema boundary (5B.1A): every
+      // record must carry a real createdAt; an "original" record must
+      // never also carry migratedAt; a "migrated" record must carry a
+      // real migratedAt too.
+      if (!(allocationData.createdAt instanceof Timestamp)) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This expense's ownership allocation record has a missing or " +
+            "invalid createdAt."
+        );
+      }
+      if (allocationData.provenance === "original") {
+        if (allocationData.migratedAt !== undefined) {
+          throw new HttpsError(
+            "failed-precondition",
+            "This expense's ownership allocation record is malformed - " +
+              "an \"original\" record must not carry migratedAt."
+          );
+        }
+      } else if (!(allocationData.migratedAt instanceof Timestamp)) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This expense's ownership allocation record has a missing or " +
+            "invalid migratedAt."
+        );
+      }
+
+      // Read every named uid's CURRENT ownership row - every row must
+      // still exist (the frozen former-member policy guarantees this
+      // for a genuine steady-state reversal); a missing row fails
+      // closed rather than being silently recreated. The entries
+      // themselves are already proven well-formed by the shape
+      // validator above (valid uid, ascending order, no duplicates).
+      const balances: MemberOwnershipBalance[] = [];
+      for (const entry of allocationData.allocations) {
+        const uid = (entry as {uid: string}).uid;
+        const rowRef = db
+          .collection("tripMemberOwnership")
+          .doc(tripMemberOwnershipId(tripId, uid));
+        const rowSnap = await tx.get(rowRef);
+        if (!rowSnap.exists) {
+          throw new HttpsError(
+            "failed-precondition",
+            `No Shared Stash ownership record exists for "${uid}" on ` +
+              "this trip - cannot restore."
+          );
+        }
+        const rowData = rowSnap.data() as FirebaseFirestore.DocumentData;
+        if (
+          rowData.tripId !== tripId ||
+          rowData.uid !== uid ||
+          !isValidOwnershipMinor(rowData.ownershipMinor)
+        ) {
+          throw new HttpsError(
+            "failed-precondition",
+            `The Shared Stash ownership record for "${uid}" on this ` +
+              "trip is malformed."
+          );
+        }
+        balances.push({uid, ownershipMinor: rowData.ownershipMinor});
+      }
+
+      const restoreResult = restoreSharedStashDepletion(balances, {
+        amountMinor: allocationData.amountMinor,
+        allocations: allocationData.allocations,
+      });
+      if (!restoreResult.ok) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This expense's ownership allocation could not be restored."
+        );
+      }
+      restoredOwnership = restoreResult.resultingOwnership;
     }
 
     // K. Genuinely new request path guard: the derived refund id must NOT
@@ -557,6 +747,24 @@ export async function reverseSharedStashExpenseCore(
       tripUpdate.ledgerOpeningBalanceMinor = initOpeningMinor;
     }
     tx.update(tripRef, tripUpdate);
+
+    // Checkpoint 5B.3, item 21: every restored member's ownership row,
+    // in this SAME transaction - the original allocation record itself
+    // is never touched/mutated/re-created; only each named uid's own
+    // CURRENT ownership row moves, by exactly their original delta.
+    if (restoredOwnership !== null) {
+      for (const b of restoredOwnership) {
+        tx.update(
+          db.collection("tripMemberOwnership").doc(
+            tripMemberOwnershipId(tripId, b.uid)
+          ),
+          {
+            ownershipMinor: b.ownershipMinor,
+            lastUpdatedAt: FieldValue.serverTimestamp(),
+          }
+        );
+      }
+    }
 
     return {expenseId: input.expenseId, refundTransactionId: refundId};
   });

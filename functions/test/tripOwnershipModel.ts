@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {describe, it} from "node:test";
 import {
   CURRENT_TRIP_OWNERSHIP_MODEL_VERSION,
+  classifyOwnershipMutationGate,
   classifyTripOwnershipModelState,
   isValidTripOwnershipModelTransition,
 } from "../src/domain/tripOwnershipModel";
@@ -397,5 +398,77 @@ describe("isValidTripOwnershipModelTransition - corrupt states always rejected",
       ),
       false
     );
+  });
+});
+
+// Checkpoint 5B.3A, item 10: direct unit coverage for the shared
+// mutation-gate classifier, independent of the integration tests
+// already exercising it through all three financial callables.
+describe("classifyOwnershipMutationGate", () => {
+  it("absent state classifies as legacy", () => {
+    assert.deepEqual(
+      classifyOwnershipMutationGate(undefined, undefined),
+      {kind: "legacy"}
+    );
+  });
+
+  it("explicit \"legacy\" state classifies as legacy", () => {
+    assert.deepEqual(
+      classifyOwnershipMutationGate("legacy", undefined),
+      {kind: "legacy"}
+    );
+  });
+
+  it("\"migrating\" classifies as blocked", () => {
+    assert.deepEqual(
+      classifyOwnershipMutationGate("migrating", undefined),
+      {kind: "blocked"}
+    );
+  });
+
+  it("\"needs_reconciliation\" at the current version classifies as blocked", () => {
+    assert.deepEqual(
+      classifyOwnershipMutationGate(
+        "needs_reconciliation",
+        CURRENT_TRIP_OWNERSHIP_MODEL_VERSION
+      ),
+      {kind: "blocked"}
+    );
+  });
+
+  it("\"initialized\" at CURRENT_TRIP_OWNERSHIP_MODEL_VERSION classifies as initialized", () => {
+    assert.deepEqual(
+      classifyOwnershipMutationGate(
+        "initialized",
+        CURRENT_TRIP_OWNERSHIP_MODEL_VERSION
+      ),
+      {kind: "initialized", version: CURRENT_TRIP_OWNERSHIP_MODEL_VERSION}
+    );
+  });
+
+  it("\"initialized\" at an unsupported version classifies as fail_closed", () => {
+    assert.deepEqual(
+      classifyOwnershipMutationGate("initialized", 999),
+      {kind: "fail_closed"}
+    );
+  });
+
+  it("every corrupt combination classifies as fail_closed", () => {
+    const corruptCombinations: Array<[unknown, unknown]> = [
+      [undefined, 1],
+      ["migrating", 1],
+      ["initialized", undefined],
+      ["needs_reconciliation", undefined],
+      ["bogus", undefined],
+      ["legacy", 1],
+    ];
+    for (const [state, version] of corruptCombinations) {
+      assert.deepEqual(
+        classifyOwnershipMutationGate(state, version),
+        {kind: "fail_closed"},
+        `expected fail_closed for state=${String(state)}, ` +
+          `version=${String(version)}`
+      );
+    }
   });
 });

@@ -8,6 +8,15 @@ import {
   deriveLegacyLedgerInitialization,
   resolveEffectiveCurrency,
 } from "../domain/savingsLedger";
+import {
+  applyMemberContribution,
+  applyMemberWithdrawal,
+} from "../domain/tripOwnershipAccounting";
+import {classifyOwnershipMutationGate} from "../domain/tripOwnershipModel";
+import {
+  isValidOwnershipMinor,
+  tripMemberOwnershipId,
+} from "../domain/tripMemberOwnership";
 
 type ResourceType = "bucket" | "trip";
 type SavingsTransactionType = "contribution" | "withdrawal";
@@ -177,6 +186,109 @@ export async function recordSavingsTransactionCore(
       );
     }
 
+    // Checkpoint 5B.3 (docs/audits/TRIP_WALLET_OWNERSHIP_WITHDRAWAL_
+    // PREFLIGHT_2026-10-08.md §11, extending recordSavingsTransactionCore's
+    // existing sequence exactly as frozen: self-only -> current-member ->
+    // [NEW] ownership-model-state gate -> [NEW] ownership ceiling ->
+    // archive-gate -> currency/ledger-state -> aggregate transition).
+    // Only the "trip" resource type has any ownership model at all - a
+    // "bucket" (including a trip_personal My Stash Bucket) is single-
+    // member by definition and is never touched by any of this.
+    let ownershipRowUpdate: {
+      ref: FirebaseFirestore.DocumentReference;
+      newOwnershipMinor: number;
+    } | null = null;
+    if (input.resourceType === "trip") {
+      const gate = classifyOwnershipMutationGate(
+        parentData.ownershipModelState,
+        parentData.ownershipModelVersion
+      );
+      if (gate.kind === "blocked") {
+        throw new HttpsError(
+          "failed-precondition",
+          "This trip's ownership model is currently being migrated or " +
+            "reconciled; new savings activity is temporarily unavailable."
+        );
+      }
+      if (gate.kind === "fail_closed") {
+        throw new HttpsError(
+          "failed-precondition",
+          "This trip has an unsupported or corrupt ownership model state."
+        );
+      }
+      if (gate.kind === "initialized") {
+        // An initialized Trip has, by definition, completed migration/
+        // reconciliation and must have a complete trusted ownership
+        // cache - 5B.3 never silently invents or repairs a missing row
+        // (that is exclusively 5B.4/5B.5's job).
+        const ownershipId = tripMemberOwnershipId(
+          input.resourceId,
+          input.memberUid
+        );
+        const ownershipRef = db
+          .collection("tripMemberOwnership")
+          .doc(ownershipId);
+        const ownershipSnap = await tx.get(ownershipRef);
+        if (!ownershipSnap.exists) {
+          throw new HttpsError(
+            "failed-precondition",
+            "No Shared Stash ownership record exists for you on this trip."
+          );
+        }
+        const ownershipData =
+          ownershipSnap.data() as FirebaseFirestore.DocumentData;
+        if (
+          ownershipData.tripId !== input.resourceId ||
+          ownershipData.uid !== input.memberUid ||
+          !isValidOwnershipMinor(ownershipData.ownershipMinor)
+        ) {
+          throw new HttpsError(
+            "failed-precondition",
+            "Your Shared Stash ownership record is malformed."
+          );
+        }
+        const currentOwnershipMinor: number = ownershipData.ownershipMinor;
+
+        if (input.type === "contribution") {
+          const contributionResult = applyMemberContribution(
+            currentOwnershipMinor,
+            input.amountMinor
+          );
+          if (!contributionResult.ok) {
+            throw new HttpsError(
+              "failed-precondition",
+              "Your resulting Shared Stash ownership is not a safe integer."
+            );
+          }
+          ownershipRowUpdate = {
+            ref: ownershipRef,
+            newOwnershipMinor: contributionResult.newOwnershipMinor,
+          };
+        } else {
+          // withdrawal - the frozen ceiling: requested <= own ownership.
+          // The Trip owner has no special ability to consume someone
+          // else's ownership; this primitive only ever sees the acting
+          // member's own row, structurally.
+          const withdrawalResult = applyMemberWithdrawal(
+            currentOwnershipMinor,
+            input.amountMinor
+          );
+          if (!withdrawalResult.ok) {
+            throw new HttpsError(
+              "failed-precondition",
+              "This withdrawal exceeds your own Shared Stash ownership."
+            );
+          }
+          ownershipRowUpdate = {
+            ref: ownershipRef,
+            newOwnershipMinor: withdrawalResult.newOwnershipMinor,
+          };
+        }
+      }
+      // gate.kind === "legacy": no ownership row is read or required -
+      // today's exact aggregate-only behavior, unchanged.
+    }
+
     // Checkpoint 4B.5C (docs/audits/TRIP_ARCHIVE_DELETE_SAFETY_PREFLIGHT_
     // 2026-09-13.md, as hardened by its 4B.5A.1 amendment), ordering
     // corrected by 4B.5C.1: the trusted enforcement half of the archive
@@ -332,6 +444,19 @@ export async function recordSavingsTransactionCore(
       parentUpdate.ledgerOpeningBalanceMinor = initOpeningMinor;
     }
     tx.update(parentRef, parentUpdate);
+
+    // Checkpoint 5B.3: the exact same contribution/withdrawal amount
+    // that just moved Trip.ledgerBalanceMinor also moves the acting
+    // member's own tripMemberOwnership row, atomically, in this same
+    // transaction - only for an "initialized" Trip (ownershipRowUpdate
+    // stays null for "legacy", which never reads or writes this
+    // collection at all). No other member's row is ever touched.
+    if (ownershipRowUpdate !== null) {
+      tx.update(ownershipRowUpdate.ref, {
+        ownershipMinor: ownershipRowUpdate.newOwnershipMinor,
+        lastUpdatedAt: FieldValue.serverTimestamp(),
+      });
+    }
 
     return {
       transactionId: input.clientRequestId,

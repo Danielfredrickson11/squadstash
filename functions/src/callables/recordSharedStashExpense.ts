@@ -9,6 +9,24 @@ import {
   deriveLegacyLedgerInitialization,
   resolveEffectiveCurrency,
 } from "../domain/savingsLedger";
+import type {MemberOwnershipBalance} from "../domain/tripOwnershipAccounting";
+import {
+  applySharedStashDepletion,
+  reconcileOwnershipAgainstAggregate,
+} from "../domain/tripOwnershipAccounting";
+import type {
+  TripOwnershipAllocationEntry,
+} from "../domain/tripOwnershipAllocation";
+import {tripOwnershipAllocationId} from "../domain/tripOwnershipAllocation";
+import {
+  classifyOwnershipMutationGate,
+  classifyTripOwnershipModelState,
+  isValidTripOwnershipModelTransition,
+} from "../domain/tripOwnershipModel";
+import {
+  isValidOwnershipMinor,
+  tripMemberOwnershipId,
+} from "../domain/tripMemberOwnership";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -171,6 +189,19 @@ export function requireAuthenticatedUid(auth: CallableAuth): string {
   return auth.uid;
 }
 
+// Checkpoint 5B.3, per the frozen preflight §12/item 12 of this
+// checkpoint's own instructions: committing a Trip's
+// "initialized" -> "needs_reconciliation" transition WHILE rejecting
+// the Expense requires the state write to survive even though the
+// callable must still report failure - throwing inside
+// db.runTransaction's own callback would abort that same write. The
+// fix: the transaction callback never throws for this one case: it
+// queues the state-transition write (if the transition is itself
+// legal) and returns a `{kind: "reconciliation_failed"}` sentinel
+// instead of its usual `{kind: "success", result: ...}`; the
+// HttpsError is thrown AFTER the transaction has already committed,
+// outside the callback, once `outcome.kind` is inspected below.
+
 /**
  * Testable trusted core. Receives an already-resolved Firestore instance
  * and the authenticated caller's uid rather than pulling either from the
@@ -206,19 +237,31 @@ export async function recordSharedStashExpenseCore(
   const expenseRef = db.collection("tripExpenses").doc(input.clientRequestId);
   const withdrawalRef = db.collection("savingsTransactions").doc(withdrawalId);
   const tripRef = db.collection("trips").doc(input.tripId);
+  // Checkpoint 5B.3A, item 1: the canonical allocation ref shares its id
+  // with withdrawalRef by construction (tripOwnershipAllocationId
+  // returns the withdrawal id unchanged) - read explicitly here, in the
+  // same up-front read phase as every other collision guard, rather
+  // than trusting that a deterministic id merely makes collision
+  // "unreachable." A deterministic id makes the WRITE TARGET
+  // predictable; it does not prove the document cannot already exist
+  // (e.g. a stale/corrupt record).
+  const allocationRef = db
+    .collection("tripOwnershipAllocations")
+    .doc(tripOwnershipAllocationId(withdrawalId));
   const historyQuery = db
     .collection("savingsTransactions")
     .where("resourceType", "==", "trip")
     .where("resourceId", "==", input.tripId)
     .limit(1);
 
-  return db.runTransaction(async (tx) => {
-    // All mandatory reads happen before any write - Firestore transactions
-    // require this ordering. The conditional historyQuery read (legacy/
-    // uninitialized ledger branch, below) also happens before the first
-    // write, matching recordSavingsTransaction.ts's own structure.
+  const outcome = await db.runTransaction(async (tx) => {
+  // All mandatory reads happen before any write - Firestore transactions
+  // require this ordering. The conditional historyQuery read (legacy/
+  // uninitialized ledger branch, below) also happens before the first
+  // write, matching recordSavingsTransaction.ts's own structure.
     const existingExpenseSnap = await tx.get(expenseRef);
     const existingWithdrawalSnap = await tx.get(withdrawalRef);
+    const existingAllocationSnap = await tx.get(allocationRef);
     const tripSnap = await tx.get(tripRef);
 
     // A. Existing Expense / idempotent replay FIRST (mirrors
@@ -234,10 +277,10 @@ export async function recordSharedStashExpenseCore(
     // authorization decision.
     if (existingExpenseSnap.exists) {
       const stored =
-        existingExpenseSnap.data() as FirebaseFirestore.DocumentData;
+      existingExpenseSnap.data() as FirebaseFirestore.DocumentData;
       if (
         stored.createdBy !== authUid ||
-        !creationRequestsMatch(stored.creationRequest, creationRequest)
+      !creationRequestsMatch(stored.creationRequest, creationRequest)
       ) {
         throw new HttpsError(
           "already-exists",
@@ -267,7 +310,7 @@ export async function recordSharedStashExpenseCore(
         );
       }
       const storedWithdrawal =
-        existingWithdrawalSnap.data() as FirebaseFirestore.DocumentData;
+      existingWithdrawalSnap.data() as FirebaseFirestore.DocumentData;
       if (storedWithdrawal.resourceType !== "trip") {
         throw new HttpsError(
           "failed-precondition",
@@ -302,7 +345,7 @@ export async function recordSharedStashExpenseCore(
         throw new HttpsError(
           "failed-precondition",
           "Linked Shared Stash transaction does not correspond to this " +
-            "expense."
+          "expense."
         );
       }
       // Expected creator attribution under the frozen 4F.1 design
@@ -313,25 +356,28 @@ export async function recordSharedStashExpenseCore(
       // creator is corrupt, regardless of who is replaying the request.
       if (
         storedWithdrawal.memberUid !== stored.createdBy ||
-        storedWithdrawal.recordedBy !== stored.createdBy
+      storedWithdrawal.recordedBy !== stored.createdBy
       ) {
         throw new HttpsError(
           "failed-precondition",
           "Linked Shared Stash transaction has unexpected creator " +
-            "attribution."
+          "attribution."
         );
       }
       if (stored.sharedStashTransactionId !== withdrawalId) {
         throw new HttpsError(
           "failed-precondition",
           "Expense's sharedStashTransactionId does not match its " +
-            "deterministic withdrawal id."
+          "deterministic withdrawal id."
         );
       }
 
       return {
-        expenseId: input.clientRequestId,
-        sharedStashTransactionId: withdrawalId,
+        kind: "success" as const,
+        result: {
+          expenseId: input.clientRequestId,
+          sharedStashTransactionId: withdrawalId,
+        },
       };
     }
 
@@ -349,7 +395,10 @@ export async function recordSharedStashExpenseCore(
 
     // B. Only for a GENUINELY NEW Expense: the parent Trip must exist.
     if (!tripSnap.exists) {
-      throw new HttpsError("not-found", "No trip found for the given tripId.");
+      throw new HttpsError(
+        "not-found",
+        "No trip found for the given tripId."
+      );
     }
     const tripData = tripSnap.data() as FirebaseFirestore.DocumentData;
 
@@ -372,6 +421,33 @@ export async function recordSharedStashExpenseCore(
       throw new HttpsError(
         "failed-precondition",
         "Trip has malformed memberIds."
+      );
+    }
+
+    // C3. Checkpoint 5B.3: the ownership-model-state gate, right after
+    // membership authorization and before archive/correction-link - a
+    // Trip that is "migrating"/"needs_reconciliation" rejects every new
+    // Shared-Stash Expense outright, and a corrupt/unsupported-version
+    // Trip fails closed, before any further work is done. A "legacy"
+    // Trip falls through with zero behavior change; "initialized" is
+    // handled further below, once the ownership set this operation
+    // needs is cheap to load (right before the final atomic write).
+    const ownershipGate = classifyOwnershipMutationGate(
+      tripData.ownershipModelState,
+      tripData.ownershipModelVersion
+    );
+    if (ownershipGate.kind === "blocked") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip's ownership model is currently being migrated or " +
+        "reconciled; new Shared Stash expenses are temporarily " +
+        "unavailable."
+      );
+    }
+    if (ownershipGate.kind === "fail_closed") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip has an unsupported or corrupt ownership model state."
       );
     }
 
@@ -412,7 +488,7 @@ export async function recordSharedStashExpenseCore(
         );
       }
       const oldExpenseData =
-        oldExpenseSnap.data() as FirebaseFirestore.DocumentData;
+      oldExpenseSnap.data() as FirebaseFirestore.DocumentData;
 
       // 5B. Structural/routing requirement, resolved before correction-
       // link authority is evaluated - authority over a DIFFERENT Trip's
@@ -445,11 +521,11 @@ export async function recordSharedStashExpenseCore(
       // Expense is active/reversed or already replaced.
       const isOwner = tripData.ownerId === authUid;
       const isOldCreatorStillMember =
-        oldExpenseData.createdBy === authUid &&
-        isCurrentTripMember(tripData, authUid);
+      oldExpenseData.createdBy === authUid &&
+      isCurrentTripMember(tripData, authUid);
       const isOldReverserStillMember =
-        oldExpenseData.reversedBy === authUid &&
-        isCurrentTripMember(tripData, authUid);
+      oldExpenseData.reversedBy === authUid &&
+      isCurrentTripMember(tripData, authUid);
       if (!isOwner && !isOldCreatorStillMember && !isOldReverserStillMember) {
         throw new HttpsError(
           "permission-denied",
@@ -501,7 +577,7 @@ export async function recordSharedStashExpenseCore(
       throw new HttpsError(
         "failed-precondition",
         "currency must match the Trip's currency " +
-          `(${currencyResult.effectiveCurrency}).`
+        `(${currencyResult.effectiveCurrency}).`
       );
     }
 
@@ -517,15 +593,15 @@ export async function recordSharedStashExpenseCore(
         "Trip has an invalid trusted ledger state."
       );
     } else if (initState.kind === "uninitialized") {
-      // Legacy/uninitialized Trip - guard against ambiguous prior history
-      // before inventing an opening balance, exactly as
-      // recordSavingsTransaction.ts does.
+    // Legacy/uninitialized Trip - guard against ambiguous prior history
+    // before inventing an opening balance, exactly as
+    // recordSavingsTransaction.ts does.
       const historySnap = await tx.get(historyQuery);
       if (!historySnap.empty) {
         throw new HttpsError(
           "failed-precondition",
           "Trip has savingsTransactions history but no initialized " +
-            "ledger state."
+          "ledger state."
         );
       }
 
@@ -546,11 +622,123 @@ export async function recordSharedStashExpenseCore(
       currentBalanceMinor = legacyResult.currentBalanceMinor;
       initOpeningMinor = legacyResult.initOpeningMinor;
     } else {
-      // partial_corrupt
+    // partial_corrupt
       throw new HttpsError(
         "failed-precondition",
         "Trip has a partial/corrupt ledger initialization state."
       );
+    }
+
+    // Checkpoint 5B.3, items 10-13: for an "initialized" Trip only, load
+    // the complete tripMemberOwnership set for this Trip - the SAME set
+    // this operation already needs to compute the §9 proportional
+    // depletion, so this adds no separate architectural scan beyond what
+    // the operation requires anyway (item 31 - unlike an ordinary
+    // contribution/withdrawal, which never does this). Reconcile it
+    // against the Trip's own trusted aggregate BEFORE computing or
+    // committing anything - a genuine drift must never be spent against.
+    let depletionAllocations: TripOwnershipAllocationEntry[] | null = null;
+    let depletionResultingOwnership: MemberOwnershipBalance[] | null = null;
+    if (ownershipGate.kind === "initialized") {
+      // A3. Checkpoint 5B.3B: the canonical allocation document must
+      // ALSO not already exist for a genuinely new request - checked
+      // as its own explicit fact, never merely inferred from A2's
+      // withdrawal check (the two are separate collections; a stale or
+      // corrupt allocation record could exist even where the
+      // withdrawal does not). This is the immutable financial
+      // source-of-truth collection - it is NEVER overwritten, NEVER
+      // merged, under any circumstance other than being newly created
+      // once, right here. Deliberately scoped to the "initialized"
+      // ownership-aware branch ONLY (moved here from an earlier,
+      // unconditional position in Checkpoint 5B.3A) - a "legacy" Trip
+      // never creates, reads for its own sake, or is blocked by
+      // anything in this collection; the frozen contract that legacy
+      // preserves today's exact aggregate-only behavior with zero new
+      // dependency on tripOwnershipAllocations would otherwise be
+      // violated by a stray/stale document a legacy Trip has no reason
+      // to even know exists.
+      if (existingAllocationSnap.exists) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Unexpected existing Shared Stash ownership allocation for " +
+            "this request."
+        );
+      }
+
+      const ownershipQuery = db
+        .collection("tripMemberOwnership")
+        .where("tripId", "==", input.tripId);
+      const ownershipSnap = await tx.get(ownershipQuery);
+
+      const balances: MemberOwnershipBalance[] = [];
+      for (const doc of ownershipSnap.docs) {
+        const rowData = doc.data();
+        if (
+          rowData.tripId !== input.tripId ||
+        typeof rowData.uid !== "string" ||
+        rowData.uid.length === 0 ||
+        !isValidOwnershipMinor(rowData.ownershipMinor) ||
+        doc.id !== tripMemberOwnershipId(input.tripId, rowData.uid)
+        ) {
+          throw new HttpsError(
+            "failed-precondition",
+            "This trip has a malformed Shared Stash ownership record."
+          );
+        }
+        balances.push({
+          uid: rowData.uid,
+          ownershipMinor: rowData.ownershipMinor,
+        });
+      }
+
+      if (balances.length === 0) {
+        if (currentBalanceMinor !== 0) {
+        // Zero ownership rows but a nonzero aggregate is a genuine
+        // drift - fail closed and flag for reconciliation rather than
+        // ever spending against an un-attributable balance.
+          const reconciliationUpdate = buildNeedsReconciliationUpdate(
+            tripData,
+            authUid
+          );
+          if (reconciliationUpdate !== null) {
+            tx.update(tripRef, reconciliationUpdate);
+          }
+          return {kind: "reconciliation_failed" as const};
+        }
+        throw new HttpsError(
+          "failed-precondition",
+          "No member has positive Shared Stash ownership - this expense " +
+          "cannot be funded."
+        );
+      }
+
+      const reconcileResult = reconcileOwnershipAgainstAggregate(
+        currentBalanceMinor,
+        balances
+      );
+      if (!reconcileResult.ok) {
+        const reconciliationUpdate = buildNeedsReconciliationUpdate(
+          tripData,
+          authUid
+        );
+        if (reconciliationUpdate !== null) {
+          tx.update(tripRef, reconciliationUpdate);
+        }
+        return {kind: "reconciliation_failed" as const};
+      }
+
+      const depletionResult = applySharedStashDepletion(
+        input.amountMinor,
+        balances
+      );
+      if (!depletionResult.ok) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Insufficient Shared Stash ownership to fund this expense."
+        );
+      }
+      depletionAllocations = depletionResult.allocations;
+      depletionResultingOwnership = depletionResult.resultingOwnership;
     }
 
     const transitionResult = applyLedgerTransition(
@@ -653,11 +841,77 @@ export async function recordSharedStashExpenseCore(
       tx.update(oldExpenseRef, {replacedByExpenseId: input.clientRequestId});
     }
 
+    // Checkpoint 5B.3, items 13-15: for an "initialized" Trip only, the
+    // ONE immutable tripOwnershipAllocations record for this expense -
+    // keyed solely by the withdrawal's own id, never the Expense id -
+    // plus every participating member's ownership-row update to the
+    // pure allocator's own exact resultingOwnership value. The
+    // allocations array comes straight from the pure helper, untouched -
+    // never re-sorted/re-transformed here.
+    if (
+      depletionAllocations !== null &&
+      depletionResultingOwnership !== null
+    ) {
+      // Checkpoint 5B.3A, item 1: reuses the SAME allocationRef already
+      // read (and proven absent) above as `existingAllocationSnap` -
+      // never re-derives a second reference to the same canonical id.
+      // `tx.create` (not `tx.set`) is an additional write-time
+      // safeguard on top of that explicit read: Firestore itself
+      // rejects this write with ALREADY_EXISTS if the document were
+      // somehow created between the read and this point, rather than
+      // silently overwriting it either way.
+      tx.create(allocationRef, {
+        tripId: input.tripId,
+        expenseId: input.clientRequestId,
+        withdrawalTransactionId: withdrawalId,
+        amountMinor: input.amountMinor,
+        currency: input.currency,
+        allocations: depletionAllocations,
+        provenance: "original",
+        createdAt: FieldValue.serverTimestamp(),
+      });
+
+      const resultingByUid = new Map(
+        depletionResultingOwnership.map((b) => [b.uid, b.ownershipMinor])
+      );
+      for (const allocation of depletionAllocations) {
+        const newOwnershipMinor = resultingByUid.get(allocation.uid);
+        if (newOwnershipMinor === undefined) {
+          throw new HttpsError(
+            "internal",
+            "Internal invariant violated - allocated member missing from " +
+            "resulting ownership."
+          );
+        }
+        tx.update(
+          db
+            .collection("tripMemberOwnership")
+            .doc(tripMemberOwnershipId(input.tripId, allocation.uid)),
+          {
+            ownershipMinor: newOwnershipMinor,
+            lastUpdatedAt: FieldValue.serverTimestamp(),
+          }
+        );
+      }
+    }
+
     return {
-      expenseId: input.clientRequestId,
-      sharedStashTransactionId: withdrawalId,
+      kind: "success" as const,
+      result: {
+        expenseId: input.clientRequestId,
+        sharedStashTransactionId: withdrawalId,
+      },
     };
   });
+
+  if (outcome.kind === "reconciliation_failed") {
+    throw new HttpsError(
+      "failed-precondition",
+      "This trip's ownership ledger could not be verified and has been " +
+        "flagged for reconciliation. Please try again later."
+    );
+  }
+  return outcome.result;
 }
 
 /**
@@ -685,6 +939,48 @@ function deriveSharedStashWithdrawalId(clientRequestId: string): string {
       "utf8"
     )
     .digest("hex");
+}
+
+/**
+ * Checkpoint 5B.3, item 12: builds the Trip update that transitions
+ * `"initialized" -> "needs_reconciliation"` (retaining the exact same
+ * `ownershipModelVersion`, per the frozen state machine), or `null` if
+ * that transition is not legal from the Trip's current classification
+ * (defensive only - this is always called from the `"initialized"`
+ * branch, so the transition should always be legal in practice). The
+ * caller queues this as a `tx.update` and returns a sentinel WITHOUT
+ * throwing, so the state write survives even though the overall
+ * operation must still report failure - throwing inside the
+ * transaction callback would abort this same write.
+ * @param {FirebaseFirestore.DocumentData} tripData The Trip document
+ *   data, as read inside this transaction.
+ * @param {string} authUid The authenticated caller's uid.
+ * @return {Record<string, unknown> | null} The Trip update to queue, or
+ *   null if the transition is not legal.
+ */
+function buildNeedsReconciliationUpdate(
+  tripData: FirebaseFirestore.DocumentData,
+  authUid: string
+): Record<string, unknown> | null {
+  const classification = classifyTripOwnershipModelState(
+    tripData.ownershipModelState,
+    tripData.ownershipModelVersion
+  );
+  if (classification.kind !== "initialized") {
+    return null;
+  }
+  const target = {
+    kind: "needs_reconciliation" as const,
+    version: classification.version,
+  };
+  if (!isValidTripOwnershipModelTransition(classification, target)) {
+    return null;
+  }
+  return {
+    ownershipModelState: "needs_reconciliation",
+    lastUpdatedAt: FieldValue.serverTimestamp(),
+    lastUpdatedBy: authUid,
+  };
 }
 
 /**

@@ -220,3 +220,61 @@ export function isValidTripOwnershipModelTransition(
   }
   return false;
 }
+
+// ---------------------------------------------------------------------
+// Checkpoint 5B.3, item 2: the single shared decision every ownership-
+// affecting trusted callable (recordSavingsTransactionCore's "trip"
+// branch, recordSharedStashExpenseCore, reverseSharedStashExpenseCore)
+// makes about a Trip's ownership-model state, right after its own
+// existing authentication/membership/idempotent-replay handling - "do
+// not manually reimplement state parsing in each callable" (the
+// checkpoint's own instruction). Collapses
+// `classifyTripOwnershipModelState`'s five-way classification into the
+// four outcomes a callable actually needs to act on, folding the
+// §20-frozen "initialized AND CURRENT_TRIP_OWNERSHIP_MODEL_VERSION"
+// conjunction in here once rather than requiring every call site to
+// repeat it.
+// ---------------------------------------------------------------------
+
+export type OwnershipMutationGateResult =
+  | {kind: "legacy"}
+  | {kind: "blocked"}
+  | {kind: "initialized"; version: number}
+  | {kind: "fail_closed"};
+
+/**
+ * Classifies a Trip's ownership-model state into the one decision every
+ * ownership-affecting trusted callable needs: `"legacy"` (today's exact
+ * aggregate-only behavior), `"blocked"` (`"migrating"` or
+ * `"needs_reconciliation"` - reject every genuinely new mutation),
+ * `"initialized"` (full ownership-aware behavior, only once the
+ * version also matches `CURRENT_TRIP_OWNERSHIP_MODEL_VERSION`), or
+ * `"fail_closed"` (corrupt, or `"initialized"` at an unsupported
+ * version - never trusted, never treated as legacy).
+ * @param {unknown} state The Trip document's own `ownershipModelState`
+ *   field, exactly as read from Firestore (may be `undefined`).
+ * @param {unknown} version The Trip document's own
+ *   `ownershipModelVersion` field, exactly as read from Firestore (may
+ *   be `undefined`).
+ * @return {OwnershipMutationGateResult} The gate decision.
+ */
+export function classifyOwnershipMutationGate(
+  state: unknown,
+  version: unknown
+): OwnershipMutationGateResult {
+  const classification = classifyTripOwnershipModelState(state, version);
+  switch (classification.kind) {
+  case "legacy":
+    return {kind: "legacy"};
+  case "migrating":
+  case "needs_reconciliation":
+    return {kind: "blocked"};
+  case "corrupt":
+    return {kind: "fail_closed"};
+  case "initialized":
+    if (classification.version !== CURRENT_TRIP_OWNERSHIP_MODEL_VERSION) {
+      return {kind: "fail_closed"};
+    }
+    return {kind: "initialized", version: classification.version};
+  }
+}
