@@ -138,3 +138,85 @@ export function classifyTripOwnershipModelState(
     reason: `Unknown ownershipModelState "${String(state)}".`,
   };
 }
+
+// ---------------------------------------------------------------------
+// Checkpoint 5B.2, item 18 (as hardened by Checkpoint 5B.2A, items 3-4):
+// pure ownership-model STATE-TRANSITION validator - distinct from
+// classifyTripOwnershipModelState above (which classifies a single
+// persisted snapshot). This answers "is moving FROM one already-
+// classified state TO another legal," per the frozen transition graph
+// (preflight §12A.2, as hardened by Amendment 5B.0B): legal transitions
+// are exactly
+//   legacy -> migrating
+//   migrating -> initialized
+//   initialized -> needs_reconciliation
+//   needs_reconciliation -> initialized
+// Every other pair - including any transition INTO "legacy" from a
+// later state, "initialized -> migrating" directly, "legacy ->
+// initialized" directly (skipping migrating), and any transition
+// touching a "corrupt" classification on either side - is illegal.
+//
+// Two additional VERSION constraints, both checked here rather than
+// split into a separate helper (the preflight gives no concrete reason
+// to split them - this design supports exactly one current version at
+// a time, exactly mirroring the 5C gate's own single "==
+// CURRENT_SUPPORTED_VERSION" check, so there is only ever one
+// authoritative place a caller needs to check before writing a
+// transition):
+//   - "initialized -> needs_reconciliation" and "needs_reconciliation
+//     -> initialized" MUST retain the exact same version - the frozen
+//     lifecycle never changes a Trip's version through reconciliation,
+//     only its state.
+//   - "migrating -> initialized" is the ONLY transition that can ever
+//     assign a brand-new version to a Trip (every later transition
+//     only ever retains whatever version a Trip already has) - so this
+//     is also the only point at which an unsupported version could
+//     ever be introduced. The target version must equal
+//     CURRENT_TRIP_OWNERSHIP_MODEL_VERSION exactly; a migration may
+//     never initialize a Trip at a version this design does not
+//     currently recognize as supported.
+//
+// Deliberately operates on `TripOwnershipClassification`, not raw
+// `(state, version)` tuples: this lets a "corrupt" classification be
+// rejected as a real runtime check here (not merely excluded by
+// TypeScript's own type system, which this function does not rely on a
+// caller having already respected). Does NOT write anything to
+// Firestore - this is called by a future trusted callable (5B.3) to
+// decide whether a WRITE IT IS ABOUT TO MAKE is even legal; it never
+// performs that write itself.
+// ---------------------------------------------------------------------
+
+/**
+ * True if transitioning a Trip's ownership-model state FROM one
+ * classification TO another is legal, per the frozen transition graph -
+ * including the version-retention rule for reconciliation and the
+ * supported-version rule for first-time initialization. A "corrupt"
+ * classification on either side is always illegal, regardless of the
+ * other side.
+ * @param {TripOwnershipClassification} from The Trip's current,
+ *   already-classified state.
+ * @param {TripOwnershipClassification} to The proposed next
+ *   classification.
+ * @return {boolean} True if this transition is legal.
+ */
+export function isValidTripOwnershipModelTransition(
+  from: TripOwnershipClassification,
+  to: TripOwnershipClassification
+): boolean {
+  if (from.kind === "corrupt" || to.kind === "corrupt") {
+    return false;
+  }
+  if (from.kind === "legacy" && to.kind === "migrating") {
+    return true;
+  }
+  if (from.kind === "migrating" && to.kind === "initialized") {
+    return to.version === CURRENT_TRIP_OWNERSHIP_MODEL_VERSION;
+  }
+  if (from.kind === "initialized" && to.kind === "needs_reconciliation") {
+    return from.version === to.version;
+  }
+  if (from.kind === "needs_reconciliation" && to.kind === "initialized") {
+    return from.version === to.version;
+  }
+  return false;
+}
