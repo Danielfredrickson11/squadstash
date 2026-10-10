@@ -171,6 +171,16 @@ service cloud.firestore {
           'imageUrl', 'tripStartDate', 'tripEndDate', 'createdAt',
           'lastUpdatedAt', 'lastUpdatedBy'
         ]);
+        // Checkpoint 5B.1: ownershipModelState/ownershipModelVersion are
+        // backend-only fields a client must never be able to create,
+        // change, or remove. No new clause was needed to enforce this -
+        // this create allowlist (and the update allowlists below) are
+        // already exhaustive `keys().hasOnly(...)`/`affectedKeys()
+        // .hasOnly(...)` lists, not a blocklist, so any attempt to
+        // include either field in a client write already fails the
+        // whole rule. Verified by dedicated tests in
+        // tests/firestore-rules/trips.rules.test.js rather than merely
+        // assumed.
 
       // SEC-001 fix: field-level allowlists for update, for both owner and
       // non-owner members. ownerId, memberIds and target remain
@@ -709,6 +719,65 @@ service cloud.firestore {
             .hasOnly(['status', 'respondedAt']);
 
       allow delete: if false;
+    }
+
+    // ---------------------------------------
+    // TRIP MEMBER OWNERSHIP (Checkpoint 5B.1, docs/audits/
+    // TRIP_WALLET_OWNERSHIP_WITHDRAWAL_PREFLIGHT_2026-10-08.md §12, as
+    // hardened by Amendment 5B.0B) - a trusted-backend-maintained CACHE
+    // of each member's current economic ownership of a Trip's Shared
+    // Stash, in integer minor units. Deterministic id `{tripId}_{uid}`
+    // (mirrors tripInvitationId's own convention - see
+    // hasTripInvitationRecord's comment above for the identical
+    // delimiter-safety caveat, which applies here unchanged). Client
+    // writes are permanently closed, in every role, for every field -
+    // only the trusted financial callables that already write
+    // savingsTransactions/tripExpenses for this Trip may ever write
+    // here (not yet implemented - 5B.1 is schema/Rules only; no
+    // withdrawal ceiling, no cache mutation, no migration happens in
+    // this checkpoint).
+    //
+    // Read policy (5B.1, chosen deliberately): a current Trip member or
+    // owner may read ANY member's ownership row for their own Trip -
+    // not only their own - mirroring tripExpenses/tripExpenseSplits/
+    // tripSettlements' own identical "Trip-scoped financial record,
+    // visible to the whole group" posture, and matching Master Spec
+    // §6.3's own framing of the per-member ownership breakdown as a
+    // shared "member-level ledger," never a private balance. This is
+    // NOT the same thing as transaction authority (5B.0A/5B.0B
+    // deliberately separated the two) - reading this collection never
+    // implies the reader may transact against it.
+    // ---------------------------------------
+    match /tripMemberOwnership/{ownershipId} {
+      allow get, list: if resource.data.tripId is string
+        && canAccessTripById(resource.data.tripId);
+
+      allow create, update, delete: if false;
+    }
+
+    // ---------------------------------------
+    // TRIP OWNERSHIP ALLOCATIONS (Checkpoint 5B.1, same preflight, §12
+    // as clarified by Amendment 5B.0B item 7) - the immutable source-
+    // of-truth record of exactly how one Shared-Stash Expense depleted
+    // (or, on reversal, restored) each participating member's
+    // ownership. Deterministic id is the id of that Expense's ORIGINAL
+    // Shared-Stash withdrawal `SavingsTransaction` - there is exactly
+    // one allocation record per Expense; a reversal reads this same
+    // record and never creates a second one keyed by the refund.
+    //
+    // Read policy (5B.1, chosen deliberately): backend/audit-only - no
+    // client role may read this collection directly. No current product
+    // requirement needs a client to read raw allocation entries; a
+    // future member-ownership UI is expected to read the
+    // tripMemberOwnership CACHE above instead, never this underlying
+    // ledger. The trusted Admin SDK callables that will write/read this
+    // later (5B.2/5B.3+) bypass these Rules entirely, exactly like every
+    // other trusted-write-only collection in this file.
+    // ---------------------------------------
+    match /tripOwnershipAllocations/{allocationId} {
+      allow get, list: if false;
+
+      allow create, update, delete: if false;
     }
 
     // TRIP MEMBERSHIP ACCEPTANCE: immutable, append-only proof that `uid`

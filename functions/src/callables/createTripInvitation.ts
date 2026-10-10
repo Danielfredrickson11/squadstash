@@ -3,6 +3,7 @@ import {FieldValue, Timestamp, getFirestore} from "firebase-admin/firestore";
 import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError, onCall} from "firebase-functions/v2/https";
 import type {CallableRequest} from "firebase-functions/v2/https";
+import {ID_DELIMITER, assertNoDelimiter} from "../domain/tripCompositeId";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -18,62 +19,13 @@ interface CreateTripInvitationResult {
 
 const INVITATION_EXPIRY_MS = 14 * 24 * 60 * 60 * 1000;
 
-// Checkpoint 5A.1 (item 7), corrected by 5A.2 (item 5): the underscore
-// delimiter in tripInvitationId/tripMembershipAcceptanceId is accepted
-// ONLY because SquadStash's CURRENT generated-id/auth flow happens not
-// to produce a component containing it - this is an observation about
-// this application's existing flow, never a guarantee of the underlying
-// Firebase APIs themselves:
-//   - tripId and termsDocId are both Firestore client-SDK/Admin-SDK
-//     auto-generated document ids (trips.ts's createTrip and
-//     publishTripTerms.ts both use addDoc()/doc() with no caller-chosen
-//     id anywhere) - Firestore's own auto-id generator is documented to
-//     draw from a fixed 62-character alphanumeric alphabet with no
-//     underscore, so THIS part is a genuine platform guarantee, not an
-//     assumption.
-//   - inviteeUid/uid, by contrast, is a Firebase Auth uid - and Firebase
-//     Auth's own API contract does NOT promise a uid is underscore-free;
-//     it is an opaque string of at most 128 characters, and a *custom*
-//     uid (e.g. one a future flow assigns via the Admin SDK's
-//     createUser({uid: ...}), or a different identity provider/import
-//     path) could legally contain "_". This project's CURRENT
-//     registration flow never calls createUser() with a caller-chosen
-//     uid anywhere (confirmed by reading every functions/src/callables/
-//     *.ts file) - every uid it produces today happens to come from
-//     Firebase Auth's own default generator, which is alphanumeric - but
-//     that is a fact about this app's current flow, not a property
-//     Firebase Auth itself enforces or documents as permanent.
-// If SquadStash ever introduces custom/imported Auth uids, or any other
-// identity model whose ids may contain this delimiter, THIS composite-id
-// scheme must be replaced before such identities are supported - not
-// patched around. Until then, the belt-and-suspenders checks below
-// (assertNoDelimiter) make any violation of this assumption LOUD (an
-// explicit "internal" rejection) instead of a silent id collision.
-const ID_DELIMITER = "_";
-
-/**
- * Throws if `value` contains the composite-id delimiter - see the
- * ID_DELIMITER comment above for exactly which invariant this guards.
- * @param {string} value The component to check.
- * @param {string} label A short name for the component, for the error.
- * @return {void}
- */
-function assertNoDelimiter(value: string, label: string): void {
-  if (value.includes(ID_DELIMITER)) {
-    throw new HttpsError(
-      "internal",
-      `${label} unexpectedly contains "${ID_DELIMITER}" - refusing to ` +
-        "build a composite invitation id that could collide."
-    );
-  }
-}
-
 /**
  * Deterministic tripInvitations document id - the entire uniqueness
  * mechanism for "at most one invitation record ever exists for a given
  * (tripId, inviteeUid) pair" (mirrors createBucket.ts's own
- * tripPersonalBucketId convention). See the ID_DELIMITER comment above
- * for why this concatenation is safe.
+ * tripPersonalBucketId convention). See domain/tripCompositeId.ts's own
+ * header comment for why this concatenation is safe - Checkpoint 5B.1
+ * extracted that guard into a shared module (behavior unchanged here).
  *
  * IMPORTANT: this exact formula is duplicated in
  * src/services/firebase/tripInvitations.ts on the client (a separate

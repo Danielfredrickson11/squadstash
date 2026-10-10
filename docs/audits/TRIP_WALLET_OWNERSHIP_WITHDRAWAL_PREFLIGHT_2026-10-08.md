@@ -1712,3 +1712,35 @@ flag for every Trip at once.
   `git status --short` shows exactly one new, untracked file —
   `docs/audits/TRIP_WALLET_OWNERSHIP_WITHDRAWAL_PREFLIGHT_2026-10-08.md`
   — and nothing else changed, added, or deleted.
+
+---
+
+## 23. Implementation-Refinement Amendment (Checkpoint 5B.1)
+
+This section records one durable-representation refinement made during
+5B.1's actual implementation, approved after the fact — it does not
+rewrite any historical section above; §12's own prose describing the
+allocation as a "map of `uid: deltaMinor`" is superseded only in its
+exact storage representation, never in its economic semantics.
+
+**From:** an allocation map of `uid -> deltaMinor`.
+
+**To:** a canonical, ordered array of `{ uid, amountMinor }` entries
+(field named `amountMinor`, matching the already-established
+`ExpenseSplitAllocation` convention in `tripExpenseSplits.ts`, rather
+than `deltaMinor`), stored in **strictly ascending uid order** — the
+one canonical representation a given logical allocation may ever have,
+since this collection is immutable and a source of truth. The validator
+rejects a correctly-valued but incorrectly-ordered array outright; it
+never silently re-sorts one. A future 5B.2 allocator must itself
+produce this canonical order.
+
+**Why:** an arbitrary uid used as a Firestore map *field name* invites
+avoidable edge cases (field-name character restrictions, dotted-path
+ambiguity) a plain array of uid *values* never raises; duplicate
+detection and iteration/audit readability are also more
+straightforward against an explicit array. All economic semantics
+(exactly one allocation record per Shared-Stash Expense, keyed by the
+original withdrawal's id; sum-of-entries equals the Expense's
+`amountMinor`; exact-restoration-on-reversal) remain exactly as §9/§10/
+§12 already froze them.

@@ -786,3 +786,99 @@ describe('firestore.rules: trips - archive lifecycle', () => {
     });
   });
 });
+
+// Checkpoint 5B.1: ownershipModelState/ownershipModelVersion are
+// backend-only fields (docs/audits/
+// TRIP_WALLET_OWNERSHIP_WITHDRAWAL_PREFLIGHT_2026-10-08.md §12A). No new
+// Rules clause was added to block them - the existing create/update
+// allowlists are already exhaustive `keys().hasOnly(...)`/
+// `affectedKeys().hasOnly(...)` lists, so any write touching either
+// field already fails the whole rule. These tests PROVE that, rather
+// than merely relying on it.
+describe('firestore.rules: trips - ownership-model-state fields are backend-only', () => {
+  beforeEach(async () => {
+    await seedTrip(testEnv, TRIP_ID, validTripData());
+  });
+
+  it('owner cannot set ownershipModelState via an ordinary update', async () => {
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update({ ownershipModelState: 'initialized' })
+    );
+  });
+
+  it('owner cannot set ownershipModelVersion via an ordinary update', async () => {
+    await assertFails(tripDoc(asOwner(), TRIP_ID).update({ ownershipModelVersion: 1 }));
+  });
+
+  it('non-owner member cannot set ownershipModelState', async () => {
+    await assertFails(
+      tripDoc(asMember(), TRIP_ID).update({ ownershipModelState: 'initialized' })
+    );
+  });
+
+  it('non-owner member cannot set ownershipModelVersion', async () => {
+    await assertFails(tripDoc(asMember(), TRIP_ID).update({ ownershipModelVersion: 1 }));
+  });
+
+  it('owner cannot set ownershipModelState even when combined with an otherwise-legitimate field change', async () => {
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update({
+        title: 'Sneaky Rename',
+        ownershipModelState: 'initialized',
+      })
+    );
+  });
+
+  it('a client cannot create a new Trip with ownershipModelState already set', async () => {
+    await assertFails(
+      tripDoc(asOwner(), 'new-trip-with-ownership').set(
+        validTripData({ ownershipModelState: 'initialized', ownershipModelVersion: 1 })
+      )
+    );
+  });
+
+  describe('on a Trip the trusted backend has already marked initialized', () => {
+    beforeEach(async () => {
+      await seedTrip(
+        testEnv,
+        TRIP_ID,
+        validTripData({ ownershipModelState: 'initialized', ownershipModelVersion: 1 })
+      );
+    });
+
+    it('owner cannot remove the backend-set ownershipModelState', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ ownershipModelState: deleteField() })
+      );
+    });
+
+    it('owner cannot remove the backend-set ownershipModelVersion', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ ownershipModelVersion: deleteField() })
+      );
+    });
+
+    it('owner cannot change the backend-set ownershipModelState to a different value', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ ownershipModelState: 'needs_reconciliation' })
+      );
+    });
+
+    it('an unrelated, otherwise-legitimate Trip update still succeeds unchanged', async () => {
+      await assertSucceeds(tripDoc(asOwner(), TRIP_ID).update({ title: 'Renamed Trip' }));
+    });
+
+    it('a non-owner member\'s otherwise-legitimate update still succeeds unchanged', async () => {
+      await assertSucceeds(tripDoc(asMember(), TRIP_ID).update({ location: 'New Place' }));
+    });
+
+    it('the Trip remains archivable normally, ownership fields untouched by that transition', async () => {
+      await assertSucceeds(
+        tripDoc(asOwner(), TRIP_ID).update({
+          archivedAt: serverTimestamp(),
+          archivedBy: OWNER_UID,
+        })
+      );
+    });
+  });
+});

@@ -1,5 +1,24 @@
 import type { PersistedTimestamp } from "./common";
 
+// Checkpoint 5B.1, per docs/audits/
+// TRIP_WALLET_OWNERSHIP_WITHDRAWAL_PREFLIGHT_2026-10-08.md §12A (as
+// hardened by Amendment 5B.0B): the two-field ownership-model lifecycle
+// marker. Corrected by Checkpoint 5B.1A: the frozen preflight (§12A.1)
+// explicitly permits BOTH an absent `ownershipModelState` field AND a
+// persisted `"legacy"` string, treating them identically - "legacy" is
+// NOT absence-only (5B.1's first pass stated otherwise in error; this
+// is the correction). Both fields are backend-only (never a
+// client-write input; already excluded from every existing create/
+// update field allowlist in firestore.rules' `trips` match block - no
+// Rules change was needed to enforce this, since those allowlists are
+// already exhaustive, not a blocklist). Not yet consulted by any
+// trusted financial callable - that is explicitly 5B.2/5B.3's job.
+export type TripOwnershipModelState =
+  | "legacy"
+  | "migrating"
+  | "initialized"
+  | "needs_reconciliation";
+
 // Persisted trips/{tripId} document. Every field but id stays optional,
 // matching the current read mapping (mapTripDocument, used by
 // fetchMemberTripsOrdered/fetchMemberTrips/fetchTripById in
@@ -92,6 +111,12 @@ export type Trip = {
   // not fabricate a value for either - see src/services/firebase/trips.ts).
   archivedAt?: PersistedTimestamp | null;
   archivedBy?: string | null;
+
+  // Checkpoint 5B.1: see the TripOwnershipModelState comment above this
+  // type for the full semantics. Absent for every existing Trip today -
+  // no migration has run yet (5B.1 is schema-only).
+  ownershipModelState?: TripOwnershipModelState;
+  ownershipModelVersion?: number;
 };
 
 export type CreateTripInput = {
