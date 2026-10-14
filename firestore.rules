@@ -780,6 +780,24 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // ---------------------------------------
+    // TRIP OWNERSHIP MIGRATION STATE (Checkpoint 5B.4B, per the frozen
+    // docs/audits/TRIP_WALLET_OWNERSHIP_MIGRATION_PREFLIGHT_2026-10-10.md
+    // §16/§16A/§16B) - the trusted migration tool's own lock/progress/
+    // audit record for one Trip's legacy -> initialized backfill. Fully
+    // client-closed, mirroring tripOwnershipAllocations's own posture
+    // exactly - no current or planned client/app feature ever needs to
+    // read this collection; it exists solely for the local, non-exported
+    // Admin SDK migration tool (functions/src/admin/migrateTripOwnership.ts)
+    // to read/write directly, bypassing these Rules entirely like every
+    // other trusted-write-only collection in this file.
+    // ---------------------------------------
+    match /tripOwnershipMigrationState/{tripId} {
+      allow get, list: if false;
+
+      allow create, update, delete: if false;
+    }
+
     // TRIP MEMBERSHIP ACCEPTANCE: immutable, append-only proof that `uid`
     // accepted the EXACT tripTerms document `termsDocId` at `acceptedAt`.
     // Deterministic id `{tripId}_{uid}_{termsDocId}` - a member may hold
