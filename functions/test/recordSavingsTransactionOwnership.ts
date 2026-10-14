@@ -289,15 +289,210 @@ describe("initialized contribution", () => {
     assert.equal(await getOwnership(MEMBER_UID), 50);
   });
 
-  it("missing acting ownership row rejects (never silently invented)", async () => {
+  // Checkpoint 5B.3C: a missing acting ownership row is exactly
+  // ownership 0 (the frozen "no row == ownership 0" equivalence,
+  // original preflight §11/§19) - a CONTRIBUTION now lazily
+  // materializes that implicit zero row, rather than rejecting. This
+  // is NOT ownership repair/migration/authorization - every gate above
+  // this block (self-only, current-member, archive, ownership-model-
+  // state) still ran identically first.
+  // Checkpoint 5B.3C.1, §3: legitimate zero-history case - the complete
+  // existing ownership set (empty) reconciles trivially against a
+  // zero pre-contribution aggregate, so the missing row safely means 0.
+  it("legitimate zero-history missing row lazily creates it at the contribution amount (Checkpoint 5B.3C/5B.3C.1)", async () => {
+    await seedTrip(initializedOverrides(0));
+    // No ownership row seeded for MEMBER_UID, and no other rows exist -
+    // a genuinely zero-history Trip.
+
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({amountMinor: 100})
+    );
+
+    assert.equal(result.balanceMinor, 100);
+    assert.equal(await getOwnership(MEMBER_UID), 100);
+    const lastUpdatedAt = await getOwnershipLastUpdatedAt(MEMBER_UID);
+    assert.ok(lastUpdatedAt, "expected the newly-created row to carry a lastUpdatedAt");
+
+    const rowSnap = await db
+      .collection("tripMemberOwnership")
+      .doc(ownershipId(TRIP_ID, MEMBER_UID))
+      .get();
+    assert.equal(rowSnap.exists, true);
+    assert.equal(rowSnap.data()?.tripId, TRIP_ID);
+    assert.equal(rowSnap.data()?.uid, MEMBER_UID);
+  });
+
+  // Checkpoint 5B.3C.1, §4: legitimate partial-history case - the
+  // complete existing set (friend=600) reconciles exactly against the
+  // pre-contribution aggregate (600), so the missing row safely means 0.
+  it("legitimate partial-history missing row succeeds after complete-set reconciliation, and does not touch any other member's row", async () => {
+    await seedTrip(initializedOverrides(600));
+    await seedOwnership(TRIP_ID, FRIEND_UID, 600);
+    // No row seeded for MEMBER_UID.
+
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({amountMinor: 100})
+    );
+
+    assert.equal(result.balanceMinor, 700);
+    assert.equal(await getOwnership(MEMBER_UID), 100);
+    assert.equal(await getOwnership(FRIEND_UID), 600);
+  });
+
+  // Checkpoint 5B.3C.1, §4: the exact frozen worked example - Daniel
+  // has 900, Friend's row is absent, aggregate is 900; Friend's first
+  // contribution of 100 must land at Daniel=900/Friend=100/aggregate=1000.
+  it("the exact frozen partial-history example: Daniel=900, Friend absent, aggregate=900 -> Friend contributes 100", async () => {
+    await seedTrip(initializedOverrides(900));
+    await seedOwnership(TRIP_ID, OWNER_UID, 900);
+
+    const result = await recordSavingsTransactionCore(
+      db,
+      FRIEND_UID,
+      baseRequest({memberUid: FRIEND_UID, amountMinor: 100})
+    );
+
+    assert.equal(result.balanceMinor, 1000);
+    assert.equal(await getOwnership(OWNER_UID), 900);
+    assert.equal(await getOwnership(FRIEND_UID), 100);
+  });
+
+  // Checkpoint 5B.3C.1, §5: Daniel's true ownership (900) matches the
+  // aggregate (1000) together with Friend's 100 - but if Daniel's row
+  // is deleted out-of-band, the existing set (Friend=100 alone) no
+  // longer reconciles against the aggregate (1000), so Daniel's
+  // missing row must NOT be reinterpreted as zero.
+  it("CONFIRMED SAFETY GAP CLOSED: a deleted positive acting row fails closed rather than being treated as zero", async () => {
     await seedTrip(initializedOverrides(1000));
-    // No ownership row seeded for MEMBER_UID.
+    await seedOwnership(TRIP_ID, OWNER_UID, 900);
+    await seedOwnership(TRIP_ID, FRIEND_UID, 100);
+    // Out-of-band deletion of Daniel's (the owner's) row.
+    await db
+      .collection("tripMemberOwnership")
+      .doc(ownershipId(TRIP_ID, OWNER_UID))
+      .delete();
+
+    const request = baseRequest({memberUid: OWNER_UID, amountMinor: 100});
     await assertRejectsWithCode(
-      recordSavingsTransactionCore(db, MEMBER_UID, baseRequest()),
+      recordSavingsTransactionCore(db, OWNER_UID, request),
       "failed-precondition"
     );
+
+    const ownerRowSnap = await db
+      .collection("tripMemberOwnership")
+      .doc(ownershipId(TRIP_ID, OWNER_UID))
+      .get();
+    assert.equal(ownerRowSnap.exists, false);
+    assert.equal(await getOwnership(FRIEND_UID), 100);
     const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
     assert.equal(tripSnap.data()?.ledgerBalanceMinor, 1000);
+    const txnSnap = await db
+      .collection("savingsTransactions")
+      .doc(request.clientRequestId as string)
+      .get();
+    assert.equal(txnSnap.exists, false);
+  });
+
+  // Checkpoint 5B.3C.1, §7: generic drift (no specific deletion
+  // narrative) - the existing set simply does not sum to the aggregate.
+  it("a generic ownership/aggregate drift rejects the missing-row contribution, with no financial mutation", async () => {
+    await seedTrip(initializedOverrides(1000));
+    await seedOwnership(TRIP_ID, FRIEND_UID, 50);
+    // No row for MEMBER_UID - existing set sums to 50, not 1000.
+
+    const request = baseRequest({amountMinor: 100});
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(db, MEMBER_UID, request),
+      "failed-precondition"
+    );
+
+    assert.equal(await getOwnership(MEMBER_UID), undefined);
+    assert.equal(await getOwnership(FRIEND_UID), 50);
+    const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.equal(tripSnap.data()?.ledgerBalanceMinor, 1000);
+  });
+
+  // Checkpoint 5B.3C.1, §6: a malformed OTHER row in the complete scan
+  // fails the whole reconciliation closed - never silently excluded.
+  it("a malformed OTHER ownership row fails the missing-row contribution closed", async () => {
+    await seedTrip(initializedOverrides(1000));
+    await seedOwnership(TRIP_ID, FRIEND_UID, -1);
+
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({amountMinor: 100})
+      ),
+      "failed-precondition"
+    );
+    assert.equal(await getOwnership(MEMBER_UID), undefined);
+  });
+
+  // Checkpoint 5B.3C.1, §6/§2: a rogue row at a NONCANONICAL document
+  // id (even with otherwise plausible-looking content) must fail the
+  // scan closed - the canonical-id check is never skipped.
+  it("a noncanonical-id rogue ownership row fails the missing-row contribution closed", async () => {
+    await seedTrip(initializedOverrides(1000));
+    await db.collection("tripMemberOwnership").doc("rogue-doc-id").set({
+      tripId: TRIP_ID,
+      uid: FRIEND_UID,
+      ownershipMinor: 1000,
+      lastUpdatedAt: new Date(),
+    });
+
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({amountMinor: 100})
+      ),
+      "failed-precondition"
+    );
+    assert.equal(await getOwnership(MEMBER_UID), undefined);
+  });
+
+  // Checkpoint 5B.3C.1, §10: a race between two DIFFERENT members' own
+  // first contributions, both starting from a missing row, must still
+  // land at the exact summed total - each commit changes the Trip
+  // document (always in both transactions' read sets), forcing a
+  // retry that re-reads the other's now-committed row rather than
+  // reconciling against a stale snapshot.
+  it("two concurrent first contributions by DIFFERENT members both succeed and sum exactly", async () => {
+    await seedTrip(initializedOverrides(0));
+    const [ownerResult, friendResult] = await Promise.all([
+      recordSavingsTransactionCore(
+        db,
+        OWNER_UID,
+        baseRequest({
+          memberUid: OWNER_UID,
+          amountMinor: 100,
+          clientRequestId: randomUUID(),
+        })
+      ),
+      recordSavingsTransactionCore(
+        db,
+        FRIEND_UID,
+        baseRequest({
+          memberUid: FRIEND_UID,
+          amountMinor: 50,
+          clientRequestId: randomUUID(),
+        })
+      ),
+    ]);
+
+    assert.equal(await getOwnership(OWNER_UID), 100);
+    assert.equal(await getOwnership(FRIEND_UID), 50);
+    const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.equal(tripSnap.data()?.ledgerBalanceMinor, 150);
+    assert.ok(
+      [ownerResult.balanceMinor, friendResult.balanceMinor].includes(150),
+      "expected whichever call committed second to observe the summed total"
+    );
   });
 
   it("malformed ownership row (wrong tripId) rejects", async () => {
@@ -357,7 +552,10 @@ describe("initialized contribution", () => {
 
   it("failure leaves all financial docs unchanged (atomicity)", async () => {
     await seedTrip(initializedOverrides(1000));
-    // No ownership row - this contribution must fail closed.
+    // A malformed (not merely missing) row - this contribution must
+    // still fail closed, and must not be confused with the new
+    // missing-row lazy-creation path above.
+    await seedOwnership(TRIP_ID, MEMBER_UID, -1);
     const request = baseRequest();
     await assertRejectsWithCode(
       recordSavingsTransactionCore(db, MEMBER_UID, request),
@@ -369,6 +567,121 @@ describe("initialized contribution", () => {
       .doc(request.clientRequestId as string)
       .get();
     assert.equal(txnSnap.exists, false);
+    const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.equal(tripSnap.data()?.ledgerBalanceMinor, 1000);
+  });
+
+  it("idempotent replay after lazy row creation does not double-credit (Checkpoint 5B.3C)", async () => {
+    await seedTrip(initializedOverrides(0));
+    const request = baseRequest({amountMinor: 100});
+
+    const first = await recordSavingsTransactionCore(db, MEMBER_UID, request);
+    assert.equal(first.balanceMinor, 100);
+    assert.equal(await getOwnership(MEMBER_UID), 100);
+
+    const second = await recordSavingsTransactionCore(db, MEMBER_UID, request);
+    assert.deepEqual(second, first);
+    assert.equal(await getOwnership(MEMBER_UID), 100);
+
+    const snap = await db
+      .collection("savingsTransactions")
+      .where("resourceType", "==", "trip")
+      .where("resourceId", "==", TRIP_ID)
+      .get();
+    assert.equal(snap.size, 1);
+  });
+
+  it("two concurrent first contributions by the same member sum exactly, with no lost update (Checkpoint 5B.3C)", async () => {
+    await seedTrip(initializedOverrides(0));
+    // No row seeded for MEMBER_UID - both contributions race to
+    // lazily create it.
+    const [resultA, resultB] = await Promise.all([
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({amountMinor: 100, clientRequestId: randomUUID()})
+      ),
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({amountMinor: 50, clientRequestId: randomUUID()})
+      ),
+    ]);
+
+    assert.equal(await getOwnership(MEMBER_UID), 150);
+    const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.equal(tripSnap.data()?.ledgerBalanceMinor, 150);
+    // Each call's own RETURNED balance reflects the aggregate as of
+    // THAT transaction's own commit - the serializable order between
+    // the two (whichever committed second necessarily observes the
+    // first one's result and returns the final 150; whichever
+    // committed first returns only its own delta, 100 or 50) - never
+    // both returning the stale pre-contention value. The absence of a
+    // lost update is what the FINAL state assertions above already
+    // prove; this only sanity-checks that one of the two calls did
+    // observe the fully-summed total.
+    assert.ok(
+      [resultA.balanceMinor, resultB.balanceMinor].includes(150),
+      "expected at least one call to observe the final summed total"
+    );
+    assert.notEqual(resultA.balanceMinor, resultB.balanceMinor);
+
+    const snap = await db
+      .collection("savingsTransactions")
+      .where("resourceType", "==", "trip")
+      .where("resourceId", "==", TRIP_ID)
+      .get();
+    assert.equal(snap.size, 2);
+  });
+
+  it("an unauthorized (non-member) uid cannot create an ownership row for itself via a missing-row contribution", async () => {
+    await seedTrip(initializedOverrides(1000));
+    const OUTSIDER_UID = "outsider-uid";
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(
+        db,
+        OUTSIDER_UID,
+        baseRequest({memberUid: OUTSIDER_UID})
+      ),
+      "permission-denied"
+    );
+    const rowSnap = await db
+      .collection("tripMemberOwnership")
+      .doc(ownershipId(TRIP_ID, OUTSIDER_UID))
+      .get();
+    assert.equal(rowSnap.exists, false);
+  });
+
+  it("a self/memberUid mismatch is rejected before any row could be created", async () => {
+    await seedTrip(initializedOverrides(1000));
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({memberUid: FRIEND_UID})
+      ),
+      "permission-denied"
+    );
+    const rowSnap = await db
+      .collection("tripMemberOwnership")
+      .doc(ownershipId(TRIP_ID, FRIEND_UID))
+      .get();
+    assert.equal(rowSnap.exists, false);
+  });
+
+  it("an archived Trip rejects a missing-row contribution, and no row is created", async () => {
+    await seedTrip(
+      initializedOverrides(1000, {archivedAt: Timestamp.fromMillis(1000)})
+    );
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(db, MEMBER_UID, baseRequest()),
+      "failed-precondition"
+    );
+    const rowSnap = await db
+      .collection("tripMemberOwnership")
+      .doc(ownershipId(TRIP_ID, MEMBER_UID))
+      .get();
+    assert.equal(rowSnap.exists, false);
     const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
     assert.equal(tripSnap.data()?.ledgerBalanceMinor, 1000);
   });
@@ -536,16 +849,30 @@ describe("initialized personal withdrawal", () => {
     assert.equal(await getOwnership(MEMBER_UID), 1000);
   });
 
-  it("missing acting ownership row rejects, never treated as zero/unlimited", async () => {
+  // Checkpoint 5B.3C, §4: a missing row means ownership 0 for
+  // withdrawal-ceiling purposes too, but - unlike contribution -
+  // withdrawal NEVER lazily creates a row, even for a rejected
+  // mutation: no row, no SavingsTransaction, aggregate unchanged.
+  it("missing acting ownership row rejects, never treated as zero/unlimited, and no row is created", async () => {
     await seedTrip(initializedOverrides(1000));
+    const request = baseRequest({type: "withdrawal", amountMinor: 1});
     await assertRejectsWithCode(
-      recordSavingsTransactionCore(
-        db,
-        MEMBER_UID,
-        baseRequest({type: "withdrawal", amountMinor: 1})
-      ),
+      recordSavingsTransactionCore(db, MEMBER_UID, request),
       "failed-precondition"
     );
+
+    const rowSnap = await db
+      .collection("tripMemberOwnership")
+      .doc(ownershipId(TRIP_ID, MEMBER_UID))
+      .get();
+    assert.equal(rowSnap.exists, false);
+    const txnSnap = await db
+      .collection("savingsTransactions")
+      .doc(request.clientRequestId as string)
+      .get();
+    assert.equal(txnSnap.exists, false);
+    const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.equal(tripSnap.data()?.ledgerBalanceMinor, 1000);
   });
 
   it("malformed ownership row rejects", async () => {
@@ -601,12 +928,17 @@ describe("initialized personal withdrawal", () => {
 // ---------------------------------------------------------------------
 
 describe("migrating - every new mutation rejects", () => {
-  it("rejects a new contribution", async () => {
+  it("rejects a new contribution, even with a missing ownership row, and never creates one (Checkpoint 5B.3C)", async () => {
     await seedTrip({ownershipModelState: "migrating"});
     await assertRejectsWithCode(
       recordSavingsTransactionCore(db, MEMBER_UID, baseRequest()),
       "failed-precondition"
     );
+    const rowSnap = await db
+      .collection("tripMemberOwnership")
+      .doc(ownershipId(TRIP_ID, MEMBER_UID))
+      .get();
+    assert.equal(rowSnap.exists, false);
   });
 
   it("rejects a new withdrawal", async () => {
@@ -670,7 +1002,7 @@ describe("migrating - every new mutation rejects", () => {
 });
 
 describe("needs_reconciliation - every new mutation rejects, identically to migrating", () => {
-  it("rejects a new contribution", async () => {
+  it("rejects a new contribution, even with a missing ownership row, and never creates one (Checkpoint 5B.3C)", async () => {
     await seedTrip({
       ownershipModelState: "needs_reconciliation",
       ownershipModelVersion: CURRENT_TRIP_OWNERSHIP_MODEL_VERSION,
@@ -679,6 +1011,11 @@ describe("needs_reconciliation - every new mutation rejects, identically to migr
       recordSavingsTransactionCore(db, MEMBER_UID, baseRequest()),
       "failed-precondition"
     );
+    const rowSnap = await db
+      .collection("tripMemberOwnership")
+      .doc(ownershipId(TRIP_ID, MEMBER_UID))
+      .get();
+    assert.equal(rowSnap.exists, false);
   });
 
   it("rejects a new withdrawal", async () => {
@@ -805,12 +1142,17 @@ describe("corrupt / unsupported ownership model state - fails closed", () => {
   ];
 
   for (const [label, overrides] of cases) {
-    it(`${label} rejects a new contribution`, async () => {
+    it(`${label} rejects a new contribution, and never creates an ownership row (Checkpoint 5B.3C)`, async () => {
       await seedTrip(overrides);
       await assertRejectsWithCode(
         recordSavingsTransactionCore(db, MEMBER_UID, baseRequest()),
         "failed-precondition"
       );
+      const rowSnap = await db
+        .collection("tripMemberOwnership")
+        .doc(ownershipId(TRIP_ID, MEMBER_UID))
+        .get();
+      assert.equal(rowSnap.exists, false);
     });
   }
 });

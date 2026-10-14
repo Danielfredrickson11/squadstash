@@ -11,7 +11,9 @@ import {
 import {
   applyMemberContribution,
   applyMemberWithdrawal,
+  reconcileOwnershipAgainstAggregate,
 } from "../domain/tripOwnershipAccounting";
+import type {MemberOwnershipBalance} from "../domain/tripOwnershipAccounting";
 import {classifyOwnershipMutationGate} from "../domain/tripOwnershipModel";
 import {
   isValidOwnershipMinor,
@@ -197,6 +199,16 @@ export async function recordSavingsTransactionCore(
     let ownershipRowUpdate: {
       ref: FirebaseFirestore.DocumentReference;
       newOwnershipMinor: number;
+      isNewRow: boolean;
+    } | null = null;
+    // Checkpoint 5B.3C.1: set only for the missing-row + contribution
+    // case, deferred until the authoritative PRE-CONTRIBUTION aggregate
+    // (`currentBalanceMinor`, computed by the ledger-classification
+    // block further down) is known - the complete-ownership-set
+    // reconciliation gate (§2 of that checkpoint) needs that exact
+    // value, never a value guessed before the ledger-state branch runs.
+    let pendingMissingRowContribution: {
+      ref: FirebaseFirestore.DocumentReference;
     } | null = null;
     if (input.resourceType === "trip") {
       const gate = classifyOwnershipMutationGate(
@@ -218,9 +230,22 @@ export async function recordSavingsTransactionCore(
       }
       if (gate.kind === "initialized") {
         // An initialized Trip has, by definition, completed migration/
-        // reconciliation and must have a complete trusted ownership
-        // cache - 5B.3 never silently invents or repairs a missing row
-        // (that is exclusively 5B.4/5B.5's job).
+        // reconciliation, but a CURRENT, authorized member may still
+        // have no canonical ownership row at all - the frozen design's
+        // own "no row == ownership 0" equivalence (original preflight
+        // §11/§19), e.g. a member who has simply never personally
+        // transacted yet (migration reconstructs ownership from
+        // financial HISTORY only, never from `memberIds` - see 5B.4B's
+        // own §11). Checkpoint 5B.3C: lazily materialize that implicit
+        // zero row - for a CONTRIBUTION only - at the moment an already-
+        // authorized member first acquires positive economic ownership.
+        // This is NOT ownership repair, NOT migration, and NOT a
+        // membership grant - every authorization gate above and below
+        // this block (self-only, current-member, archive, currency,
+        // ownership-model-state) still runs identically regardless of
+        // whether this row exists; a uid that never passes those gates
+        // never reaches this code at all, so it can never manufacture a
+        // row for itself.
         const ownershipId = tripMemberOwnershipId(
           input.resourceId,
           input.memberUid
@@ -229,60 +254,79 @@ export async function recordSavingsTransactionCore(
           .collection("tripMemberOwnership")
           .doc(ownershipId);
         const ownershipSnap = await tx.get(ownershipRef);
-        if (!ownershipSnap.exists) {
-          throw new HttpsError(
-            "failed-precondition",
-            "No Shared Stash ownership record exists for you on this trip."
-          );
-        }
-        const ownershipData =
-          ownershipSnap.data() as FirebaseFirestore.DocumentData;
-        if (
-          ownershipData.tripId !== input.resourceId ||
-          ownershipData.uid !== input.memberUid ||
-          !isValidOwnershipMinor(ownershipData.ownershipMinor)
-        ) {
-          throw new HttpsError(
-            "failed-precondition",
-            "Your Shared Stash ownership record is malformed."
-          );
-        }
-        const currentOwnershipMinor: number = ownershipData.ownershipMinor;
 
-        if (input.type === "contribution") {
-          const contributionResult = applyMemberContribution(
-            currentOwnershipMinor,
-            input.amountMinor
-          );
-          if (!contributionResult.ok) {
+        if (ownershipSnap.exists) {
+          const ownershipData =
+            ownershipSnap.data() as FirebaseFirestore.DocumentData;
+          if (
+            ownershipData.tripId !== input.resourceId ||
+            ownershipData.uid !== input.memberUid ||
+            !isValidOwnershipMinor(ownershipData.ownershipMinor)
+          ) {
             throw new HttpsError(
               "failed-precondition",
-              "Your resulting Shared Stash ownership is not a safe integer."
+              "Your Shared Stash ownership record is malformed."
             );
           }
-          ownershipRowUpdate = {
-            ref: ownershipRef,
-            newOwnershipMinor: contributionResult.newOwnershipMinor,
-          };
+          const currentOwnershipMinor: number = ownershipData.ownershipMinor;
+
+          // Existing-row path - unchanged, efficient, no ownership-set
+          // scan (Checkpoint 5B.3C.1, §8: only the missing-row
+          // contribution case below ever reads more than this one row).
+          if (input.type === "contribution") {
+            const contributionResult = applyMemberContribution(
+              currentOwnershipMinor,
+              input.amountMinor
+            );
+            if (!contributionResult.ok) {
+              throw new HttpsError(
+                "failed-precondition",
+                "Your resulting Shared Stash ownership is not a safe " +
+                  "integer."
+              );
+            }
+            ownershipRowUpdate = {
+              ref: ownershipRef,
+              newOwnershipMinor: contributionResult.newOwnershipMinor,
+              isNewRow: false,
+            };
+          } else {
+            // withdrawal - the frozen ceiling: requested <= own
+            // ownership. The Trip owner has no special ability to
+            // consume someone else's ownership; this primitive only
+            // ever sees the acting member's own row, structurally.
+            const withdrawalResult = applyMemberWithdrawal(
+              currentOwnershipMinor,
+              input.amountMinor
+            );
+            if (!withdrawalResult.ok) {
+              throw new HttpsError(
+                "failed-precondition",
+                "This withdrawal exceeds your own Shared Stash ownership."
+              );
+            }
+            ownershipRowUpdate = {
+              ref: ownershipRef,
+              newOwnershipMinor: withdrawalResult.newOwnershipMinor,
+              isNewRow: false,
+            };
+          }
+        } else if (input.type === "withdrawal") {
+          // A missing row is exactly ownership 0 for ceiling purposes -
+          // any positive withdrawal against it must reject, and a
+          // withdrawal attempt NEVER lazily creates a row (Checkpoint
+          // 5B.3C §4/5B.3C.1 §9) - no reconciliation scan is needed
+          // merely to reject.
+          throw new HttpsError(
+            "failed-precondition",
+            "This withdrawal exceeds your own Shared Stash ownership."
+          );
         } else {
-          // withdrawal - the frozen ceiling: requested <= own ownership.
-          // The Trip owner has no special ability to consume someone
-          // else's ownership; this primitive only ever sees the acting
-          // member's own row, structurally.
-          const withdrawalResult = applyMemberWithdrawal(
-            currentOwnershipMinor,
-            input.amountMinor
-          );
-          if (!withdrawalResult.ok) {
-            throw new HttpsError(
-              "failed-precondition",
-              "This withdrawal exceeds your own Shared Stash ownership."
-            );
-          }
-          ownershipRowUpdate = {
-            ref: ownershipRef,
-            newOwnershipMinor: withdrawalResult.newOwnershipMinor,
-          };
+          // Missing row + contribution: NOT yet safe to treat as zero.
+          // Deferred to the complete-ownership-set reconciliation gate
+          // below (Checkpoint 5B.3C.1, §2), once the authoritative
+          // pre-contribution aggregate is known.
+          pendingMissingRowContribution = {ref: ownershipRef};
         }
       }
       // gate.kind === "legacy": no ownership row is read or required -
@@ -392,6 +436,99 @@ export async function recordSavingsTransactionCore(
       );
     }
 
+    // Checkpoint 5B.3C.1, §2: the missing-row-contribution safety gate.
+    // A missing acting-member row is ambiguous on its own - it could
+    // mean "genuinely never participated" (safe to treat as 0) or "this
+    // member's row was corrupted/deleted out-of-band" (NOT safe - see
+    // the checkpoint's own worked example: Daniel's row vanishing while
+    // the aggregate still reflects his contribution). The only way to
+    // tell them apart without a new, separate migration/repair
+    // mechanism is to prove that every OTHER existing ownership row for
+    // this Trip already reconciles exactly against the authoritative
+    // PRE-CONTRIBUTION aggregate (`currentBalanceMinor`, just computed
+    // above) - if it does, the acting member's true share of that
+    // aggregate can only be the remainder, which is 0 by construction.
+    // Reuses the existing BigInt-safe `reconcileOwnershipAgainstAggregate`
+    // primitive verbatim - no new sum/BigInt logic here.
+    if (pendingMissingRowContribution !== null) {
+      const existingRowsSnap = await tx.get(
+        db
+          .collection("tripMemberOwnership")
+          .where("tripId", "==", input.resourceId)
+      );
+
+      const balances: MemberOwnershipBalance[] = [];
+      let malformed = false;
+      for (const doc of existingRowsSnap.docs) {
+        const d = doc.data() as FirebaseFirestore.DocumentData;
+        if (
+          typeof d.uid !== "string" ||
+          d.uid.length === 0 ||
+          d.tripId !== input.resourceId ||
+          doc.id !== tripMemberOwnershipId(input.resourceId, d.uid)
+        ) {
+          malformed = true;
+          break;
+        }
+        balances.push({uid: d.uid, ownershipMinor: d.ownershipMinor});
+      }
+
+      if (malformed) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This trip's Shared Stash ownership records are malformed " +
+            "and cannot be safely reconciled."
+        );
+      }
+
+      // Checkpoint 5B.3C.1, §3: an empty existing set is the
+      // legitimate zero-history case - reconcileOwnershipAgainstAggregate
+      // itself requires a non-empty array (it is designed for the
+      // live, at-least-one-row context), so the trivial "nothing
+      // exists yet, aggregate must be 0" check is performed directly.
+      const reconciles = balances.length === 0 ?
+        currentBalanceMinor === 0 :
+        reconcileOwnershipAgainstAggregate(currentBalanceMinor, balances).ok;
+      if (!reconciles) {
+        // Checkpoint 5B.3C.1, §7: a genuine needs_reconciliation state
+        // transition would require the same {kind: "success" |
+        // "reconciliation_failed"} sentinel/co-transaction pattern
+        // recordSharedStashExpense.ts uses so a state-flip write can
+        // survive an otherwise-aborted transaction - adopting that
+        // here would restructure this function's entire return/throw
+        // contract (every call site today expects either a definite
+        // result or a thrown HttpsError, including the idempotent-
+        // replay branch above). That is a broader change than this
+        // checkpoint's own scope boundary (recordSavingsTransaction.ts
+        // only, no unrelated restructuring) - deferred, reported
+        // explicitly rather than improvised. The minimum required
+        // safety property still holds exactly: fail closed, zero
+        // financial mutation, Trip ownershipModelState untouched.
+        throw new HttpsError(
+          "failed-precondition",
+          "This trip's Shared Stash ownership records do not reconcile " +
+            "with its aggregate balance; this contribution cannot be " +
+            "processed safely."
+        );
+      }
+
+      const contributionResult = applyMemberContribution(
+        0,
+        input.amountMinor
+      );
+      if (!contributionResult.ok) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Your resulting Shared Stash ownership is not a safe integer."
+        );
+      }
+      ownershipRowUpdate = {
+        ref: pendingMissingRowContribution.ref,
+        newOwnershipMinor: contributionResult.newOwnershipMinor,
+        isNewRow: true,
+      };
+    }
+
     const transitionResult = applyLedgerTransition(
       currentBalanceMinor,
       input.type,
@@ -452,10 +589,27 @@ export async function recordSavingsTransactionCore(
     // stays null for "legacy", which never reads or writes this
     // collection at all). No other member's row is ever touched.
     if (ownershipRowUpdate !== null) {
-      tx.update(ownershipRowUpdate.ref, {
-        ownershipMinor: ownershipRowUpdate.newOwnershipMinor,
-        lastUpdatedAt: FieldValue.serverTimestamp(),
-      });
+      if (ownershipRowUpdate.isNewRow) {
+        // Checkpoint 5B.3C: lazily materializing the implicit zero row
+        // - `tx.create` (never a plain `tx.set`) so that if a
+        // concurrent transaction already created this exact row
+        // between our read and our commit, this transaction fails
+        // closed and retries against the now-current row rather than
+        // silently overwriting it (Firestore's own transaction
+        // conflict-retry already re-runs this entire callback against
+        // fresh reads, landing in the "row exists" branch above).
+        tx.create(ownershipRowUpdate.ref, {
+          tripId: input.resourceId,
+          uid: input.memberUid,
+          ownershipMinor: ownershipRowUpdate.newOwnershipMinor,
+          lastUpdatedAt: FieldValue.serverTimestamp(),
+        });
+      } else {
+        tx.update(ownershipRowUpdate.ref, {
+          ownershipMinor: ownershipRowUpdate.newOwnershipMinor,
+          lastUpdatedAt: FieldValue.serverTimestamp(),
+        });
+      }
     }
 
     return {
