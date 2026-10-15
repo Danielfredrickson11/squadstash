@@ -21,6 +21,7 @@ import {initializeApp} from "firebase-admin/app";
 
 import {
   reconcileOwnershipAgainstAggregate,
+  sumOwnershipMinor,
 } from "../domain/tripOwnershipAccounting";
 import type {MemberOwnershipBalance} from "../domain/tripOwnershipAccounting";
 import {tripMemberOwnershipId} from "../domain/tripMemberOwnership";
@@ -698,6 +699,63 @@ function resolveTripEffectiveCurrency(
   return {ok: true, effectiveCurrency: result.effectiveCurrency};
 }
 
+// Checkpoint 5B.4B.4: the exact sum of a reconstructed ownership set,
+// for audit-output reporting only - reuses the existing BigInt-safe
+// `sumOwnershipMinor` primitive rather than duplicating arithmetic.
+// `sumOwnershipMinor` itself requires a non-empty array (it is designed
+// for the live-callable context, where at least one row always
+// exists); a genuinely zero-participant reconstruction has no rows at
+// all, which sums to exactly 0 without needing that primitive. A
+// non-null, non-zero failure is structurally unreachable here (the
+// array has already been proven well-formed by
+// `reconcileOwnershipAgainstAggregate`/the materialization checks by
+// the time this is ever called) - returning `null` rather than a
+// silently-wrong number in that unreachable case, per this
+// checkpoint's own "null means not evaluated/unavailable" convention.
+/**
+ * Computes the exact sum of a reconstructed ownership set, for
+ * audit-output reporting only.
+ * @param {MemberOwnershipBalance[]} balances The reconstructed
+ *   ownership set.
+ * @return {number | null} The exact total, or `null` if it could not
+ *   be computed (structurally unreachable in practice).
+ */
+function sumReconstructedOwnership(
+  balances: MemberOwnershipBalance[]
+): number | null {
+  if (balances.length === 0) {
+    return 0;
+  }
+  const result = sumOwnershipMinor(balances);
+  return result.ok ? result.totalMinor : null;
+}
+
+/**
+ * Derives the two plain `openingBalanceMinor`/`aggregateLedgerBalanceMinor`
+ * numbers from a `LockedFinancialBasis` - the same discriminated
+ * ternary this file previously repeated at every call site; factored
+ * out once here (Checkpoint 5B.4C) rather than duplicated again by the
+ * already_completed report.
+ * @param {LockedFinancialBasis} basis The locked/frozen financial
+ *   basis.
+ * @return {object} `{openingBalanceMinor, aggregateLedgerBalanceMinor}`.
+ */
+function basisAmounts(basis: LockedFinancialBasis): {
+  openingBalanceMinor: number;
+  aggregateLedgerBalanceMinor: number;
+} {
+  if (basis.ledgerInitializationKind === "initialized") {
+    return {
+      openingBalanceMinor: basis.ledgerOpeningBalanceMinor,
+      aggregateLedgerBalanceMinor: basis.ledgerBalanceMinor,
+    };
+  }
+  return {
+    openingBalanceMinor: basis.derivedLegacyOpeningBalanceMinor,
+    aggregateLedgerBalanceMinor: basis.derivedLegacyOpeningBalanceMinor,
+  };
+}
+
 // ---------------------------------------------------------------------
 // STRICT already_completed / needs_reconciliation CLASSIFICATION
 // (Checkpoint 5B.4B.1, Sections B/C) - shared by both runDryRun and
@@ -791,6 +849,188 @@ function evaluateAlreadyCompleted(
     };
   }
   return {kind: "already_completed"};
+}
+
+// Checkpoint 5B.4B.4, Section B (hardened by Checkpoint 5B.4C, Section
+// A): the safe, read-only already_completed audit-report enrichment.
+// Called ONLY after `evaluateAlreadyCompleted` has already strictly
+// confirmed `already_completed` - this function never influences that
+// classification and performs no new economic verification of any
+// kind; it purely reports data that is either already FROZEN/
+// PERSISTED on the migration-state document itself, or - for the
+// three HISTORICAL-RECONSTRUCTION fields specifically
+// (`reconstructedOwnership`/`reconstructedOwnershipTotalMinor`/
+// `allocationsToCreate`) - read fresh and PROVEN still identical to
+// the frozen migration output before ever being reported as such.
+//
+// Checkpoint 5B.4C, Section A: legitimate post-migration financial
+// activity (a lazy-initialized contribution/withdrawal, a brand-new
+// Shared-Stash Expense) can change `tripMemberOwnership` rows or add
+// new `tripOwnershipAllocations` records at ANY time after
+// `"initialized"` - current rows are therefore NOT automatically the
+// historical migration output. The three historical fields above are
+// populated from the current rows ONLY when BOTH the exact digest AND
+// the exact count of the current set equal the frozen
+// `expectedOwnershipDigest`/`expectedOwnershipCount` (ownership) or
+// `expectedAllocationDigest`/`expectedAllocationCount` (allocations) -
+// reusing the exact same canonical digest primitives every other
+// exact-output check in this file already uses, never a new
+// comparison scheme. A mismatch is NOT reported as an anomaly and
+// NEVER changes `already_completed` - it only means these three
+// fields stay at their default `null` ("not provably the original
+// migration output"), since legitimate evolution is an expected,
+// healthy outcome this function must never mistake for drift.
+//
+// Deliberately NOT populated here, and why:
+//   - `historyCounts`: the per-category breakdown (ordinary
+//     contributions vs withdrawals vs Shared-Stash events) was only
+//     ever computed in-memory during the original reconstruction - it
+//     was never persisted individually (only the combined
+//     `sourceHistoryDocumentCount` was frozen). Reconstructing it here
+//     would require re-reading and re-replaying the Trip's full
+//     history, which is a materially larger, re-verification-shaped
+//     operation this narrow audit-completeness patch deliberately
+//     does not perform.
+//   - `reconciliation.*`: already_completed performs no new
+//     verification. The individual per-check booleans this type
+//     exists to report were only ever computed at runtime by the
+//     ORIGINAL completing run's own finalization transaction, and were
+//     never persisted anywhere - there is no trustworthy source to
+//     honestly reconstruct them from after the fact, so they remain
+//     `null` ("not evaluated this run") rather than being guessed.
+/**
+ * Builds the safe, read-only already_completed audit-report fields.
+ * @param {Firestore} db The Firestore instance.
+ * @param {string} tripId The Trip's own id.
+ * @param {TripOwnershipMigrationState} ms The already-validated,
+ *   `phase === "completed"` migration-state document.
+ * @return {Promise<Partial<MigrationAuditResult>>} The safe fields to
+ *   merge onto the audit result - never touches `verdict`/`phase`.
+ */
+async function buildAlreadyCompletedReport(
+  db: Firestore,
+  tripId: string,
+  ms: TripOwnershipMigrationState
+): Promise<Partial<MigrationAuditResult>> {
+  if (ms.phase !== "completed") {
+    // Structurally unreachable given this function's own contract
+    // (the caller only calls this once `already_completed` is
+    // confirmed) - fail closed to an empty enrichment rather than
+    // assuming, if that contract is ever violated.
+    return {};
+  }
+
+  const lockedFinancialBasis = ms.lockedFinancialBasis;
+  const {openingBalanceMinor, aggregateLedgerBalanceMinor} =
+    basisAmounts(lockedFinancialBasis);
+
+  const [ownershipSnap, allocationSnap] = await Promise.all([
+    db.collection("tripMemberOwnership").where("tripId", "==", tripId).get(),
+    db
+      .collection("tripOwnershipAllocations")
+      .where("tripId", "==", tripId)
+      .get(),
+  ]);
+
+  // Best-effort structural parse only - a single malformed row makes
+  // the whole current set impossible to honestly prove equal to the
+  // frozen digest (the digest primitive requires well-typed input),
+  // so the corresponding historical field below simply stays null
+  // rather than comparing a partial/guessed set.
+  const currentOwnership: MemberOwnershipBalance[] = [];
+  let ownershipRowsWellFormed = true;
+  for (const doc of ownershipSnap.docs) {
+    const d = doc.data() as Record<string, unknown>;
+    if (
+      typeof d.uid === "string" &&
+      d.uid.length > 0 &&
+      typeof d.ownershipMinor === "number" &&
+      Number.isSafeInteger(d.ownershipMinor) &&
+      d.ownershipMinor >= 0
+    ) {
+      currentOwnership.push({uid: d.uid, ownershipMinor: d.ownershipMinor});
+    } else {
+      ownershipRowsWellFormed = false;
+    }
+  }
+
+  const currentAllocations: AllocationEconomicProjection[] = [];
+  let allocationRowsWellFormed = true;
+  for (const doc of allocationSnap.docs) {
+    const d = doc.data() as Record<string, unknown>;
+    if (
+      typeof d.tripId === "string" &&
+      typeof d.expenseId === "string" &&
+      typeof d.withdrawalTransactionId === "string" &&
+      typeof d.amountMinor === "number" &&
+      typeof d.currency === "string" &&
+      Array.isArray(d.allocations) &&
+      typeof d.provenance === "string" &&
+      d.createdAt instanceof Timestamp
+    ) {
+      currentAllocations.push({
+        id: doc.id,
+        tripId: d.tripId,
+        expenseId: d.expenseId,
+        withdrawalTransactionId: d.withdrawalTransactionId,
+        amountMinor: d.amountMinor,
+        currency: d.currency,
+        allocations: d.allocations as AllocationEconomicProjection[
+          "allocations"
+        ],
+        provenance: d.provenance,
+        createdAt: d.createdAt,
+      });
+    } else {
+      allocationRowsWellFormed = false;
+    }
+  }
+
+  const report: Partial<MigrationAuditResult> = {
+    attemptId: ms.attemptId,
+    lockedFinancialBasis,
+    openingBalanceMinor,
+    aggregateLedgerBalanceMinor,
+    sourceHistoryDigest: ms.sourceHistoryDigest,
+    sourceHistoryDocumentCount: ms.sourceHistoryDocumentCount,
+    expectedOwnershipDigest: ms.expectedOwnershipDigest,
+    expectedAllocationDigest: ms.expectedAllocationDigest,
+  };
+
+  // Checkpoint 5B.4C, Section A: exact digest AND exact count, both
+  // required - never count/aggregate alone - reusing the canonical
+  // `computeOwnershipDigest` primitive, exactly as finalization's own
+  // exact-output check does.
+  if (ownershipRowsWellFormed) {
+    const currentOwnershipDigest = computeOwnershipDigest(currentOwnership);
+    if (
+      currentOwnershipDigest.hash === ms.expectedOwnershipDigest &&
+      currentOwnershipDigest.count === ms.expectedOwnershipCount
+    ) {
+      report.reconstructedOwnership = currentOwnership;
+      report.reconstructedOwnershipTotalMinor =
+        sumReconstructedOwnership(currentOwnership);
+    }
+  }
+
+  if (allocationRowsWellFormed) {
+    const currentAllocationDigest = computeAllocationDigest(
+      currentAllocations
+    );
+    if (
+      currentAllocationDigest.hash === ms.expectedAllocationDigest &&
+      currentAllocationDigest.count === ms.expectedAllocationCount
+    ) {
+      report.allocationsToCreate = currentAllocations.map((a) => ({
+        withdrawalTransactionId: a.withdrawalTransactionId,
+        expenseId: a.expenseId,
+        amountMinor: a.amountMinor,
+        allocations: a.allocations,
+      }));
+    }
+  }
+
+  return report;
 }
 
 // ---------------------------------------------------------------------
@@ -931,6 +1171,11 @@ export async function runDryRun(
     if (completion.kind === "already_completed") {
       result.verdict = "already_completed";
       result.phase = "completed";
+      // Checkpoint 5B.4B.4, Section B: safe, read-only report
+      // enrichment - never influences the already_completed
+      // classification itself, which is already final by this point.
+      const ms = migrationStateSnap.data() as TripOwnershipMigrationState;
+      Object.assign(result, await buildAlreadyCompletedReport(db, tripId, ms));
     } else {
       result.verdict = "requires_manual_review";
       result.anomalies.push({
@@ -989,14 +1234,10 @@ export async function runDryRun(
     effectiveCurrency
   );
   result.lockedFinancialBasis = lockedFinancialBasis;
-  const openingBalanceMinor =
-    lockedFinancialBasis.ledgerInitializationKind === "initialized" ?
-      lockedFinancialBasis.ledgerOpeningBalanceMinor :
-      lockedFinancialBasis.derivedLegacyOpeningBalanceMinor;
-  const currentAggregateLedgerBalanceMinor =
-    lockedFinancialBasis.ledgerInitializationKind === "initialized" ?
-      lockedFinancialBasis.ledgerBalanceMinor :
-      lockedFinancialBasis.derivedLegacyOpeningBalanceMinor;
+  const {
+    openingBalanceMinor,
+    aggregateLedgerBalanceMinor: currentAggregateLedgerBalanceMinor,
+  } = basisAmounts(lockedFinancialBasis);
   result.openingBalanceMinor = openingBalanceMinor;
   result.aggregateLedgerBalanceMinor = currentAggregateLedgerBalanceMinor;
 
@@ -1028,7 +1269,9 @@ export async function runDryRun(
   result.sourceHistoryDigest = reconstruction.sourceHistoryDigest.hash;
   result.sourceHistoryDocumentCount = reconstruction.sourceHistoryDigest.count;
   result.reconstructedOwnership = reconstruction.ownership;
-  result.reconstructedOwnershipTotalMinor = currentAggregateLedgerBalanceMinor;
+  result.reconstructedOwnershipTotalMinor = sumReconstructedOwnership(
+    reconstruction.ownership
+  );
   result.expectedOwnershipDigest = reconstruction.expectedOwnershipDigest.hash;
   result.expectedAllocationDigest =
     reconstruction.expectedAllocationDigest.hash;
@@ -1269,6 +1512,85 @@ export type TransitionOutcome =
   | {ok: true}
   | {ok: false; reasonCode: string; detail: string};
 
+// Checkpoint 5B.4B.4: per-check evidence from the finalization
+// transaction's own 13-step gate (§22) - each field mirrors EXACTLY
+// one check that transaction itself performed, set at the moment that
+// specific check ran, never inferred afterward from "finalization
+// succeeded." `null` means that specific check was never reached this
+// attempt (an earlier check already failed closed, or finalization was
+// never called at all); `true`/`false` mean it was reached and its
+// exact boolean outcome.
+export type FinalizationEvidence = {
+  lockedFinancialBasisMatches: boolean | null;
+  sourceHistoryDigestMatches: boolean | null;
+  exactOwnershipOutputMatches: boolean | null;
+  exactAllocationOutputMatches: boolean | null;
+  aggregateMatches: boolean | null;
+};
+
+export type FinalizationOutcome =
+  | {ok: true; evidence: FinalizationEvidence}
+  | {
+      ok: false;
+      reasonCode: string;
+      detail: string;
+      evidence: FinalizationEvidence;
+    };
+
+/**
+ * A fresh, all-null finalization-evidence block - every check starts
+ * unreached; each is set to `true`/`false` only at the exact point in
+ * `finalizeMigration` where that specific check actually runs.
+ * @return {FinalizationEvidence} The empty evidence block.
+ */
+function emptyFinalizationEvidence(): FinalizationEvidence {
+  return {
+    lockedFinancialBasisMatches: null,
+    sourceHistoryDigestMatches: null,
+    exactOwnershipOutputMatches: null,
+    exactAllocationOutputMatches: null,
+    aggregateMatches: null,
+  };
+}
+
+/**
+ * Copies every non-null field of finalization's own evidence onto the
+ * audit result's `reconciliation` block, overwriting only the fields
+ * finalization actually reached - a field finalization never reached
+ * (still `null` on its evidence) leaves whatever the caller already
+ * had there untouched (e.g. `aggregateMatches`/`historyReplayMatches`
+ * already populated from the reconstruction step itself).
+ * @param {object} reconciliation The audit result's own reconciliation
+ *   block, mutated in place.
+ * @param {FinalizationEvidence} evidence Finalization's own evidence,
+ *   from either its success or failure outcome.
+ * @return {void}
+ */
+function mergeFinalizationEvidence(
+  reconciliation: MigrationAuditResult["reconciliation"],
+  evidence: FinalizationEvidence
+): void {
+  if (evidence.lockedFinancialBasisMatches !== null) {
+    reconciliation.lockedFinancialBasisMatches =
+      evidence.lockedFinancialBasisMatches;
+  }
+  if (evidence.sourceHistoryDigestMatches !== null) {
+    reconciliation.sourceHistoryDigestMatches =
+      evidence.sourceHistoryDigestMatches;
+  }
+  if (evidence.exactOwnershipOutputMatches !== null) {
+    reconciliation.exactOwnershipOutputMatches =
+      evidence.exactOwnershipOutputMatches;
+  }
+  if (evidence.exactAllocationOutputMatches !== null) {
+    reconciliation.exactAllocationOutputMatches =
+      evidence.exactAllocationOutputMatches;
+  }
+  if (evidence.aggregateMatches !== null) {
+    reconciliation.aggregateMatches = evidence.aggregateMatches;
+  }
+}
+
 /**
  * The `"locked" -> "reconstructed"` transition (§16B) - its own atomic
  * step. Re-scans/reconstructs the bounded history OUTSIDE this
@@ -1296,14 +1618,10 @@ async function transitionToReconstructed(
   }
   const ms = migrationStateSnap.data() as TripOwnershipMigrationState;
   const lockedFinancialBasis = ms.lockedFinancialBasis;
-  const openingBalanceMinor =
-    lockedFinancialBasis.ledgerInitializationKind === "initialized" ?
-      lockedFinancialBasis.ledgerOpeningBalanceMinor :
-      lockedFinancialBasis.derivedLegacyOpeningBalanceMinor;
-  const currentAggregate =
-    lockedFinancialBasis.ledgerInitializationKind === "initialized" ?
-      lockedFinancialBasis.ledgerBalanceMinor :
-      lockedFinancialBasis.derivedLegacyOpeningBalanceMinor;
+  const {
+    openingBalanceMinor,
+    aggregateLedgerBalanceMinor: currentAggregate,
+  } = basisAmounts(lockedFinancialBasis);
 
   const loaded = await loadTripHistory(db, tripId);
   if (!loaded.ok) {
@@ -1763,32 +2081,50 @@ export async function materializeAllocationOutputs(
  * this run. Hardened by Checkpoint 5B.4B.1, Section M: additionally
  * proves the migration-state document itself validates strictly, and
  * that it belongs to this exact Trip/attempt - never assumed merely
- * from reading it at the expected location.
+ * from reading it at the expected location. Hardened by Checkpoint
+ * 5B.4B.4: returns `FinalizationEvidence` alongside the outcome -
+ * each evidence field is set at the EXACT point its own corresponding
+ * check runs (never inferred afterward from "the transaction
+ * succeeded"), so a caller can report genuinely-verified audit
+ * booleans rather than fabricating them from the final result alone.
  * @param {Firestore} db The Firestore instance.
  * @param {string} tripId The Trip's own id.
  * @param {string} attemptId This run's own attempt id.
- * @return {Promise<TransitionOutcome>} Ok, or the specific anomaly.
+ * @return {Promise<FinalizationOutcome>} Ok, or the specific anomaly -
+ *   either way, with the per-check evidence gathered so far.
  */
 async function finalizeMigration(
   db: Firestore,
   tripId: string,
   attemptId: string
-): Promise<TransitionOutcome> {
+): Promise<FinalizationOutcome> {
   const tripRef = db.collection("trips").doc(tripId);
   const migrationStateRef = db
     .collection("tripOwnershipMigrationState")
     .doc(tripOwnershipMigrationStateId(tripId));
 
   return db.runTransaction(async (tx) => {
+    const evidence = emptyFinalizationEvidence();
+
     const tripSnap = await tx.get(tripRef);
     if (!tripSnap.exists) {
-      return {ok: false, reasonCode: "trip_not_found", detail: "missing"};
+      return {
+        ok: false,
+        reasonCode: "trip_not_found",
+        detail: "missing",
+        evidence,
+      };
     }
     const tripData = tripSnap.data() as Record<string, unknown>;
 
     const msSnap = await tx.get(migrationStateRef);
     if (!msSnap.exists) {
-      return {ok: false, reasonCode: "lost_lock_state", detail: "missing"};
+      return {
+        ok: false,
+        reasonCode: "lost_lock_state",
+        detail: "missing",
+        evidence,
+      };
     }
     const msShapeResult = validateMigrationStateShape(msSnap.data());
     if (!msShapeResult.ok) {
@@ -1796,6 +2132,7 @@ async function finalizeMigration(
         ok: false,
         reasonCode: "invalid_migration_state_phase",
         detail: msShapeResult.reason,
+        evidence,
       };
     }
     const ms = msSnap.data() as TripOwnershipMigrationState;
@@ -1804,6 +2141,7 @@ async function finalizeMigration(
         ok: false,
         reasonCode: "invalid_migration_state_phase",
         detail: "migrationState.tripId does not match the target Trip.",
+        evidence,
       };
     }
     if (ms.attemptId !== attemptId) {
@@ -1811,6 +2149,7 @@ async function finalizeMigration(
         ok: false,
         reasonCode: "invalid_migration_state_phase",
         detail: "migrationState.attemptId no longer matches this attempt.",
+        evidence,
       };
     }
 
@@ -1838,6 +2177,7 @@ async function finalizeMigration(
         ok: false,
         reasonCode: "unexpected_state_change",
         detail: `Trip is no longer migrating (now ${classification.kind}).`,
+        evidence,
       };
     }
 
@@ -1848,6 +2188,7 @@ async function finalizeMigration(
         reasonCode: "invalid_migration_state_phase",
         detail: `migrationStateRef.phase is "${ms.phase}", not ` +
           "\"reconstructed\".",
+        evidence,
       };
     }
 
@@ -1861,19 +2202,23 @@ async function finalizeMigration(
       currentLedgerBootstrap.kind !== "case_a" &&
       currentLedgerBootstrap.kind !== "case_a_equivalent"
     ) {
+      evidence.lockedFinancialBasisMatches = false;
       return {
         ok: false,
         reasonCode: "locked_financial_basis_mismatch",
         detail: "Trip's current ledger-bootstrap classification is no " +
           "longer Case A / Case A-equivalent.",
+        evidence,
       };
     }
     const currencyResolution = resolveTripEffectiveCurrency(tripData);
     if (!currencyResolution.ok) {
+      evidence.lockedFinancialBasisMatches = false;
       return {
         ok: false,
         reasonCode: "locked_financial_basis_mismatch",
         detail: "Trip has a malformed currency field.",
+        evidence,
       };
     }
     const currentFinancialBasis = buildLockedFinancialBasis(
@@ -1884,11 +2229,13 @@ async function finalizeMigration(
       currentFinancialBasis,
       ms.lockedFinancialBasis
     );
+    evidence.lockedFinancialBasisMatches = basisMatches;
     if (!basisMatches) {
       return {
         ok: false,
         reasonCode: "locked_financial_basis_mismatch",
         detail: "Current financial basis disagrees with the locked one.",
+        evidence,
       };
     }
 
@@ -1897,10 +2244,12 @@ async function finalizeMigration(
     for (const doc of txSnap.docs) {
       const parsed = parseSavingsTransactionRecord(doc.id, doc.data());
       if (!parsed.ok) {
+        evidence.sourceHistoryDigestMatches = false;
         return {
           ok: false,
           reasonCode: "out_of_band_mutation_detected",
           detail: parsed.reason,
+          evidence,
         };
       }
       transactions.push(parsed.value);
@@ -1909,10 +2258,12 @@ async function finalizeMigration(
     for (const doc of expenseSnap.docs) {
       const parsed = parseExpenseRecord(doc.id, tripId, doc.data());
       if (!parsed.ok) {
+        evidence.sourceHistoryDigestMatches = false;
         return {
           ok: false,
           reasonCode: "out_of_band_mutation_detected",
           detail: parsed.reason,
+          evidence,
         };
       }
       expenses.push(parsed.value);
@@ -1921,15 +2272,17 @@ async function finalizeMigration(
       transactions,
       expenses
     );
-    if (
-      currentSourceDigest.hash !== ms.sourceHistoryDigest ||
-      currentSourceDigest.count !== ms.sourceHistoryDocumentCount
-    ) {
+    const sourceDigestMatches =
+      currentSourceDigest.hash === ms.sourceHistoryDigest &&
+      currentSourceDigest.count === ms.sourceHistoryDocumentCount;
+    evidence.sourceHistoryDigestMatches = sourceDigestMatches;
+    if (!sourceDigestMatches) {
       return {
         ok: false,
         reasonCode: "out_of_band_mutation_detected",
         detail: "Source-history digest/count no longer match the " +
           "locked expectation.",
+        evidence,
       };
     }
 
@@ -1946,29 +2299,37 @@ async function finalizeMigration(
         !Number.isSafeInteger(d.ownershipMinor) ||
         d.ownershipMinor < 0
       ) {
+        evidence.exactOwnershipOutputMatches = false;
         return {
           ok: false,
           reasonCode: "exact_output_mismatch",
           detail: `tripMemberOwnership/${doc.id} is malformed.`,
+          evidence,
         };
       }
       balances.push({uid: d.uid, ownershipMinor: d.ownershipMinor});
     }
     if (balances.length !== ms.expectedOwnershipCount) {
+      evidence.exactOwnershipOutputMatches = false;
       return {
         ok: false,
         reasonCode: "exact_output_mismatch",
         detail: `Found ${balances.length} ownership rows, expected ` +
           `${ms.expectedOwnershipCount}.`,
+        evidence,
       };
     }
     const actualOwnershipDigest = computeOwnershipDigest(balances);
-    if (actualOwnershipDigest.hash !== ms.expectedOwnershipDigest) {
+    const ownershipOutputMatches =
+      actualOwnershipDigest.hash === ms.expectedOwnershipDigest;
+    evidence.exactOwnershipOutputMatches = ownershipOutputMatches;
+    if (!ownershipOutputMatches) {
       return {
         ok: false,
         reasonCode: "exact_output_mismatch",
         detail: "Ownership output digest does not match the expected " +
           "value.",
+        evidence,
       };
     }
 
@@ -1980,20 +2341,25 @@ async function finalizeMigration(
         0;
     if (balances.length === 0) {
       if (aggregate !== 0) {
+        evidence.aggregateMatches = false;
         return {
           ok: false,
           reasonCode: "ownership_drift",
           detail: "No ownership rows exist, but the Trip's current " +
             `aggregate is ${aggregate}, not 0.`,
+          evidence,
         };
       }
+      evidence.aggregateMatches = true;
     } else {
       const reconcile = reconcileOwnershipAgainstAggregate(aggregate, balances);
+      evidence.aggregateMatches = reconcile.ok;
       if (!reconcile.ok) {
         return {
           ok: false,
           reasonCode: "ownership_drift",
           detail: reconcile.reason,
+          evidence,
         };
       }
     }
@@ -2012,10 +2378,12 @@ async function finalizeMigration(
         provenance: d.provenance,
       });
       if (!shapeResult.ok || !(d.createdAt instanceof Timestamp)) {
+        evidence.exactAllocationOutputMatches = false;
         return {
           ok: false,
           reasonCode: "exact_allocation_output_mismatch",
           detail: `tripOwnershipAllocations/${doc.id} is malformed.`,
+          evidence,
         };
       }
       allocationProjections.push({
@@ -2033,22 +2401,28 @@ async function finalizeMigration(
       });
     }
     if (allocationProjections.length !== ms.expectedAllocationCount) {
+      evidence.exactAllocationOutputMatches = false;
       return {
         ok: false,
         reasonCode: "exact_allocation_output_mismatch",
         detail: `Found ${allocationProjections.length} allocation ` +
           `records, expected ${ms.expectedAllocationCount}.`,
+        evidence,
       };
     }
     const actualAllocationDigest = computeAllocationDigest(
       allocationProjections
     );
-    if (actualAllocationDigest.hash !== ms.expectedAllocationDigest) {
+    const allocationOutputMatches =
+      actualAllocationDigest.hash === ms.expectedAllocationDigest;
+    evidence.exactAllocationOutputMatches = allocationOutputMatches;
+    if (!allocationOutputMatches) {
       return {
         ok: false,
         reasonCode: "exact_allocation_output_mismatch",
         detail: "Allocation output digest does not match the expected " +
           "value.",
+        evidence,
       };
     }
 
@@ -2061,7 +2435,7 @@ async function finalizeMigration(
       phase: "completed",
       completedAt: FieldValue.serverTimestamp(),
     });
-    return {ok: true};
+    return {ok: true, evidence};
   });
 }
 
@@ -2121,6 +2495,26 @@ export async function runApply(
   if (lockOutcome.kind === "already_completed") {
     base.verdict = "already_completed";
     base.phase = "completed";
+    // Checkpoint 5B.4B.4, Section B: the same safe, read-only report
+    // enrichment as runDryRun's already_completed path.
+    // `acquireOrResumeLock` already strictly proved this outcome
+    // inside its own transaction but does not return the
+    // migration-state document it read - re-read it fresh here
+    // (cheap, read-only; the document is terminal/immutable once
+    // `phase === "completed"`) purely to build the report.
+    const msSnap = await db
+      .collection("tripOwnershipMigrationState")
+      .doc(tripOwnershipMigrationStateId(tripId))
+      .get();
+    if (msSnap.exists && validateMigrationStateShape(msSnap.data()).ok) {
+      const ms = msSnap.data() as TripOwnershipMigrationState;
+      if (ms.phase === "completed") {
+        Object.assign(
+          base,
+          await buildAlreadyCompletedReport(db, tripId, ms)
+        );
+      }
+    }
     base.completedAt = new Date().toISOString();
     return base;
   }
@@ -2160,14 +2554,10 @@ export async function runApply(
   const ms = msRaw;
   base.lockedFinancialBasis = ms.lockedFinancialBasis;
 
-  const openingBalanceMinor =
-    ms.lockedFinancialBasis.ledgerInitializationKind === "initialized" ?
-      ms.lockedFinancialBasis.ledgerOpeningBalanceMinor :
-      ms.lockedFinancialBasis.derivedLegacyOpeningBalanceMinor;
-  const currentAggregate =
-    ms.lockedFinancialBasis.ledgerInitializationKind === "initialized" ?
-      ms.lockedFinancialBasis.ledgerBalanceMinor :
-      ms.lockedFinancialBasis.derivedLegacyOpeningBalanceMinor;
+  const {
+    openingBalanceMinor,
+    aggregateLedgerBalanceMinor: currentAggregate,
+  } = basisAmounts(ms.lockedFinancialBasis);
   base.openingBalanceMinor = openingBalanceMinor;
   base.aggregateLedgerBalanceMinor = currentAggregate;
 
@@ -2191,10 +2581,17 @@ export async function runApply(
     loaded.history.transactions,
     loaded.history.expenses
   );
-  if (
-    currentSourceDigest.hash !== ms.sourceHistoryDigest ||
-    currentSourceDigest.count !== ms.sourceHistoryDocumentCount
-  ) {
+  const sourceHistoryDigestMatches =
+    currentSourceDigest.hash === ms.sourceHistoryDigest &&
+    currentSourceDigest.count === ms.sourceHistoryDocumentCount;
+  // Checkpoint 5B.4C follow-up: this comparison's boolean result is
+  // already directly available here - report it immediately rather
+  // than leaving it null, per the true/false/null audit convention.
+  // If finalization later reaches its own fresher source-history
+  // check, its FinalizationEvidence overwrites this baseline exactly
+  // as aggregateMatches already does above.
+  base.reconciliation.sourceHistoryDigestMatches = sourceHistoryDigestMatches;
+  if (!sourceHistoryDigestMatches) {
     base.anomalies.push({
       reasonCode: "out_of_band_mutation_detected",
       detail: "Source-history digest/count no longer match the " +
@@ -2217,6 +2614,16 @@ export async function runApply(
     base.completedAt = new Date().toISOString();
     return base;
   }
+
+  // Checkpoint 5B.4B.4: these two were genuinely established the
+  // moment reconstruction itself succeeded - real evidence, not
+  // inferred from the eventual outcome - so they are populated here,
+  // immediately, rather than only on the final success path. Finalization
+  // re-verifies `aggregateMatches` independently and fresher below; if
+  // reached, its own evidence overwrites this baseline.
+  base.reconciliation.historyReplayMatches =
+    reconstruction.historyReplayMatches;
+  base.reconciliation.aggregateMatches = reconstruction.aggregateMatches;
 
   // Checkpoint 5B.4B.1, Section G: pin the resumed reconstruction to
   // the EXACT expected-output model already frozen at
@@ -2281,6 +2688,7 @@ export async function runApply(
   }
 
   const finalizeResult = await finalizeMigration(db, tripId, attemptId);
+  mergeFinalizationEvidence(base.reconciliation, finalizeResult.evidence);
   if (!finalizeResult.ok) {
     base.anomalies.push({
       reasonCode: finalizeResult.reasonCode,
@@ -2296,7 +2704,16 @@ export async function runApply(
   base.sourceHistoryDigest = reconstruction.sourceHistoryDigest.hash;
   base.sourceHistoryDocumentCount = reconstruction.sourceHistoryDigest.count;
   base.reconstructedOwnership = reconstruction.ownership;
+  base.reconstructedOwnershipTotalMinor = sumReconstructedOwnership(
+    reconstruction.ownership
+  );
   base.expectedOwnershipDigest = reconstruction.expectedOwnershipDigest.hash;
+  base.allocationsToCreate = reconstruction.allocations.map((a) => ({
+    withdrawalTransactionId: a.withdrawalTransactionId,
+    expenseId: a.expenseId,
+    amountMinor: a.amountMinor,
+    allocations: a.allocations,
+  }));
   base.expectedAllocationDigest = reconstruction.expectedAllocationDigest.hash;
   base.historyCounts = {
     ...reconstruction.historyCounts,

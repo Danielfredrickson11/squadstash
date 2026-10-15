@@ -630,6 +630,667 @@ describe("runApply - fresh lock, full completion", () => {
 });
 
 // ---------------------------------------------------------------------
+// Checkpoint 5B.4B.4: audit-output completeness for a successful
+// apply - reconstructedOwnershipTotalMinor, allocationsToCreate, and
+// the reconciliation evidence must all be genuinely populated from
+// real, already-computed values, never fabricated from counts alone.
+// ---------------------------------------------------------------------
+
+describe("runApply - audit-output completeness on success (Checkpoint 5B.4B.4)", () => {
+  it("zero-balance apply reports exact empty reconstruction and fully-verified reconciliation", async () => {
+    await seedTrip();
+    const result = await runApply(db, TRIP_ID);
+
+    assert.equal(result.verdict, "safe_to_migrate");
+    assert.deepEqual(result.reconstructedOwnership, []);
+    assert.equal(result.reconstructedOwnershipTotalMinor, 0);
+    assert.deepEqual(result.allocationsToCreate, []);
+    assert.ok(result.sourceHistoryDigest);
+    assert.ok(result.expectedOwnershipDigest);
+    assert.ok(result.expectedAllocationDigest);
+
+    assert.equal(result.reconciliation.aggregateMatches, true);
+    assert.equal(result.reconciliation.historyReplayMatches, true);
+    assert.equal(result.reconciliation.lockedFinancialBasisMatches, true);
+    assert.equal(result.reconciliation.sourceHistoryDigestMatches, true);
+    assert.equal(result.reconciliation.exactOwnershipOutputMatches, true);
+    assert.equal(result.reconciliation.exactAllocationOutputMatches, true);
+  });
+
+  it("nonzero reconstruction reports the exact ownership total and allocation output", async () => {
+    await seedTrip({ledgerOpeningBalanceMinor: 0, ledgerBalanceMinor: 800});
+    await seedOrdinaryTransaction("tx-1", "daniel", "contribution", 900, 1000);
+    await seedOrdinaryTransaction("tx-2", "friend", "contribution", 100, 2000);
+    await seedSharedStashExpense("expense-1", "withdrawal-1", 200, 3000);
+
+    const result = await runApply(db, TRIP_ID);
+
+    assert.equal(result.verdict, "safe_to_migrate");
+    const byUid = new Map(
+      (result.reconstructedOwnership ?? []).map((b) => [
+        b.uid,
+        b.ownershipMinor,
+      ])
+    );
+    assert.equal(byUid.get("daniel"), 720);
+    assert.equal(byUid.get("friend"), 80);
+    // The exact sum of the reconstructed ownership set - never the
+    // aggregate used merely as a proxy for it.
+    assert.equal(result.reconstructedOwnershipTotalMinor, 800);
+
+    assert.equal(result.allocationsToCreate?.length, 1);
+    assert.equal(
+      result.allocationsToCreate?.[0].withdrawalTransactionId,
+      "withdrawal-1"
+    );
+    assert.equal(result.allocationsToCreate?.[0].amountMinor, 200);
+    assert.deepEqual(
+      result.allocationsToCreate?.[0].allocations,
+      [
+        {uid: "daniel", amountMinor: 180},
+        {uid: "friend", amountMinor: 20},
+      ]
+    );
+
+    assert.equal(result.reconciliation.aggregateMatches, true);
+    assert.equal(result.reconciliation.historyReplayMatches, true);
+    assert.equal(result.reconciliation.lockedFinancialBasisMatches, true);
+    assert.equal(result.reconciliation.sourceHistoryDigestMatches, true);
+    assert.equal(result.reconciliation.exactOwnershipOutputMatches, true);
+    assert.equal(result.reconciliation.exactAllocationOutputMatches, true);
+  });
+
+  it("an early failure (before reconstruction even runs) leaves every reconciliation field null, never a fabricated true", async () => {
+    await seedTrip({ownershipModelState: "migrating"});
+    await db.collection("tripOwnershipMigrationState").doc(TRIP_ID).set({
+      tripId: TRIP_ID,
+      attemptId: "attempt-early-fail",
+      phase: "reconstructed",
+      lockedAt: new Date(),
+      startedAt: new Date(),
+      lockedFinancialBasis: buildLockedFinancialBasis(
+        {kind: "case_a_equivalent"},
+        "USD"
+      ),
+      sourceHistoryDigest: "this-will-never-match-anything",
+      sourceHistoryDocumentCount: 0,
+      expectedOwnershipDigest: "def",
+      expectedOwnershipCount: 0,
+      expectedAllocationDigest: "ghi",
+      expectedAllocationCount: 0,
+    });
+
+    const result = await runApply(db, TRIP_ID);
+    assert.equal(
+      result.anomalies[0].reasonCode,
+      "out_of_band_mutation_detected"
+    );
+    assert.equal(result.reconciliation.aggregateMatches, null);
+    assert.equal(result.reconciliation.historyReplayMatches, null);
+    assert.equal(result.reconciliation.lockedFinancialBasisMatches, null);
+    // Reached and failed (the frozen digest is deliberately bogus) -
+    // an honest false, not the null this run never got to.
+    assert.equal(result.reconciliation.sourceHistoryDigestMatches, false);
+    assert.equal(result.reconciliation.exactOwnershipOutputMatches, null);
+    assert.equal(result.reconciliation.exactAllocationOutputMatches, null);
+  });
+
+  it("a finalization-only failure (locked financial basis mismatch) reports partial, honest evidence - never a false true", async () => {
+    await seedTrip({ledgerOpeningBalanceMinor: 0, ledgerBalanceMinor: 800});
+    await seedOrdinaryTransaction("tx-1", "daniel", "contribution", 900, 1000);
+    await seedOrdinaryTransaction("tx-2", "friend", "contribution", 100, 2000);
+    await seedSharedStashExpense("expense-1", "withdrawal-1", 200, 3000);
+
+    const transactions: RawSavingsTransactionRecord[] = [
+      {
+        id: "tx-1",
+        resourceType: "trip",
+        resourceId: TRIP_ID,
+        memberUid: "daniel",
+        type: "contribution",
+        amountMinor: 900,
+        currency: "USD",
+        createdAt: Timestamp.fromMillis(1000),
+        reversalOf: null,
+        linkedExpenseId: null,
+      },
+      {
+        id: "tx-2",
+        resourceType: "trip",
+        resourceId: TRIP_ID,
+        memberUid: "friend",
+        type: "contribution",
+        amountMinor: 100,
+        currency: "USD",
+        createdAt: Timestamp.fromMillis(2000),
+        reversalOf: null,
+        linkedExpenseId: null,
+      },
+      {
+        id: "withdrawal-1",
+        resourceType: "trip",
+        resourceId: TRIP_ID,
+        memberUid: "daniel",
+        type: "withdrawal",
+        amountMinor: 200,
+        currency: "USD",
+        createdAt: Timestamp.fromMillis(3000),
+        reversalOf: null,
+        linkedExpenseId: "expense-1",
+      },
+    ];
+    const expenses = [
+      {
+        id: "expense-1",
+        tripId: TRIP_ID,
+        paymentSource: "shared_stash",
+        amountMinor: 200,
+        currency: "USD",
+        sharedStashTransactionId: "withdrawal-1",
+        status: "active",
+        createdAt: Timestamp.fromMillis(3000),
+        reversedAt: null,
+        refundTransactionId: null,
+        replacesExpenseId: null,
+        replacedByExpenseId: null,
+      },
+    ];
+    const expected = computeExpectedReconstruction(transactions, expenses);
+
+    await db.collection("trips").doc(TRIP_ID).update({
+      ownershipModelState: "migrating",
+    });
+    // The FROZEN basis correctly matches the replayed history (800),
+    // so runReconstructionPipeline's own independent aggregate-replay
+    // check passes - this isolates the failure to finalization's own
+    // step-2b re-derivation from the Trip's CURRENT document, which
+    // is the only place an out-of-band edit to the Trip's own ledger
+    // field (simulated below) is ever actually caught.
+    await db.collection("tripOwnershipMigrationState").doc(TRIP_ID).set({
+      tripId: TRIP_ID,
+      attemptId: "attempt-basis-mismatch",
+      phase: "reconstructed",
+      lockedAt: new Date(),
+      startedAt: new Date(),
+      lockedFinancialBasis: {
+        ledgerInitializationKind: "initialized",
+        ledgerOpeningBalanceMinor: 0,
+        ledgerBalanceMinor: 800,
+        effectiveCurrency: "USD",
+      },
+      sourceHistoryDigest: expected.sourceDigest.hash,
+      sourceHistoryDocumentCount: expected.sourceDigest.count,
+      expectedOwnershipDigest: expected.ownershipDigest.hash,
+      expectedOwnershipCount: expected.ownershipDigest.count,
+      expectedAllocationDigest: expected.allocationDigest.hash,
+      expectedAllocationCount: expected.allocationDigest.count,
+    });
+    // Simulated out-of-band edit to the Trip's own ledger field,
+    // AFTER the basis was locked - finalization re-reads this fresh.
+    await db.collection("trips").doc(TRIP_ID).update({
+      ledgerBalanceMinor: 850,
+    });
+
+    const result = await runApply(db, TRIP_ID);
+    assert.equal(
+      result.anomalies[0].reasonCode,
+      "locked_financial_basis_mismatch"
+    );
+    // Reached and failed - an honest false, never a fabricated true.
+    assert.equal(result.reconciliation.lockedFinancialBasisMatches, false);
+    // Reached (during reconstruction, which ran successfully before
+    // finalization) and genuinely true.
+    assert.equal(result.reconciliation.aggregateMatches, true);
+    assert.equal(result.reconciliation.historyReplayMatches, true);
+    // runApply's own pre-finalization check DID run and pass (the
+    // frozen source digest is valid) - true, not null, even though
+    // finalization itself never reaches its own fresher source-history
+    // check because it fails closed earlier, at step 2b.
+    assert.equal(result.reconciliation.sourceHistoryDigestMatches, true);
+    assert.equal(result.reconciliation.exactOwnershipOutputMatches, null);
+    assert.equal(result.reconciliation.exactAllocationOutputMatches, null);
+    // Finalization never committed - Trip remains migrating.
+    const tripData = (await db.collection("trips").doc(TRIP_ID).get()).data();
+    assert.equal(tripData?.ownershipModelState, "migrating");
+  });
+});
+
+// ---------------------------------------------------------------------
+// Checkpoint 5B.4B.4, Section B: already_completed audit-report
+// enrichment - safe, read-only, frozen/persisted data only.
+// ---------------------------------------------------------------------
+
+describe("already_completed - safe audit-report enrichment (Checkpoint 5B.4B.4/5B.4C)", () => {
+  async function seedCompletedTrip(overrides: {
+    lockedFinancialBasis: Record<string, unknown>;
+    ownershipRows?: Array<{uid: string; ownershipMinor: number}>;
+    expectedOwnershipDigest?: string;
+    expectedOwnershipCount?: number;
+    expectedAllocationDigest?: string;
+    expectedAllocationCount?: number;
+  }): Promise<void> {
+    const ownershipRows = overrides.ownershipRows ?? [];
+    // Checkpoint 5B.4C, Section A: the frozen expected digest/count
+    // default to the REAL computed digest/count of the seeded rows -
+    // i.e. a Trip whose current output is still exactly the original
+    // migration output - unless a test deliberately overrides them to
+    // simulate drift/evolution.
+    const realOwnershipDigest = computeOwnershipDigest(ownershipRows);
+    await seedTrip({
+      ownershipModelState: "initialized",
+      ownershipModelVersion: CURRENT_TRIP_OWNERSHIP_MODEL_VERSION,
+    });
+    await db.collection("tripOwnershipMigrationState").doc(TRIP_ID).set({
+      tripId: TRIP_ID,
+      attemptId: "attempt-completed-report",
+      phase: "completed",
+      lockedAt: Timestamp.now(),
+      startedAt: Timestamp.now(),
+      lockedFinancialBasis: overrides.lockedFinancialBasis,
+      sourceHistoryDigest: "frozen-source-digest",
+      sourceHistoryDocumentCount: 3,
+      expectedOwnershipDigest:
+        overrides.expectedOwnershipDigest ?? realOwnershipDigest.hash,
+      expectedOwnershipCount:
+        overrides.expectedOwnershipCount ?? realOwnershipDigest.count,
+      expectedAllocationDigest:
+        overrides.expectedAllocationDigest ?? computeAllocationDigest([]).hash,
+      expectedAllocationCount: overrides.expectedAllocationCount ?? 0,
+      completedAt: Timestamp.now(),
+    });
+    for (const row of ownershipRows) {
+      await db.collection("tripMemberOwnership").doc(`${TRIP_ID}_${row.uid}`).set({
+        tripId: TRIP_ID,
+        uid: row.uid,
+        ownershipMinor: row.ownershipMinor,
+        lastUpdatedAt: new Date(),
+      });
+    }
+  }
+
+  // Checkpoint 5B.4C, test matrix item 1: current digests exactly
+  // equal the frozen values - historical fields may be populated.
+  it("immediately after migration (current digest/count exactly matches frozen) - historical fields are populated", async () => {
+    await seedCompletedTrip({
+      lockedFinancialBasis: {
+        ledgerInitializationKind: "initialized",
+        ledgerOpeningBalanceMinor: 0,
+        ledgerBalanceMinor: 1000,
+        effectiveCurrency: "USD",
+      },
+      ownershipRows: [
+        {uid: "daniel", ownershipMinor: 900},
+        {uid: "friend", ownershipMinor: 100},
+      ],
+    });
+
+    const result = await runDryRun(db, TRIP_ID);
+    assert.equal(result.verdict, "already_completed");
+    assert.equal(result.attemptId, "attempt-completed-report");
+    assert.deepEqual(result.lockedFinancialBasis, {
+      ledgerInitializationKind: "initialized",
+      ledgerOpeningBalanceMinor: 0,
+      ledgerBalanceMinor: 1000,
+      effectiveCurrency: "USD",
+    });
+    assert.equal(result.openingBalanceMinor, 0);
+    assert.equal(result.aggregateLedgerBalanceMinor, 1000);
+    assert.equal(result.sourceHistoryDigest, "frozen-source-digest");
+    assert.equal(result.sourceHistoryDocumentCount, 3);
+    assert.ok(result.expectedOwnershipDigest);
+    assert.ok(result.expectedAllocationDigest);
+
+    const byUid = new Map(
+      (result.reconstructedOwnership ?? []).map((b) => [
+        b.uid,
+        b.ownershipMinor,
+      ])
+    );
+    assert.equal(byUid.get("daniel"), 900);
+    assert.equal(byUid.get("friend"), 100);
+    assert.equal(result.reconstructedOwnershipTotalMinor, 1000);
+    assert.deepEqual(result.allocationsToCreate, []);
+
+    // Intentionally never fabricated: the per-category history
+    // breakdown and this run's own reconciliation evidence were never
+    // persisted by the original completing run.
+    assert.equal(result.historyCounts, null);
+    assert.equal(result.reconciliation.aggregateMatches, null);
+    assert.equal(result.reconciliation.historyReplayMatches, null);
+    assert.equal(result.reconciliation.lockedFinancialBasisMatches, null);
+    assert.equal(result.reconciliation.sourceHistoryDigestMatches, null);
+    assert.equal(result.reconciliation.exactOwnershipOutputMatches, null);
+    assert.equal(result.reconciliation.exactAllocationOutputMatches, null);
+  });
+
+  it("apply's already_completed path reports the same safe enrichment", async () => {
+    await seedCompletedTrip({
+      lockedFinancialBasis: {
+        ledgerInitializationKind: "uninitialized",
+        derivedLegacyOpeningBalanceMinor: 0,
+        effectiveCurrency: "USD",
+      },
+      ownershipRows: [],
+    });
+
+    const result = await runApply(db, TRIP_ID);
+    assert.equal(result.verdict, "already_completed");
+    assert.equal(result.attemptId, "attempt-completed-report");
+    assert.equal(result.openingBalanceMinor, 0);
+    assert.equal(result.aggregateLedgerBalanceMinor, 0);
+    assert.deepEqual(result.reconstructedOwnership, []);
+    assert.equal(result.reconstructedOwnershipTotalMinor, 0);
+    assert.deepEqual(result.allocationsToCreate, []);
+    assert.equal(result.historyCounts, null);
+    assert.equal(result.reconciliation.aggregateMatches, null);
+  });
+
+  // Checkpoint 5B.4C, test matrix item 2: legitimate post-migration
+  // ownership evolution (e.g. a lazy-initialized new contribution) -
+  // verdict stays already_completed, this is NEVER reported as an
+  // anomaly, and the now-stale current rows are NOT mislabeled as the
+  // historical migration output.
+  it("after legitimate post-migration ownership evolution - verdict unchanged, no anomaly, historical ownership fields left null", async () => {
+    await seedCompletedTrip({
+      lockedFinancialBasis: {
+        ledgerInitializationKind: "initialized",
+        ledgerOpeningBalanceMinor: 0,
+        ledgerBalanceMinor: 1000,
+        effectiveCurrency: "USD",
+      },
+      ownershipRows: [
+        {uid: "daniel", ownershipMinor: 900},
+        {uid: "friend", ownershipMinor: 100},
+      ],
+    });
+    // Simulates a legitimate post-migration lazy-initialized
+    // contribution changing daniel's row.
+    await db.collection("tripMemberOwnership").doc(`${TRIP_ID}_daniel`).update({
+      ownershipMinor: 950,
+    });
+
+    const result = await runDryRun(db, TRIP_ID);
+    assert.equal(result.verdict, "already_completed");
+    assert.equal(result.anomalies.length, 0);
+    // The current set no longer matches the frozen digest - it must
+    // NOT be reported as the historical migration output.
+    assert.equal(result.reconstructedOwnership, null);
+    assert.equal(result.reconstructedOwnershipTotalMinor, null);
+    // Allocations were untouched and still match - still populated.
+    assert.deepEqual(result.allocationsToCreate, []);
+    // Frozen/persisted fields remain reported regardless.
+    assert.ok(result.expectedOwnershipDigest);
+  });
+
+  // Checkpoint 5B.4C, test matrix item 3: legitimate post-migration
+  // allocation additions (e.g. a brand-new Shared-Stash Expense) -
+  // verdict stays already_completed, allocationsToCreate is not
+  // mislabeled as historical migration output.
+  it("after legitimate post-migration allocation additions - verdict unchanged, no anomaly, historical allocation field left null", async () => {
+    await seedCompletedTrip({
+      lockedFinancialBasis: {
+        ledgerInitializationKind: "initialized",
+        ledgerOpeningBalanceMinor: 0,
+        ledgerBalanceMinor: 1000,
+        effectiveCurrency: "USD",
+      },
+      ownershipRows: [
+        {uid: "daniel", ownershipMinor: 900},
+        {uid: "friend", ownershipMinor: 100},
+      ],
+    });
+    // Simulates a legitimate NEW post-migration Shared-Stash Expense
+    // (live "original" provenance, not "migrated") adding a record
+    // the frozen expectedAllocationCount never accounted for.
+    await db.collection("tripOwnershipAllocations").doc("new-withdrawal").set({
+      tripId: TRIP_ID,
+      expenseId: "new-expense",
+      withdrawalTransactionId: "new-withdrawal",
+      amountMinor: 50,
+      currency: "USD",
+      allocations: [{uid: "daniel", amountMinor: 50}],
+      provenance: "original",
+      createdAt: Timestamp.now(),
+    });
+
+    const result = await runDryRun(db, TRIP_ID);
+    assert.equal(result.verdict, "already_completed");
+    assert.equal(result.anomalies.length, 0);
+    // Ownership untouched and still matches - still populated.
+    const byUid = new Map(
+      (result.reconstructedOwnership ?? []).map((b) => [
+        b.uid,
+        b.ownershipMinor,
+      ])
+    );
+    assert.equal(byUid.get("daniel"), 900);
+    // The current allocation set no longer matches the frozen count -
+    // it must NOT be reported as the historical migration output.
+    assert.equal(result.allocationsToCreate, null);
+  });
+
+  // Checkpoint 5B.4C, test matrix item 4: exact digest AND exact
+  // count are both required - a count that happens to match the
+  // frozen value is not sufficient on its own if the digest (i.e. the
+  // actual content) disagrees.
+  it("requires BOTH exact digest and exact count - a matching count with a wrong digest still leaves the field null", async () => {
+    const ownershipRows = [
+      {uid: "daniel", ownershipMinor: 900},
+      {uid: "friend", ownershipMinor: 100},
+    ];
+    await seedCompletedTrip({
+      lockedFinancialBasis: {
+        ledgerInitializationKind: "initialized",
+        ledgerOpeningBalanceMinor: 0,
+        ledgerBalanceMinor: 1000,
+        effectiveCurrency: "USD",
+      },
+      ownershipRows,
+      // Same COUNT (2) as the real set, but a digest that could never
+      // honestly match any real 2-row set's content.
+      expectedOwnershipDigest: "deliberately-wrong-digest-same-count",
+      expectedOwnershipCount: ownershipRows.length,
+    });
+
+    const result = await runDryRun(db, TRIP_ID);
+    assert.equal(result.verdict, "already_completed");
+    assert.equal(result.anomalies.length, 0);
+    assert.equal(result.reconstructedOwnership, null);
+    assert.equal(result.reconstructedOwnershipTotalMinor, null);
+  });
+
+  it("strict already_completed validation is unchanged - a malformed completed migration-state document still fails closed with no enrichment", async () => {
+    await seedTrip({
+      ownershipModelState: "initialized",
+      ownershipModelVersion: CURRENT_TRIP_OWNERSHIP_MODEL_VERSION,
+    });
+    await db.collection("tripOwnershipMigrationState").doc(TRIP_ID).set({
+      tripId: "some-other-trip",
+      attemptId: "attempt-x",
+      phase: "completed",
+      lockedAt: Timestamp.now(),
+      startedAt: Timestamp.now(),
+      lockedFinancialBasis: {
+        ledgerInitializationKind: "initialized",
+        ledgerOpeningBalanceMinor: 0,
+        ledgerBalanceMinor: 0,
+        effectiveCurrency: "USD",
+      },
+      sourceHistoryDigest: "abc",
+      sourceHistoryDocumentCount: 0,
+      expectedOwnershipDigest: "def",
+      expectedOwnershipCount: 0,
+      expectedAllocationDigest: "ghi",
+      expectedAllocationCount: 0,
+      completedAt: Timestamp.now(),
+    });
+
+    const result = await runDryRun(db, TRIP_ID);
+    assert.equal(result.verdict, "requires_manual_review");
+    assert.equal(
+      result.anomalies[0].reasonCode,
+      "invalid_migration_state_phase"
+    );
+    assert.equal(result.lockedFinancialBasis, null);
+    assert.equal(result.reconstructedOwnership, null);
+  });
+});
+
+// ---------------------------------------------------------------------
+// Checkpoint 5B.4C, Section B / test matrix item 5: FinalizationEvidence
+// must be retry-safe - `finalizeMigration` declares its `evidence`
+// object INSIDE the `db.runTransaction` callback (never outside and
+// mutated from within), so the Firestore Admin SDK's own documented
+// retry behavior (re-invoking the ENTIRE callback from scratch,
+// including that declaration) can never leak a stale/partial evidence
+// object from an earlier, aborted attempt into the final result - each
+// attempt gets its own fresh object, and only the attempt whose
+// return value actually commits is ever seen by the caller. This test
+// forces a genuine write conflict (two concurrent `runApply` calls
+// racing to finalize the SAME Trip) to exercise a real retry, then
+// proves the losing side's evidence is never a fabricated success.
+// ---------------------------------------------------------------------
+
+describe("FinalizationEvidence retry safety (Checkpoint 5B.4C, Section B)", () => {
+  it("two concurrent finalizations of the same Trip never leak stale/partial evidence into either result", async () => {
+    await seedTrip({ledgerOpeningBalanceMinor: 0, ledgerBalanceMinor: 800});
+    await seedOrdinaryTransaction("tx-1", "daniel", "contribution", 900, 1000);
+    await seedOrdinaryTransaction("tx-2", "friend", "contribution", 100, 2000);
+    await seedSharedStashExpense("expense-1", "withdrawal-1", 200, 3000);
+
+    const transactions: RawSavingsTransactionRecord[] = [
+      {
+        id: "tx-1",
+        resourceType: "trip",
+        resourceId: TRIP_ID,
+        memberUid: "daniel",
+        type: "contribution",
+        amountMinor: 900,
+        currency: "USD",
+        createdAt: Timestamp.fromMillis(1000),
+        reversalOf: null,
+        linkedExpenseId: null,
+      },
+      {
+        id: "tx-2",
+        resourceType: "trip",
+        resourceId: TRIP_ID,
+        memberUid: "friend",
+        type: "contribution",
+        amountMinor: 100,
+        currency: "USD",
+        createdAt: Timestamp.fromMillis(2000),
+        reversalOf: null,
+        linkedExpenseId: null,
+      },
+      {
+        id: "withdrawal-1",
+        resourceType: "trip",
+        resourceId: TRIP_ID,
+        memberUid: "daniel",
+        type: "withdrawal",
+        amountMinor: 200,
+        currency: "USD",
+        createdAt: Timestamp.fromMillis(3000),
+        reversalOf: null,
+        linkedExpenseId: "expense-1",
+      },
+    ];
+    const expenses = [
+      {
+        id: "expense-1",
+        tripId: TRIP_ID,
+        paymentSource: "shared_stash",
+        amountMinor: 200,
+        currency: "USD",
+        sharedStashTransactionId: "withdrawal-1",
+        status: "active",
+        createdAt: Timestamp.fromMillis(3000),
+        reversedAt: null,
+        refundTransactionId: null,
+        replacesExpenseId: null,
+        replacedByExpenseId: null,
+      },
+    ];
+    const expected = computeExpectedReconstruction(transactions, expenses);
+
+    await db.collection("trips").doc(TRIP_ID).update({
+      ownershipModelState: "migrating",
+    });
+    const lockedFinancialBasis = buildLockedFinancialBasis(
+      {kind: "case_a", currentBalanceMinor: 800, openingBalanceMinor: 0},
+      "USD"
+    );
+    await db.collection("tripOwnershipMigrationState").doc(TRIP_ID).set({
+      tripId: TRIP_ID,
+      attemptId: "attempt-race",
+      phase: "reconstructed",
+      lockedAt: new Date(),
+      startedAt: new Date(),
+      lockedFinancialBasis,
+      sourceHistoryDigest: expected.sourceDigest.hash,
+      sourceHistoryDocumentCount: expected.sourceDigest.count,
+      expectedOwnershipDigest: expected.ownershipDigest.hash,
+      expectedOwnershipCount: expected.ownershipDigest.count,
+      expectedAllocationDigest: expected.allocationDigest.hash,
+      expectedAllocationCount: expected.allocationDigest.count,
+    });
+
+    const [resultA, resultB] = await Promise.all([
+      runApply(db, TRIP_ID),
+      runApply(db, TRIP_ID),
+    ]);
+
+    const winner = [resultA, resultB].find(
+      (r) => r.verdict === "safe_to_migrate"
+    );
+    const loser = [resultA, resultB].find((r) => r !== winner);
+    assert.ok(winner, "expected exactly one call to actually finalize");
+    assert.equal(winner?.phase, "completed");
+    assert.equal(winner?.reconciliation.lockedFinancialBasisMatches, true);
+    assert.equal(winner?.reconciliation.sourceHistoryDigestMatches, true);
+    assert.equal(winner?.reconciliation.exactOwnershipOutputMatches, true);
+    assert.equal(winner?.reconciliation.exactAllocationOutputMatches, true);
+    assert.equal(winner?.reconciliation.aggregateMatches, true);
+
+    // The loser must never report a fabricated success - either it
+    // also reconciles to already_completed (if its own retry happened
+    // to land after the winner's commit, and it re-classified fresh),
+    // or it fails closed; either way it must NEVER claim
+    // verdict === "safe_to_migrate" a second time, and any
+    // reconciliation field it reports must be an HONEST reflection of
+    // a check THAT SAME losing attempt actually reached - never a
+    // leaked true from the winner's own attempt.
+    assert.notEqual(loser?.verdict, "safe_to_migrate");
+    if (loser?.verdict === "requires_manual_review") {
+      // Failed closed before (or during) finalization - every
+      // finalization-only evidence field it reports must be either
+      // null (never reached) or false (reached and correctly failed,
+      // since the Trip had already moved on) - never true, since
+      // THIS attempt's own finalization never actually committed.
+      assert.notEqual(loser.reconciliation.exactOwnershipOutputMatches, true);
+      assert.notEqual(
+        loser.reconciliation.exactAllocationOutputMatches,
+        true
+      );
+    }
+
+    // Exactly one commit happened - the persisted state is correct
+    // and not corrupted by the race.
+    const tripData = (await db.collection("trips").doc(TRIP_ID).get()).data();
+    assert.equal(tripData?.ownershipModelState, "initialized");
+    const ownership = await getOwnershipMap();
+    assert.equal(ownership.get("daniel"), 720);
+    assert.equal(ownership.get("friend"), 80);
+    const msSnap = await db
+      .collection("tripOwnershipMigrationState")
+      .doc(TRIP_ID)
+      .get();
+    assert.equal(msSnap.data()?.phase, "completed");
+  });
+});
+
+// ---------------------------------------------------------------------
 // APPLY - phase-aware resumability (§19/§20)
 // ---------------------------------------------------------------------
 
