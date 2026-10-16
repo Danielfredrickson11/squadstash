@@ -4,7 +4,6 @@
 // the screen, since fetchMemberTripsOrdered and fetchMemberTrips are
 // meant to be thin, error-propagating building blocks for that logic.
 import {
-  addDoc,
   collection,
   doc,
   getDoc,
@@ -16,7 +15,8 @@ import {
   type DocumentData,
   where,
 } from "firebase/firestore";
-import { db } from "../../../firebase";
+import { httpsCallable } from "firebase/functions";
+import { db, functions } from "../../../firebase";
 import type {
   CreateTripInput,
   PersistedTimestamp,
@@ -82,28 +82,95 @@ export async function fetchMemberTrips(uid: string): Promise<Trip[]> {
   return snap.docs.map((d) => mapTripDocument(d.id, d.data() as DocumentData));
 }
 
-export async function createTrip(input: CreateTripInput): Promise<string> {
-  const { title, location, target, imageUrl, ownerId, tripStartDate, tripEndDate } = input;
+// Generates a clientRequestId locally, with no network call and no
+// document actually created - reads the id off a Firestore
+// DocumentReference built by the client SDK's own auto-id generator,
+// matching generateBucketClientRequestId's (buckets.ts) identical
+// convention. This id becomes the Trip's own document id - see
+// createTrip below.
+export function generateTripClientRequestId(): string {
+  return doc(collection(db, "trips")).id;
+}
 
-  const ref = await addDoc(collection(db, "trips"), {
-    title,
-    location,
-    target,
-    saved: 0,
+export type CreateTripResult = {
+  tripId: string;
+};
 
-    imageUrl,
-    tripStartDate,
-    tripEndDate,
+// Validates the callable's response field-by-field rather than trusting
+// a whole-object cast, matching parseCreateBucketResponse's (buckets.ts)
+// convention. The frozen response contract is exactly {tripId} - an
+// unexpected extra top-level key is rejected rather than silently
+// ignored (deployment-skew defense: a response carrying more than this
+// one key means the deployed Function disagrees with this client about
+// the contract, and that disagreement must fail loudly, not pass
+// through unnoticed). Checking tripId === the submitted clientRequestId
+// is a second, independent deployment-skew defense: this id scheme ties
+// the two together by construction (see createTrip below), so any
+// mismatch means the deployed Function did not honor the contract this
+// client expects.
+function parseCreateTripResponse(
+  data: unknown,
+  expectedTripId: string
+): CreateTripResult {
+  if (typeof data !== "object" || data === null) {
+    throw new Error(
+      "createTrip: invalid response (expected an object)."
+    );
+  }
 
-    createdAt: serverTimestamp(),
-    ownerId,
-    memberIds: [ownerId],
+  const keys = Object.keys(data as Record<string, unknown>);
+  if (keys.length !== 1 || keys[0] !== "tripId") {
+    throw new Error(
+      "createTrip: invalid response (expected exactly { tripId })."
+    );
+  }
 
-    lastUpdatedAt: serverTimestamp(),
-    lastUpdatedBy: ownerId,
+  const { tripId } = data as Record<string, unknown>;
+  if (typeof tripId !== "string" || tripId.length === 0) {
+    throw new Error(
+      "createTrip: invalid response (tripId must be a non-empty string)."
+    );
+  }
+  if (tripId !== expectedTripId) {
+    throw new Error(
+      "createTrip: invalid response (tripId did not match the submitted " +
+        "clientRequestId - the deployed createTrip function may be out " +
+        "of date; this request did not succeed)."
+    );
+  }
+
+  return { tripId };
+}
+
+// Invokes the trusted createTrip Cloud Function via httpsCallable
+// (Checkpoint 5B.5A/5B.5B) - no direct Firestore write occurs here.
+// ownerId/memberIds/ledger/currency/ownership-model/creation-metadata
+// fields are never sent - the backend derives/trusts all of them
+// exclusively from the authenticated caller. The request is rebuilt
+// field-by-field from `input` (never spread/forwarded as-is) so exactly
+// these seven keys are ever sent, regardless of what else `input`'s
+// static type might structurally tolerate. Callable errors
+// (HttpsError/FirebaseError) are not caught or wrapped - they propagate
+// to the caller unchanged, matching every other trusted-callable wrapper
+// in this file's sibling services (createBucket, recordSavingsTransaction).
+export async function createTrip(
+  input: CreateTripInput
+): Promise<CreateTripResult> {
+  const callable = httpsCallable<CreateTripInput, unknown>(
+    functions,
+    "createTrip"
+  );
+  const res = await callable({
+    clientRequestId: input.clientRequestId,
+    title: input.title,
+    location: input.location,
+    target: input.target,
+    imageUrl: input.imageUrl,
+    tripStartDate: input.tripStartDate,
+    tripEndDate: input.tripEndDate,
   });
 
-  return ref.id;
+  return parseCreateTripResponse(res.data, input.clientRequestId);
 }
 
 export async function fetchTripById(tripId: string): Promise<Trip | null> {
@@ -129,10 +196,12 @@ export async function archiveTrip(tripId: string, uid: string): Promise<void> {
   });
 }
 
-// Checkpoint 3F.3B.3: owner-only trip-date edit. Direct client write
-// (matching createTrip/deleteTrip's own pattern - Trip has no trusted
-// callable at all today), gated by firestore.rules' owner-only update
-// allowlist for tripStartDate/tripEndDate. tripStartDate is required
+// Checkpoint 3F.3B.3: owner-only trip-date edit. Unlike Trip creation
+// (now the trusted createTrip Cloud Function - Checkpoint 5B.5A/5B.5B),
+// this remains a direct client write - date edits are non-financial
+// metadata that firestore.rules' owner-only update allowlist for
+// tripStartDate/tripEndDate can fully express and enforce on its own, the
+// same reasoning already applied to archiveTrip above. tripStartDate is required
 // (cannot be cleared to null once set - a trip with dates cannot revert
 // to dateless); tripEndDate may be explicitly cleared via null.
 export type UpdateTripDatesInput = {

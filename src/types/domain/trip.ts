@@ -63,10 +63,9 @@ export type Trip = {
   // tripEndDate is optional. Both remain optional/nullable: existing
   // trip documents have neither, and neither is ever backfilled with a
   // fabricated value - the UI shows truthful "Add trip dates" copy
-  // instead. Set by the client at trip-creation time (Trip creation is
-  // a direct client write gated by firestore.rules, not a trusted
-  // Cloud Function - see createTrip in src/services/firebase/trips.ts);
-  // not yet part of any update/edit path.
+  // instead. Set by the client at trip-creation time via the trusted
+  // createTrip Cloud Function (Checkpoint 5B.5A/5B.5B - see createTrip
+  // in src/services/firebase/trips.ts).
   tripStartDate?: string | null;
   tripEndDate?: string | null;
 
@@ -119,12 +118,22 @@ export type Trip = {
   ownershipModelVersion?: number;
 };
 
+// Checkpoint 5B.5B: the exact, frozen request shape the trusted
+// createTrip Cloud Function accepts - matches
+// functions/src/callables/createTrip.ts's own CreateTripInput exactly.
+// ownerId is deliberately NOT a field here (removed by this checkpoint) -
+// the backend derives it exclusively from the authenticated caller, and
+// memberIds/saved/ledger/currency/ownership-model/creation-metadata
+// fields are never client input at all. clientRequestId is generated
+// locally (generateTripClientRequestId in src/services/firebase/trips.ts)
+// and becomes the Trip's own document id - see that file's createTrip
+// wrapper for the exact idempotent-replay contract.
 export type CreateTripInput = {
+  clientRequestId: string;
   title: string;
   location: string | null;
   target: number;
   imageUrl: string;
-  ownerId: string;
   // Checkpoint 3F.3B.2: canonical "YYYY-MM-DD" strings (see the Trip
   // type comment above). tripStartDate is required for trips created
   // from this checkpoint forward - app/(tabs)/trips/create.tsx validates

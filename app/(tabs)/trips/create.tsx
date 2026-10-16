@@ -1,10 +1,17 @@
 import { useRouter } from "expo-router";
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import { SafeAreaView, ScrollView, StyleSheet, View } from "react-native";
 import { Button, Text, TextInput, useTheme } from "react-native-paper";
 
 import { useAuth } from "../../../src/contexts/AuthContext";
-import { createTrip } from "../../../src/services/firebase/trips";
+import {
+  createTrip,
+  generateTripClientRequestId,
+} from "../../../src/services/firebase/trips";
+import {
+  tripCreateFactsUnchanged,
+  type PreparedTripCreateRequest,
+} from "../../../src/domain/tripCreateRequest";
 import { isValidCanonicalDate, todayCanonicalDate } from "../../../src/domain/tripDates";
 import { radii, spacing, typography } from "../../../src/theme/tokens";
 import { useSemanticColors } from "../../../src/theme/useSemanticColors";
@@ -105,6 +112,32 @@ export default function CreateTripScreen() {
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // Checkpoint 5B.5B: screen-lifetime idempotency state. clientRequestId
+  // is generated at most once per mount (lazily, only once local
+  // validation has passed for the first time) and reused for every
+  // backend create attempt until a successful navigation/unmount - never
+  // regenerated after an ambiguous callable failure, since the deployed
+  // createTrip Function uses this id as the Trip's own document id and a
+  // fresh id would risk creating a second Trip if a "failed" attempt
+  // actually succeeded server-side with only its response lost.
+  // preparedRequestRef remembers the exact facts (and resulting
+  // imageUrl) of the last attempt, so an unchanged retry can reuse the
+  // same imageUrl instead of re-running the Wikipedia lookup - see
+  // src/domain/tripCreateRequest.ts for why that matters.
+  const clientRequestIdRef = useRef<string | null>(null);
+  const preparedRequestRef = useRef<PreparedTripCreateRequest | null>(null);
+  // Checkpoint 5B.5B hardening: `submitting` (React state) is NOT a
+  // synchronous mutex - its disabling of the Save button only takes
+  // effect after the render it triggers, so two very rapid onPress
+  // events can both enter onSave before that render happens. This plain
+  // ref is checked/set synchronously, before any await (including the
+  // Wikipedia lookup, which could otherwise run twice concurrently and
+  // prepare two different imageUrl values under the same
+  // clientRequestId). `submitting` state is retained unchanged for
+  // visual/loading/disabled UI behavior - this ref is only the
+  // synchronous re-entry guard.
+  const submitInFlightRef = useRef(false);
+
   const todayPlaceholder = todayCanonicalDate();
 
   const canSave = useMemo(() => {
@@ -152,33 +185,64 @@ export default function CreateTripScreen() {
       return;
     }
 
+    // Synchronous re-entry guard - must be checked/acquired before
+    // anything async (see the ref's own declaration comment above). A
+    // second rapid press lands here while the guard is already true and
+    // returns immediately, never reaching the Wikipedia lookup or the
+    // createTrip call.
+    if (submitInFlightRef.current) return;
+    submitInFlightRef.current = true;
     setSubmitting(true);
     setErr(null);
 
     try {
-      // Seed for stable fallback image
-      const seed = `${user.uid}-${cleanTitle}-${cleanLocation || "travel"}`;
-
-      // ✅ Try location-matching Wikipedia image first; fallback to loremflickr
-      const wikiQuery = cleanLocation || cleanTitle;
-      const wikiImage = await tryGetWikipediaImage(wikiQuery);
-      const imageUrl = wikiImage ?? buildFallbackTripImageUrl(seed, cleanLocation || null, cleanTitle);
-
-      const tripId = await createTrip({
+      const facts = {
         title: cleanTitle,
         location: cleanLocation ? cleanLocation : null,
         target: t,
-        imageUrl,
-        ownerId: user.uid,
         tripStartDate: cleanStart,
         tripEndDate: cleanEnd ? cleanEnd : null,
+      };
+
+      let imageUrl: string;
+      if (tripCreateFactsUnchanged(preparedRequestRef.current, facts)) {
+        // Exact same canonical facts as the last prepared attempt - reuse
+        // the exact prior imageUrl rather than re-running the Wikipedia
+        // lookup (src/domain/tripCreateRequest.ts explains why: a
+        // different image on retry would make the backend's immutable
+        // creationRequest comparison see changed original facts).
+        imageUrl = preparedRequestRef.current!.imageUrl;
+      } else {
+        // Seed for stable fallback image
+        const seed = `${user.uid}-${cleanTitle}-${facts.location || "travel"}`;
+
+        // ✅ Try location-matching Wikipedia image first; fallback to loremflickr
+        const wikiQuery = facts.location || cleanTitle;
+        const wikiImage = await tryGetWikipediaImage(wikiQuery);
+        imageUrl = wikiImage ?? buildFallbackTripImageUrl(seed, facts.location, cleanTitle);
+      }
+
+      // Generated at most once per mounted screen - reused for every
+      // attempt, including a changed-facts retry after a failed attempt.
+      if (clientRequestIdRef.current === null) {
+        clientRequestIdRef.current = generateTripClientRequestId();
+      }
+      const clientRequestId = clientRequestIdRef.current;
+
+      preparedRequestRef.current = { ...facts, clientRequestId, imageUrl };
+
+      const result = await createTrip({
+        clientRequestId,
+        ...facts,
+        imageUrl,
       });
 
-      router.replace(`/(tabs)/trips/${tripId}`);
+      router.replace(`/(tabs)/trips/${result.tripId}`);
     } catch (e) {
       console.error("Failed to create trip:", e);
       setErr("Failed to create trip (permissions or network).");
     } finally {
+      submitInFlightRef.current = false;
       setSubmitting(false);
     }
   };
