@@ -10,6 +10,7 @@ const {
   OUTSIDER_UID,
   TRIP_ID,
   validTripData,
+  validNativeTripData,
   seedTrip,
   tripDoc,
   tripsCollection,
@@ -43,15 +44,6 @@ function asOutsider() {
 }
 function asUnauthenticated() {
   return testEnv.unauthenticatedContext();
-}
-
-// Builds a trip payload with no `location` key at all (as opposed to an
-// explicit null), to exercise the create rule's "location may be absent"
-// branch. Firestore's SDK throws on explicit `undefined` field values, so
-// this can't be done via validTripData({ location: undefined }).
-function withoutLocation(data) {
-  const { location, ...rest } = data;
-  return rest;
 }
 
 describe('firestore.rules: trips - authentication and reads', () => {
@@ -89,20 +81,37 @@ describe('firestore.rules: trips - authentication and reads', () => {
   });
 });
 
-describe('firestore.rules: trips - create', () => {
-  it('authenticated user: can create a valid trip (ownerId = uid, ownerId in memberIds, valid types)', async () => {
-    await assertSucceeds(
+// Checkpoint 5B.5D: direct client Trip creation is now permanently
+// closed (`allow create: if false` in firestore.rules, no exception for
+// any role or payload shape - the trusted createTrip Cloud Function,
+// which bypasses these rules via the Admin SDK, is the sole creation
+// path). The old large "some direct creates succeed" suite this
+// replaced is obsolete by construction - its premise (a client-facing
+// create allowlist worth type/shape-testing field-by-field) no longer
+// exists. This suite instead proves the actual security boundary:
+// unconditional denial, regardless of actor, payload shape, or how
+// closely a forged payload mimics either the legacy or the native
+// trusted backend shape.
+describe('firestore.rules: trips - create (Checkpoint 5B.5D: permanently closed)', () => {
+  it('A. authenticated owner cannot directly create a valid legacy-shaped Trip', async () => {
+    await assertFails(
       tripDoc(asOwner(), 'new-trip').set(validTripData())
     );
   });
 
-  it('unauthenticated user: cannot create a trip', async () => {
+  it('B. unauthenticated client cannot create a Trip', async () => {
     await assertFails(
       tripDoc(asUnauthenticated(), 'new-trip').set(validTripData())
     );
   });
 
-  it('user: cannot create a trip owned by another user', async () => {
+  it('C. authenticated client cannot directly create a perfectly-shaped native ownership-ready Trip', async () => {
+    await assertFails(
+      tripDoc(asOwner(), 'new-trip').set(validNativeTripData())
+    );
+  });
+
+  it('D1. a forged ownerId does not create an escape hatch', async () => {
     await assertFails(
       tripDoc(asOwner(), 'new-trip').set(
         validTripData({ ownerId: OUTSIDER_UID })
@@ -110,204 +119,28 @@ describe('firestore.rules: trips - create', () => {
     );
   });
 
-  it('create: owner must be included in memberIds', async () => {
+  it('D2. an extra/unexpected field does not create an escape hatch', async () => {
     await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(
-        validTripData({ memberIds: [MEMBER_UID] })
-      )
+      tripDoc(asOwner(), 'new-trip').set(validTripData({ notes: 'hi' }))
     );
   });
 
-  it('create: invalid memberIds type is rejected', async () => {
+  it('D3. an otherwise-malformed/incomplete request still fails (not merely shape-rejected)', async () => {
     await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(
-        validTripData({ memberIds: OWNER_UID })
-      )
+      tripDoc(asOwner(), 'new-trip').set({ title: 'Incomplete' })
     );
   });
 
-  it('create: invalid target type is rejected', async () => {
+  it('D4. a non-owner member cannot create a Trip on someone else\'s behalf either', async () => {
     await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(
-        validTripData({ target: '1000' })
-      )
+      tripDoc(asMember(), 'new-trip').set(validTripData())
     );
   });
 
-  it('create: invalid saved type is rejected', async () => {
+  it('D5. an outsider cannot create a Trip', async () => {
     await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(
-        validTripData({ saved: '0' })
-      )
+      tripDoc(asOutsider(), 'new-trip').set(validTripData())
     );
-  });
-
-  it('create: invalid title type is rejected', async () => {
-    await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(
-        validTripData({ title: 123 })
-      )
-    );
-  });
-
-  it('create: invalid imageUrl type is rejected', async () => {
-    await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(
-        validTripData({ imageUrl: 123 })
-      )
-    );
-  });
-
-  it('create: location may be an explicit string', async () => {
-    await assertSucceeds(
-      tripDoc(asOwner(), 'new-trip').set(validTripData({ location: 'Somewhere Else' }))
-    );
-  });
-
-  it('create: location may be explicit null', async () => {
-    await assertSucceeds(
-      tripDoc(asOwner(), 'new-trip').set(validTripData({ location: null }))
-    );
-  });
-
-  it('create: location may be omitted entirely', async () => {
-    await assertSucceeds(
-      tripDoc(asOwner(), 'new-trip').set(withoutLocation(validTripData()))
-    );
-  });
-
-  it('create: invalid location type (present but not string/null) is rejected', async () => {
-    await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(validTripData({ location: 123 }))
-    );
-  });
-
-  // Milestone 2B Checkpoint 4I: Trip has no Starting Balance concept - a
-  // freshly-created Trip must always report a neutral saved: 0. The
-  // existing "valid trip create" test above already proves saved: 0
-  // succeeds via validTripData()'s default, so no separate zero-saved
-  // success test is added here.
-  it('create: a nonzero saved is rejected', async () => {
-    await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(validTripData({ saved: 500 }))
-    );
-  });
-
-  it('create: a negative saved is rejected', async () => {
-    await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(validTripData({ saved: -50 }))
-    );
-  });
-
-  // Milestone 2B Checkpoint 4I: a client must never be able to inject
-  // either trusted ledger field, not even at create time - the trusted
-  // recordSavingsTransaction backend would otherwise treat a client-
-  // forged pair of ledger fields as already-initialized truth, or
-  // permanently break the Trip via its partial-ledger guard if only one
-  // is present (see firestore.rules's create comment for the full
-  // reasoning).
-  it('create: ledgerBalanceMinor cannot be injected', async () => {
-    await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(
-        validTripData({ ledgerBalanceMinor: 999999 })
-      )
-    );
-  });
-
-  it('create: ledgerOpeningBalanceMinor cannot be injected', async () => {
-    await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(
-        validTripData({ ledgerOpeningBalanceMinor: 999999 })
-      )
-    );
-  });
-
-  it('create: currency cannot be injected', async () => {
-    await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(
-        validTripData({ currency: 'EUR' })
-      )
-    );
-  });
-
-  it('create: an arbitrary extra field is rejected', async () => {
-    await assertFails(
-      tripDoc(asOwner(), 'new-trip').set(
-        validTripData({ notes: 'hi' })
-      )
-    );
-  });
-
-  // Checkpoint 3F.3B.2: tripStartDate/tripEndDate canonical-date fields.
-  describe('trip dates', () => {
-    it('create: valid tripStartDate (canonical YYYY-MM-DD) succeeds', async () => {
-      await assertSucceeds(
-        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripStartDate: '2027-06-12' }))
-      );
-    });
-
-    it('create: missing tripStartDate is rejected (now required)', async () => {
-      const { tripStartDate, ...withoutStart } = validTripData();
-      await assertFails(tripDoc(asOwner(), 'new-trip').set(withoutStart));
-    });
-
-    it('create: tripStartDate as a locale-formatted string is rejected', async () => {
-      await assertFails(
-        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripStartDate: '06/12/2027' }))
-      );
-    });
-
-    it('create: tripStartDate with a non-string type is rejected', async () => {
-      await assertFails(
-        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripStartDate: 20270612 }))
-      );
-    });
-
-    it('create: tripEndDate may be a valid canonical date on/after tripStartDate', async () => {
-      await assertSucceeds(
-        tripDoc(asOwner(), 'new-trip').set(
-          validTripData({ tripStartDate: '2027-06-12', tripEndDate: '2027-06-18' })
-        )
-      );
-    });
-
-    it('create: tripEndDate equal to tripStartDate succeeds (same-day trip)', async () => {
-      await assertSucceeds(
-        tripDoc(asOwner(), 'new-trip').set(
-          validTripData({ tripStartDate: '2027-06-12', tripEndDate: '2027-06-12' })
-        )
-      );
-    });
-
-    it('create: tripEndDate may be explicit null', async () => {
-      await assertSucceeds(
-        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripEndDate: null }))
-      );
-    });
-
-    it('create: tripEndDate may be omitted entirely', async () => {
-      await assertSucceeds(tripDoc(asOwner(), 'new-trip').set(validTripData()));
-    });
-
-    it('create: tripEndDate before tripStartDate is rejected', async () => {
-      await assertFails(
-        tripDoc(asOwner(), 'new-trip').set(
-          validTripData({ tripStartDate: '2027-06-12', tripEndDate: '2027-06-01' })
-        )
-      );
-    });
-
-    it('create: tripEndDate with an invalid type is rejected', async () => {
-      await assertFails(
-        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripEndDate: 20270618 }))
-      );
-    });
-
-    it('create: tripEndDate as a locale-formatted string is rejected', async () => {
-      await assertFails(
-        tripDoc(asOwner(), 'new-trip').set(validTripData({ tripEndDate: '06/18/2027' }))
-      );
-    });
   });
 });
 
@@ -837,12 +670,47 @@ describe('firestore.rules: trips - ownership-model-state fields are backend-only
     );
   });
 
-  describe('on a Trip the trusted backend has already marked initialized', () => {
+  // Checkpoint 5B.5D, item 4: seeded with the FULL canonical native shape
+  // (validNativeTripData - every backend-only field together: ledger/
+  // currency/ownership-model/creationRequest), not just the two ownership
+  // fields the rest of this describe block otherwise tests in isolation.
+  // Proves closing CREATE did not accidentally break legitimate client
+  // behavior on an already-existing native Trip, and that every
+  // backend-only field on the REAL native shape (not just ownership
+  // state/version) remains client-immutable on update.
+  describe('on a native initialized Trip the trusted createTrip backend has already created', () => {
     beforeEach(async () => {
-      await seedTrip(
-        testEnv,
-        TRIP_ID,
-        validTripData({ ownershipModelState: 'initialized', ownershipModelVersion: 1 })
+      await seedTrip(testEnv, TRIP_ID, validNativeTripData());
+    });
+
+    it('owner can read the Trip', async () => {
+      await assertSucceeds(tripDoc(asOwner(), TRIP_ID).get());
+    });
+
+    it('a member included in memberIds can read the Trip', async () => {
+      await assertSucceeds(tripDoc(asMember(), TRIP_ID).get());
+    });
+
+    it('an outsider still cannot read the Trip', async () => {
+      await assertFails(tripDoc(asOutsider(), TRIP_ID).get());
+    });
+
+    it('owner can perform an ordinary allowed metadata update (title)', async () => {
+      await assertSucceeds(tripDoc(asOwner(), TRIP_ID).update({ title: 'Renamed Trip' }));
+    });
+
+    it('owner can perform the existing allowed date update (tripStartDate)', async () => {
+      await assertSucceeds(
+        tripDoc(asOwner(), TRIP_ID).update({ tripStartDate: '2028-02-02' })
+      );
+    });
+
+    it('owner can archive the Trip through the existing archive transition', async () => {
+      await assertSucceeds(
+        tripDoc(asOwner(), TRIP_ID).update({
+          archivedAt: serverTimestamp(),
+          archivedBy: OWNER_UID,
+        })
       );
     });
 
@@ -861,6 +729,26 @@ describe('firestore.rules: trips - ownership-model-state fields are backend-only
     it('owner cannot change the backend-set ownershipModelState to a different value', async () => {
       await assertFails(
         tripDoc(asOwner(), TRIP_ID).update({ ownershipModelState: 'needs_reconciliation' })
+      );
+    });
+
+    it('owner cannot change ledgerBalanceMinor on the native Trip', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ ledgerBalanceMinor: 99999 })
+      );
+    });
+
+    it('owner cannot change creationRequest on the native Trip', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({
+          creationRequest: { clientRequestId: 'forged' },
+        })
+      );
+    });
+
+    it('owner cannot remove creationRequest on the native Trip', async () => {
+      await assertFails(
+        tripDoc(asOwner(), TRIP_ID).update({ creationRequest: deleteField() })
       );
     });
 

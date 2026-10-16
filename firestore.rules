@@ -114,73 +114,23 @@ service cloud.firestore {
         return resource.data.get('archivedAt', null) == null;
       }
 
-      // Create requires: ownerId, memberIds includes owner, title string,
-      // target number, saved number, imageUrl string, tripStartDate a
-      // valid canonical date. location/tripEndDate may be string or null.
-      //
-      // Milestone 2B Checkpoint 4I: Trip creation remains a direct client
-      // write for now (unlike Bucket, which moved to a trusted callable
-      // in Checkpoint 4G), so this rule alone is what prevents a client
-      // from injecting or forging Trip financial state. saved == 0 is
-      // required - Trip has no Starting Balance product concept, so a
-      // freshly-created Trip must always report a neutral zero shared
-      // fund; the first trusted recordSavingsTransaction call legacy-
-      // initializes the ledger from that 0 exactly like a new $0-Starting-
-      // Balance Bucket already does. keys().hasOnly(...) permits exactly
-      // the fields the current createTrip service legitimately writes -
-      // critically, ledgerOpeningBalanceMinor, ledgerBalanceMinor, and
-      // currency are NOT in this list. Without this, a client could set
-      // both ledger fields at create time and have the trusted backend
-      // treat them as already-initialized truth (bypassing legacy
-      // initialization and seeding forged financial state), or set only
-      // one and permanently break the Trip via the backend's partial-
-      // ledger failed-precondition guard - see recordSavingsTransaction.ts.
-      //
-      // Checkpoint 3F.3B.2: tripStartDate is required (matching the
-      // product decision that every trip created from this checkpoint
-      // forward must have a real start date) - tripEndDate stays
-      // optional/nullable, and when both are present as valid dates,
-      // end must be on/after start (a plain string >= comparison is
-      // correct here because same-length ISO "YYYY-MM-DD" strings sort
-      // lexicographically in calendar order).
-      allow create: if signedIn()
-        && request.resource.data.ownerId == request.auth.uid
-        && request.resource.data.memberIds is list
-        && request.auth.uid in request.resource.data.memberIds
-        && request.resource.data.title is string
-        && request.resource.data.target is number
-        && request.resource.data.saved is number
-        && request.resource.data.saved == 0
-        && request.resource.data.imageUrl is string
-        && (
-          !(request.resource.data.keys().hasAny(['location']))
-          || request.resource.data.location is string
-          || request.resource.data.location == null
-        )
-        && isValidCanonicalDate(request.resource.data.tripStartDate)
-        && (
-          !(request.resource.data.keys().hasAny(['tripEndDate']))
-          || request.resource.data.tripEndDate == null
-          || (
-            isValidCanonicalDate(request.resource.data.tripEndDate)
-            && request.resource.data.tripEndDate >= request.resource.data.tripStartDate
-          )
-        )
-        && request.resource.data.keys().hasOnly([
-          'ownerId', 'memberIds', 'title', 'location', 'target', 'saved',
-          'imageUrl', 'tripStartDate', 'tripEndDate', 'createdAt',
-          'lastUpdatedAt', 'lastUpdatedBy'
-        ]);
-        // Checkpoint 5B.1: ownershipModelState/ownershipModelVersion are
-        // backend-only fields a client must never be able to create,
-        // change, or remove. No new clause was needed to enforce this -
-        // this create allowlist (and the update allowlists below) are
-        // already exhaustive `keys().hasOnly(...)`/`affectedKeys()
-        // .hasOnly(...)` lists, not a blocklist, so any attempt to
-        // include either field in a client write already fails the
-        // whole rule. Verified by dedicated tests in
-        // tests/firestore-rules/trips.rules.test.js rather than merely
-        // assumed.
+      // Checkpoint 5B.5D: direct client Trip creation is now permanently
+      // closed. The trusted createTrip Cloud Function (Admin SDK, which
+      // bypasses these rules entirely) is the sole creation path - it
+      // derives ownerId/memberIds from the authenticated caller and
+      // atomically writes the canonical ledgerOpeningBalanceMinor/
+      // ledgerBalanceMinor/currency/ownershipModelState/
+      // ownershipModelVersion/creationRequest state, none of which a
+      // client-facing rule could ever safely express or enforce on its
+      // own (see the Checkpoint 5B.5/5B.5A preflight and
+      // functions/src/callables/createTrip.ts). No exception exists for
+      // any role - not the owner, not any authenticated caller, not a
+      // perfectly-shaped legacy OR native ownership-ready payload, and
+      // not any particular field combination. This follows the exact
+      // same security model already used to close direct Bucket
+      // creation (Checkpoint 4G-3) and direct savingsTransactions writes
+      // (Checkpoint 4B).
+      allow create: if false;
 
       // SEC-001 fix: field-level allowlists for update, for both owner and
       // non-owner members. ownerId, memberIds and target remain
@@ -194,10 +144,10 @@ service cloud.firestore {
       // client attempt to add, change, or delete them (uniformly, since a
       // deleted field is also an affected key). The trusted
       // recordSavingsTransaction Cloud Function (Admin SDK, which
-      // bypasses these rules) is the only path that updates them. Trip
-      // creation is unaffected - saved's create-time exposure is a
-      // separate, deliberately deferred gap (see the "allow create"
-      // clause above), tracked for a dedicated follow-up checkpoint.
+      // bypasses these rules) is the only path that updates them.
+      // Checkpoint 5B.5D: Trip creation itself is now fully closed too
+      // (see the "allow create: if false" clause above) - there is no
+      // remaining create-time exposure gap of any kind.
       // Checkpoint 3F.3B.3: tripStartDate/tripEndDate join the OWNER-only
       // update allowlist (a member may still never touch them, matching
       // "Owner may update dates; Member may NOT"). The shape checks below
