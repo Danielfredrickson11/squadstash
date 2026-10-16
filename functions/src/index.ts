@@ -3,6 +3,7 @@ import {initializeApp} from "firebase-admin/app";
 initializeApp();
 
 export {createBucket} from "./callables/createBucket";
+export {createTrip} from "./callables/createTrip";
 export {lookupUserByEmail} from "./callables/lookupUserByEmail";
 export {createTripInvitation} from "./callables/createTripInvitation";
 export {publishTripTerms} from "./callables/publishTripTerms";
