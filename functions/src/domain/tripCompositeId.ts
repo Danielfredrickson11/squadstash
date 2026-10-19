@@ -57,3 +57,55 @@ export function assertNoDelimiter(value: string, label: string): void {
     );
   }
 }
+
+/**
+ * Deterministic tripInvitations document id - the entire uniqueness
+ * mechanism for "at most one invitation record ever exists for a given
+ * (tripId, inviteeUid) pair" (mirrors createBucket.ts's own
+ * tripPersonalBucketId convention).
+ *
+ * Checkpoint 5C.1: moved here from createTripInvitation.ts (a
+ * behavior-preserving extraction - exact same formula/guard, same
+ * thrown HttpsError) so acceptTripInvitation.ts can reuse this exact
+ * primitive to verify a persisted invitation document's own id is
+ * canonical for its (tripId, inviteeUid), rather than trusting that
+ * merely finding a document at a requested id proves its identity.
+ *
+ * IMPORTANT: this exact formula is duplicated in
+ * src/services/firebase/tripInvitations.ts on the client (a separate
+ * compiled TypeScript project with no shared import path). Keep both in
+ * sync manually if this ever changes.
+ * @param {string} tripId The Trip's document id.
+ * @param {string} inviteeUid The resolved invitee's uid.
+ * @return {string} The deterministic invitation document id.
+ */
+export function tripInvitationId(tripId: string, inviteeUid: string): string {
+  assertNoDelimiter(tripId, "tripId");
+  assertNoDelimiter(inviteeUid, "inviteeUid");
+  return `${tripId}${ID_DELIMITER}${inviteeUid}`;
+}
+
+/**
+ * Deterministic tripMembershipAcceptances document id (Checkpoint 5C.1,
+ * per the frozen docs/audits/
+ * TRIP_FINANCIAL_MEMBERSHIP_ACCEPTANCE_PREFLIGHT_2026-10-16.md §12) -
+ * `{tripId}_{uid}_{termsDocId}`, applying the same delimiter guard to
+ * every component. The entire uniqueness mechanism for "one historical
+ * acceptance per member per terms version" - a later acceptance of a
+ * newer terms version naturally produces a different id, never
+ * overwriting an earlier one.
+ * @param {string} tripId The Trip's document id.
+ * @param {string} uid The accepting member's uid.
+ * @param {string} termsDocId The exact tripTerms document accepted.
+ * @return {string} The deterministic acceptance document id.
+ */
+export function tripMembershipAcceptanceId(
+  tripId: string,
+  uid: string,
+  termsDocId: string
+): string {
+  assertNoDelimiter(tripId, "tripId");
+  assertNoDelimiter(uid, "uid");
+  assertNoDelimiter(termsDocId, "termsDocId");
+  return `${tripId}${ID_DELIMITER}${uid}${ID_DELIMITER}${termsDocId}`;
+}

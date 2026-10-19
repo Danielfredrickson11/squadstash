@@ -2,6 +2,10 @@ import {FieldValue, getFirestore} from "firebase-admin/firestore";
 import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError, onCall} from "firebase-functions/v2/https";
 import type {CallableRequest} from "firebase-functions/v2/https";
+import {
+  assertPointerTargetValid,
+  assertValidExistingPointer,
+} from "../domain/tripTermsPointer";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -230,85 +234,6 @@ function assertTripTermsAuthorized(
  */
 function isTripArchived(tripData: FirebaseFirestore.DocumentData): boolean {
   return tripData.archivedAt !== undefined && tripData.archivedAt !== null;
-}
-
-/**
- * Validates an EXISTING tripTermsCurrent/{tripId} pointer's own fields,
- * following this project's established corruption/server-state error
- * convention (see recordSavingsTransaction.ts's identical
- * failed-precondition pattern for a malformed ledger state) - never
- * silently treating a malformed pointer as equivalent to "no pointer."
- * @param {FirebaseFirestore.DocumentData} pointerData The pointer
- *   document's data.
- * @param {string} tripId The Trip id this publish request is for.
- * @return {number} The pointer's validated currentVersion.
- */
-function assertValidExistingPointer(
-  pointerData: FirebaseFirestore.DocumentData,
-  tripId: string
-): number {
-  if (pointerData.tripId !== tripId) {
-    throw new HttpsError(
-      "failed-precondition",
-      "Trip terms pointer references a different tripId."
-    );
-  }
-  if (
-    !Number.isSafeInteger(pointerData.currentVersion) ||
-    (pointerData.currentVersion as number) <= 0
-  ) {
-    throw new HttpsError(
-      "failed-precondition",
-      "Trip terms pointer has an invalid currentVersion."
-    );
-  }
-  if (
-    typeof pointerData.currentTermsDocId !== "string" ||
-    pointerData.currentTermsDocId.length === 0
-  ) {
-    throw new HttpsError(
-      "failed-precondition",
-      "Trip terms pointer has an invalid currentTermsDocId."
-    );
-  }
-  return pointerData.currentVersion as number;
-}
-
-/**
- * Validates that the EXACT tripTerms document an existing pointer names
- * actually agrees with it, inside the same transaction - a malformed or
- * manually corrupted pointer must never become the basis of subsequent
- * authoritative history.
- * @param {FirebaseFirestore.DocumentSnapshot} targetSnap The pointer's
- *   named tripTerms document snapshot.
- * @param {string} tripId The Trip id this publish request is for.
- * @param {number} expectedVersion The pointer's own currentVersion.
- * @return {void}
- */
-function assertPointerTargetValid(
-  targetSnap: FirebaseFirestore.DocumentSnapshot,
-  tripId: string,
-  expectedVersion: number
-): void {
-  if (!targetSnap.exists) {
-    throw new HttpsError(
-      "failed-precondition",
-      "Trip terms pointer references a terms document that does not exist."
-    );
-  }
-  const targetData = targetSnap.data() as FirebaseFirestore.DocumentData;
-  if (targetData.tripId !== tripId) {
-    throw new HttpsError(
-      "failed-precondition",
-      "Trip terms pointer's referenced document belongs to a different Trip."
-    );
-  }
-  if (targetData.version !== expectedVersion) {
-    throw new HttpsError(
-      "failed-precondition",
-      "Trip terms pointer's version disagrees with its referenced document."
-    );
-  }
 }
 
 /**

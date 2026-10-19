@@ -6,6 +6,7 @@ export {createBucket} from "./callables/createBucket";
 export {createTrip} from "./callables/createTrip";
 export {lookupUserByEmail} from "./callables/lookupUserByEmail";
 export {createTripInvitation} from "./callables/createTripInvitation";
+export {acceptTripInvitation} from "./callables/acceptTripInvitation";
 export {publishTripTerms} from "./callables/publishTripTerms";
 export {recordSavingsTransaction} from "./callables/recordSavingsTransaction";
 export {recordTripExpense} from "./callables/recordTripExpense";

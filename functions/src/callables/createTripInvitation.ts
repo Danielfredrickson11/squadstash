@@ -3,7 +3,7 @@ import {FieldValue, Timestamp, getFirestore} from "firebase-admin/firestore";
 import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError, onCall} from "firebase-functions/v2/https";
 import type {CallableRequest} from "firebase-functions/v2/https";
-import {ID_DELIMITER, assertNoDelimiter} from "../domain/tripCompositeId";
+import {tripInvitationId} from "../domain/tripCompositeId";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -18,28 +18,6 @@ interface CreateTripInvitationResult {
 }
 
 const INVITATION_EXPIRY_MS = 14 * 24 * 60 * 60 * 1000;
-
-/**
- * Deterministic tripInvitations document id - the entire uniqueness
- * mechanism for "at most one invitation record ever exists for a given
- * (tripId, inviteeUid) pair" (mirrors createBucket.ts's own
- * tripPersonalBucketId convention). See domain/tripCompositeId.ts's own
- * header comment for why this concatenation is safe - Checkpoint 5B.1
- * extracted that guard into a shared module (behavior unchanged here).
- *
- * IMPORTANT: this exact formula is duplicated in
- * src/services/firebase/tripInvitations.ts on the client (a separate
- * compiled TypeScript project with no shared import path). Keep both in
- * sync manually if this ever changes.
- * @param {string} tripId The Trip's document id.
- * @param {string} inviteeUid The resolved invitee's uid.
- * @return {string} The deterministic invitation document id.
- */
-function tripInvitationId(tripId: string, inviteeUid: string): string {
-  assertNoDelimiter(tripId, "tripId");
-  assertNoDelimiter(inviteeUid, "inviteeUid");
-  return `${tripId}${ID_DELIMITER}${inviteeUid}`;
-}
 
 /**
  * createTripInvitation (Checkpoint 5A, docs/audits/
