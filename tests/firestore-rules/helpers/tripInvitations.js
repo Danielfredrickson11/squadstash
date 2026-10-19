@@ -4,6 +4,10 @@ const { Timestamp } = require('firebase/firestore');
 const OWNER_UID = 'owner-uid';
 const INVITEE_UID = 'invitee-uid';
 const OUTSIDER_UID = 'outsider-uid';
+// Checkpoint 5C.2: a current Trip MEMBER who is neither the owner nor
+// the named invitee - distinct from OUTSIDER_UID, which has no Trip
+// relationship at all.
+const MEMBER_UID = 'other-member-uid';
 const TRIP_ID = 'test-trip';
 
 function invitationId(tripId, inviteeUid) {
@@ -42,6 +46,7 @@ module.exports = {
   OWNER_UID,
   INVITEE_UID,
   OUTSIDER_UID,
+  MEMBER_UID,
   TRIP_ID,
   invitationId,
   validInvitationData,

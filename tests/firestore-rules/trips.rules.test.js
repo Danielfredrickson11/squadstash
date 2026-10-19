@@ -237,9 +237,27 @@ describe('firestore.rules: trips - owner updates', () => {
     );
   });
 
-  it('owner: can update memberIds while keeping themselves included', async () => {
-    await assertSucceeds(
+  // Checkpoint 5C.2 (frozen docs/audits/
+  // TRIP_FINANCIAL_MEMBERSHIP_ACCEPTANCE_PREFLIGHT_2026-10-16.md §18 item
+  // 1): this test used to assert the OPPOSITE - that the owner COULD
+  // directly add a uid to memberIds. That direct-mutation path is now
+  // permanently closed; the trusted acceptTripInvitation Cloud Function
+  // is the only path that may add a member. This is an intentional
+  // reversal, not a weakening - see also "owner: cannot directly remove
+  // an existing member from memberIds" below.
+  it('owner: cannot directly add a new uid to memberIds', async () => {
+    await assertFails(
       tripDoc(asOwner(), TRIP_ID).update({ memberIds: [OWNER_UID, MEMBER_UID, OUTSIDER_UID] })
+    );
+  });
+
+  // Checkpoint 5C.2: removing an EXISTING member (as opposed to removing
+  // the owner themselves, already covered below) must also be closed -
+  // §5/§15 of the preflight requires addition and removal to close
+  // together, with trusted removal deferred to a future checkpoint.
+  it('owner: cannot directly remove an existing member from memberIds', async () => {
+    await assertFails(
+      tripDoc(asOwner(), TRIP_ID).update({ memberIds: [OWNER_UID] })
     );
   });
 
@@ -455,6 +473,18 @@ describe('firestore.rules: trips - non-owner member updates', () => {
 describe('firestore.rules: trips - outsider and unauthenticated updates', () => {
   beforeEach(async () => {
     await seedTrip(testEnv, TRIP_ID, validTripData());
+  });
+
+  // Checkpoint 5C.2: an outsider was already blocked from updating the
+  // Trip at all (the test immediately below), but memberIds closure is
+  // an independent allowlist check - this makes the "outsider cannot
+  // alter memberIds either" assertion explicit rather than implicit.
+  it('outsider: cannot alter memberIds', async () => {
+    await assertFails(
+      tripDoc(asOutsider(), TRIP_ID).update({
+        memberIds: [OWNER_UID, MEMBER_UID, OUTSIDER_UID],
+      })
+    );
   });
 
   it('outsider: cannot update the trip', async () => {

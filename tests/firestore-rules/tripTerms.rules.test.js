@@ -3,6 +3,7 @@
 // against the local Firestore emulator using the real firestore.rules
 // file (never weakened to make a test pass).
 const { assertFails, assertSucceeds } = require('@firebase/rules-unit-testing');
+const { Timestamp } = require('firebase/firestore');
 const { createTestEnv } = require('./helpers/testEnv');
 const { seedTrip, validTripData } = require('./helpers/trips');
 const { seedTripInvitation, validInvitationData, invitationId } = require('./helpers/tripInvitations');
@@ -49,7 +50,14 @@ function asUnauthenticated() {
   return testEnv.unauthenticatedContext();
 }
 
-describe('firestore.rules: tripTerms - reads', () => {
+// Checkpoint 5C.2 (frozen docs/audits/
+// TRIP_FINANCIAL_MEMBERSHIP_ACCEPTANCE_PREFLIGHT_2026-10-16.md §16/§18
+// item 5, Option B): pre-join terms access now requires a CURRENTLY
+// actionable - pending AND unexpired - invitation, not merely any
+// invitation of any status. This describe block's name/content reflect
+// that narrowing; the former any-status hasTripInvitationRecord behavior
+// this block used to prove is gone.
+describe('firestore.rules: tripTerms - reads (Option B pre-join privacy, Checkpoint 5C.2)', () => {
   beforeEach(async () => {
     await seedTrip(testEnv, TRIP_ID, validTripData());
     await seedTripTerms(testEnv, TERMS_ID, validTripTermsData());
@@ -63,7 +71,7 @@ describe('firestore.rules: tripTerms - reads', () => {
     await assertSucceeds(tripTermsDoc(asMember(), TERMS_ID).get());
   });
 
-  it('an invited-but-not-yet-accepted user can read the trip terms', async () => {
+  it('a pending+unexpired named invitee can read the trip terms', async () => {
     const invitedUid = 'invited-not-member-uid';
     await seedTripInvitation(
       testEnv,
@@ -72,6 +80,99 @@ describe('firestore.rules: tripTerms - reads', () => {
     );
     await assertSucceeds(
       tripTermsDoc(testEnv.authenticatedContext(invitedUid), TERMS_ID).get()
+    );
+  });
+
+  it('a pending+EXPIRED invitee cannot read the trip terms', async () => {
+    const invitedUid = 'expired-invitee-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, invitedUid),
+      validInvitationData({
+        inviteeUid: invitedUid,
+        expiresAt: Timestamp.fromMillis(Date.now() - 60 * 60 * 1000),
+      })
+    );
+    await assertFails(
+      tripTermsDoc(testEnv.authenticatedContext(invitedUid), TERMS_ID).get()
+    );
+  });
+
+  it('a declined invitee cannot read the trip terms', async () => {
+    const invitedUid = 'declined-invitee-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, invitedUid),
+      validInvitationData({
+        inviteeUid: invitedUid,
+        status: 'declined',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertFails(
+      tripTermsDoc(testEnv.authenticatedContext(invitedUid), TERMS_ID).get()
+    );
+  });
+
+  it('a cancelled invitee cannot read the trip terms', async () => {
+    const invitedUid = 'cancelled-invitee-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, invitedUid),
+      validInvitationData({
+        inviteeUid: invitedUid,
+        status: 'cancelled',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertFails(
+      tripTermsDoc(testEnv.authenticatedContext(invitedUid), TERMS_ID).get()
+    );
+  });
+
+  // An accepted INVITATION alone must never be post-join authority -
+  // trips.memberIds is the sole source of truth (frozen preflight §16).
+  // This uid's invitation says "accepted" but was never actually added
+  // to trips.memberIds - an inconsistent/unlinked state that must still
+  // fail closed, never treated as equivalent to real membership.
+  it('an accepted invitation ALONE (uid not in trips.memberIds) cannot read the trip terms', async () => {
+    const acceptedNotMemberUid = 'accepted-not-member-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, acceptedNotMemberUid),
+      validInvitationData({
+        inviteeUid: acceptedNotMemberUid,
+        status: 'accepted',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertFails(
+      tripTermsDoc(testEnv.authenticatedContext(acceptedNotMemberUid), TERMS_ID).get()
+    );
+  });
+
+  // The mirror image of the test above - once a uid IS in
+  // trips.memberIds, they read via ordinary canAccessTripById, never
+  // through the invitation relationship at all (the accepted invitation
+  // here is present only to prove it is not what's granting access).
+  it('an accepted invitation + CURRENT trips.memberIds membership can read the trip terms', async () => {
+    const acceptedMemberUid = 'accepted-and-member-uid';
+    await seedTrip(
+      testEnv,
+      TRIP_ID,
+      validTripData({ memberIds: [OWNER_UID, MEMBER_UID, acceptedMemberUid] })
+    );
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, acceptedMemberUid),
+      validInvitationData({
+        inviteeUid: acceptedMemberUid,
+        status: 'accepted',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertSucceeds(
+      tripTermsDoc(testEnv.authenticatedContext(acceptedMemberUid), TERMS_ID).get()
     );
   });
 
@@ -159,7 +260,7 @@ describe('firestore.rules: tripTerms - query-level access (fetchAllTripTermsVers
     expect(snap.docs.map((d) => d.id).sort()).toEqual([TERMS_ID, 'test-terms-v2'].sort());
   });
 
-  it('an invited-but-not-yet-accepted user can run the same query', async () => {
+  it('a pending+unexpired invited user can run the same query', async () => {
     const invitedUid = 'invited-not-member-uid';
     await seedTripInvitation(
       testEnv,
@@ -168,6 +269,108 @@ describe('firestore.rules: tripTerms - query-level access (fetchAllTripTermsVers
     );
     await assertSucceeds(
       tripTermsCollection(testEnv.authenticatedContext(invitedUid))
+        .where('tripId', '==', TRIP_ID)
+        .get()
+    );
+  });
+
+  // Checkpoint 5C.2: Firestore evaluates a `list`/query rule using the
+  // query's own filters plus a per-document Rules check for each
+  // candidate, so the Option-B narrowing (§16) must be proven at the
+  // query level too, not only for a single point-read get() - list/query
+  // authorization is evaluated independently and can diverge from a
+  // point get() if the Rules expression were ever written differently
+  // for the two (it is not, here, but this is exactly the kind of gap a
+  // point-read-only test suite would miss).
+  it('an expired invited user cannot run the same query', async () => {
+    const invitedUid = 'expired-invitee-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, invitedUid),
+      validInvitationData({
+        inviteeUid: invitedUid,
+        expiresAt: Timestamp.fromMillis(Date.now() - 60 * 60 * 1000),
+      })
+    );
+    await assertFails(
+      tripTermsCollection(testEnv.authenticatedContext(invitedUid))
+        .where('tripId', '==', TRIP_ID)
+        .get()
+    );
+  });
+
+  it('a declined invited user cannot run the same query', async () => {
+    const invitedUid = 'declined-invitee-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, invitedUid),
+      validInvitationData({
+        inviteeUid: invitedUid,
+        status: 'declined',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertFails(
+      tripTermsCollection(testEnv.authenticatedContext(invitedUid))
+        .where('tripId', '==', TRIP_ID)
+        .get()
+    );
+  });
+
+  it('a cancelled invited user cannot run the same query', async () => {
+    const invitedUid = 'cancelled-invitee-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, invitedUid),
+      validInvitationData({
+        inviteeUid: invitedUid,
+        status: 'cancelled',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertFails(
+      tripTermsCollection(testEnv.authenticatedContext(invitedUid))
+        .where('tripId', '==', TRIP_ID)
+        .get()
+    );
+  });
+
+  it('an accepted-invitation-but-not-member user cannot run the same query', async () => {
+    const acceptedNotMemberUid = 'accepted-not-member-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, acceptedNotMemberUid),
+      validInvitationData({
+        inviteeUid: acceptedNotMemberUid,
+        status: 'accepted',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertFails(
+      tripTermsCollection(testEnv.authenticatedContext(acceptedNotMemberUid))
+        .where('tripId', '==', TRIP_ID)
+        .get()
+    );
+  });
+
+  it('an accepted current member can run the same query (via memberIds, not the invitation)', async () => {
+    const acceptedMemberUid = 'accepted-and-member-uid';
+    await seedTrip(
+      testEnv,
+      TRIP_ID,
+      validTripData({ memberIds: [OWNER_UID, MEMBER_UID, acceptedMemberUid] })
+    );
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, acceptedMemberUid),
+      validInvitationData({
+        inviteeUid: acceptedMemberUid,
+        status: 'accepted',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertSucceeds(
+      tripTermsCollection(testEnv.authenticatedContext(acceptedMemberUid))
         .where('tripId', '==', TRIP_ID)
         .get()
     );
@@ -204,7 +407,7 @@ describe('firestore.rules: tripTermsCurrent - the authoritative pointer', () => 
     await assertSucceeds(tripTermsCurrentDoc(asMember(), TRIP_ID).get());
   });
 
-  it('an invited-but-not-yet-accepted user can read the pointer', async () => {
+  it('a pending+unexpired named invitee can read the pointer', async () => {
     const invitedUid = 'invited-not-member-uid';
     await seedTripInvitation(
       testEnv,
@@ -213,6 +416,96 @@ describe('firestore.rules: tripTermsCurrent - the authoritative pointer', () => 
     );
     await assertSucceeds(
       tripTermsCurrentDoc(testEnv.authenticatedContext(invitedUid), TRIP_ID).get()
+    );
+  });
+
+  // Checkpoint 5C.2 (frozen preflight §16/§18 item 5, Option B): the
+  // tripTermsCurrent pointer's read rule shares the exact same
+  // hasPendingUnexpiredTripInvitation helper as tripTerms itself - this
+  // block mirrors that collection's full privacy matrix rather than only
+  // the happy path, since the two Rules clauses could in principle drift
+  // independently even though they do not today.
+  it('a pending+EXPIRED invitee cannot read the pointer', async () => {
+    const invitedUid = 'expired-invitee-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, invitedUid),
+      validInvitationData({
+        inviteeUid: invitedUid,
+        expiresAt: Timestamp.fromMillis(Date.now() - 60 * 60 * 1000),
+      })
+    );
+    await assertFails(
+      tripTermsCurrentDoc(testEnv.authenticatedContext(invitedUid), TRIP_ID).get()
+    );
+  });
+
+  it('a declined invitee cannot read the pointer', async () => {
+    const invitedUid = 'declined-invitee-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, invitedUid),
+      validInvitationData({
+        inviteeUid: invitedUid,
+        status: 'declined',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertFails(
+      tripTermsCurrentDoc(testEnv.authenticatedContext(invitedUid), TRIP_ID).get()
+    );
+  });
+
+  it('a cancelled invitee cannot read the pointer', async () => {
+    const invitedUid = 'cancelled-invitee-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, invitedUid),
+      validInvitationData({
+        inviteeUid: invitedUid,
+        status: 'cancelled',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertFails(
+      tripTermsCurrentDoc(testEnv.authenticatedContext(invitedUid), TRIP_ID).get()
+    );
+  });
+
+  it('an accepted invitation ALONE (uid not in trips.memberIds) cannot read the pointer', async () => {
+    const acceptedNotMemberUid = 'accepted-not-member-uid';
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, acceptedNotMemberUid),
+      validInvitationData({
+        inviteeUid: acceptedNotMemberUid,
+        status: 'accepted',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertFails(
+      tripTermsCurrentDoc(testEnv.authenticatedContext(acceptedNotMemberUid), TRIP_ID).get()
+    );
+  });
+
+  it('an accepted invitation + CURRENT trips.memberIds membership can read the pointer', async () => {
+    const acceptedMemberUid = 'accepted-and-member-uid';
+    await seedTrip(
+      testEnv,
+      TRIP_ID,
+      validTripData({ memberIds: [OWNER_UID, MEMBER_UID, acceptedMemberUid] })
+    );
+    await seedTripInvitation(
+      testEnv,
+      invitationId(TRIP_ID, acceptedMemberUid),
+      validInvitationData({
+        inviteeUid: acceptedMemberUid,
+        status: 'accepted',
+        respondedAt: Timestamp.now(),
+      })
+    );
+    await assertSucceeds(
+      tripTermsCurrentDoc(testEnv.authenticatedContext(acceptedMemberUid), TRIP_ID).get()
     );
   });
 

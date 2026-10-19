@@ -10,6 +10,7 @@ const {
   OWNER_UID,
   INVITEE_UID,
   OUTSIDER_UID,
+  MEMBER_UID,
   TRIP_ID,
   invitationId,
   validInvitationData,
@@ -34,7 +35,11 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await testEnv.clearFirestore();
-  await seedTrip(testEnv, TRIP_ID, validTripData({ memberIds: [OWNER_UID] }));
+  // Checkpoint 5C.2: MEMBER_UID is seeded as a CURRENT Trip member
+  // (distinct from the owner and the named invitee) so tests can prove
+  // an existing member has no special accept authority over someone
+  // else's invitation either.
+  await seedTrip(testEnv, TRIP_ID, validTripData({ memberIds: [OWNER_UID, MEMBER_UID] }));
 });
 
 function asOwner() {
@@ -42,6 +47,9 @@ function asOwner() {
 }
 function asInvitee() {
   return testEnv.authenticatedContext(INVITEE_UID);
+}
+function asMember() {
+  return testEnv.authenticatedContext(MEMBER_UID);
 }
 function asOutsider() {
   return testEnv.authenticatedContext(OUTSIDER_UID);
@@ -91,9 +99,34 @@ describe('firestore.rules: tripInvitations - invitee responses', () => {
     await seedTripInvitation(testEnv, INVITATION_ID, validInvitationData());
   });
 
-  it('the invitee can accept a pending invitation', async () => {
-    await assertSucceeds(
+  // Checkpoint 5C.2 (frozen docs/audits/
+  // TRIP_FINANCIAL_MEMBERSHIP_ACCEPTANCE_PREFLIGHT_2026-10-16.md §18 item
+  // 3): this test used to assert the OPPOSITE - that a perfectly
+  // pending+unexpired named invitee COULD directly accept. That direct
+  // path is now permanently closed; the trusted acceptTripInvitation
+  // Cloud Function is the sole accept path. Intentional reversal, not a
+  // weakening.
+  it('the named invitee with a perfect pending+unexpired invitation cannot directly accept (trusted callable only)', async () => {
+    await assertFails(
       tripInvitationDoc(asInvitee(), INVITATION_ID).update({
+        status: 'accepted',
+        respondedAt: serverTimestamp(),
+      })
+    );
+  });
+
+  it('another current Trip member (neither owner nor the named invitee) cannot directly accept it', async () => {
+    await assertFails(
+      tripInvitationDoc(asMember(), INVITATION_ID).update({
+        status: 'accepted',
+        respondedAt: serverTimestamp(),
+      })
+    );
+  });
+
+  it('an unauthenticated user cannot accept', async () => {
+    await assertFails(
+      tripInvitationDoc(asUnauthenticated(), INVITATION_ID).update({
         status: 'accepted',
         respondedAt: serverTimestamp(),
       })
@@ -192,9 +225,15 @@ describe('firestore.rules: tripInvitations - expiry enforcement', () => {
     return seedTripInvitation(testEnv, INVITATION_ID, validInvitationData({ expiresAt }));
   }
 
-  it('pending + unexpired: accepting succeeds', async () => {
+  // Checkpoint 5C.2: this test used to assert the OPPOSITE (that a
+  // pending+unexpired invitee COULD directly accept). Direct accept is
+  // now unconditionally closed regardless of expiry - see the "invitee
+  // responses" describe block above for the primary closure assertion;
+  // this one specifically proves expiry status no longer matters at all
+  // to the (now permanently false) direct-accept Rule.
+  it('pending + unexpired: accepting still fails (direct accept is now unconditionally closed)', async () => {
     await seedWithExpiry(Timestamp.fromMillis(Date.now() + 60 * 60 * 1000));
-    await assertSucceeds(
+    await assertFails(
       tripInvitationDoc(asInvitee(), INVITATION_ID).update({
         status: 'accepted',
         respondedAt: serverTimestamp(),
