@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "jest",
-    "test:rules": "firebase emulators:exec --only firestore \"jest --config jest.rules.config.js --runInBand\""
+    "test:rules": "firebase emulators:exec --only firestore \"jest --config jest.rules.config.js --runInBand\"",
+    "test:trip-invitation-integration": "npm --prefix functions run build && node tests/integration/runTripInvitationIntegration.cjs"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",

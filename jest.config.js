@@ -18,5 +18,11 @@ module.exports = {
     '/node_modules/',
     '<rootDir>/tests/firestore-rules/',
     '<rootDir>/functions/',
+    // Checkpoint 5C.3D-B: the Trip-invitation emulator integration suite
+    // runs under its own dedicated config (jest.integration.config.js),
+    // against real local Auth/Firestore/Functions emulators - a plain
+    // `npm test` must never pick these files up and attempt a real
+    // network call with no emulator running.
+    '<rootDir>/tests/integration/',
   ],
 };
