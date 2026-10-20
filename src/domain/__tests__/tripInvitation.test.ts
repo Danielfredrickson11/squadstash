@@ -3,6 +3,7 @@ import {
   canRespondToTripInvitation,
   isPendingTripInvitation,
   isTripInvitationExpired,
+  isTripInvitationTermsChangedError,
 } from "../tripInvitation";
 import type { TripInvitation } from "../../types/domain/tripInvitation";
 
@@ -124,5 +125,60 @@ describe("canCancelTripInvitation", () => {
         "owner-uid"
       )
     ).toBe(false);
+  });
+});
+
+describe("isTripInvitationTermsChangedError", () => {
+  it("is true for an error with details.reason === \"terms_changed\"", () => {
+    expect(
+      isTripInvitationTermsChangedError({
+        details: { reason: "terms_changed" },
+      })
+    ).toBe(true);
+  });
+
+  it("is false for null", () => {
+    expect(isTripInvitationTermsChangedError(null)).toBe(false);
+  });
+
+  it("is false for undefined", () => {
+    expect(isTripInvitationTermsChangedError(undefined)).toBe(false);
+  });
+
+  it("is false for a string", () => {
+    expect(isTripInvitationTermsChangedError("terms_changed")).toBe(false);
+  });
+
+  it("is false for a plain Error with no details", () => {
+    expect(isTripInvitationTermsChangedError(new Error("boom"))).toBe(false);
+  });
+
+  it("is false when details is missing", () => {
+    expect(isTripInvitationTermsChangedError({ code: "failed-precondition" })).toBe(
+      false
+    );
+  });
+
+  it("is false when details.reason is missing", () => {
+    expect(isTripInvitationTermsChangedError({ details: {} })).toBe(false);
+  });
+
+  it("is false for a different reason value", () => {
+    expect(
+      isTripInvitationTermsChangedError({ details: { reason: "something_else" } })
+    ).toBe(false);
+  });
+
+  it("is false when details is not an object", () => {
+    expect(isTripInvitationTermsChangedError({ details: "terms_changed" })).toBe(
+      false
+    );
+  });
+
+  it("does not mutate the original error object", () => {
+    const original = { details: { reason: "terms_changed" } };
+    const snapshot = JSON.parse(JSON.stringify(original));
+    isTripInvitationTermsChangedError(original);
+    expect(original).toEqual(snapshot);
   });
 });

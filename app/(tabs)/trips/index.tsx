@@ -18,16 +18,33 @@ import { ActiveStashHero } from "../../../components/home/ActiveStashHero";
 import { OtherTripCard } from "../../../components/trips/OtherTripCard";
 import { EmptyAdventureHero } from "../../../components/shared/EmptyAdventureHero";
 import { getCurrentUser } from "../../../src/services/firebase/auth";
+import { fetchPendingInvitationsForUser } from "../../../src/services/firebase/tripInvitations";
 import {
   fetchMemberTrips,
   fetchMemberTripsOrdered,
 } from "../../../src/services/firebase/trips";
 import { radii, spacing, typography } from "../../../src/theme/tokens";
 import { useSemanticColors } from "../../../src/theme/useSemanticColors";
-import type { Trip } from "../../../src/types/domain";
+import type { Trip, TripInvitation } from "../../../src/types/domain";
 
 const DESKTOP_BREAKPOINT = 900;
 const MAX_CONTENT_WIDTH = 1100;
+
+// Checkpoint 5C.3C: a short, friendly "expires in N day(s)" line for an
+// invitation card - display-only, never used for any actual eligibility
+// decision (fetchPendingInvitationsForUser already filters to pending +
+// unexpired before this ever renders). Deliberately not reusing
+// src/domain/tripDates.ts's canonical-date-string helpers, which model a
+// different representation (a plain "YYYY-MM-DD" calendar date) than an
+// invitation's real Firestore Timestamp expiresAt.
+function formatInvitationExpiry(invitation: TripInvitation): string {
+  const days = Math.ceil(
+    (invitation.expiresAt.toDate().getTime() - Date.now()) / (24 * 60 * 60 * 1000)
+  );
+  if (days <= 0) return "Expires today";
+  if (days === 1) return "Expires in 1 day";
+  return `Expires in ${days} days`;
+}
 
 export default function TripsIndex() {
   const router = useRouter();
@@ -39,6 +56,15 @@ export default function TripsIndex() {
   const [loading, setLoading] = useState(true);
   const [trips, setTrips] = useState<Trip[]>([]);
   const [queryText, setQueryText] = useState("");
+
+  // Checkpoint 5C.3C: pending-invitation state is deliberately
+  // INDEPENDENT of Trip state - an invitation-fetch failure must never
+  // blank or break the user's real Trips list, and a Trip-fetch failure
+  // must never fabricate invitations. Each has its own try/catch below;
+  // neither ever sets the other's state.
+  const [invitations, setInvitations] = useState<TripInvitation[]>([]);
+  const [invitationsLoading, setInvitationsLoading] = useState(true);
+  const [invitationsError, setInvitationsError] = useState<string | null>(null);
 
   const fetchTrips = useCallback(async () => {
     const user = getCurrentUser();
@@ -69,10 +95,36 @@ export default function TripsIndex() {
     }
   }, []);
 
+  // Uses the existing fetchPendingInvitationsForUser, which already
+  // filters to pending + unexpired in client code (Checkpoint 5A.1) -
+  // no new composite Firestore query/index is introduced here.
+  const fetchInvitations = useCallback(async () => {
+    const user = getCurrentUser();
+    if (!user) {
+      setInvitations([]);
+      setInvitationsLoading(false);
+      return;
+    }
+
+    setInvitationsLoading(true);
+    setInvitationsError(null);
+    try {
+      const rows = await fetchPendingInvitationsForUser(user.uid);
+      setInvitations(rows);
+    } catch (e) {
+      console.log("fetchInvitations error:", e);
+      setInvitations([]);
+      setInvitationsError("Couldn't load invitations right now.");
+    } finally {
+      setInvitationsLoading(false);
+    }
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       fetchTrips();
-    }, [fetchTrips])
+      fetchInvitations();
+    }, [fetchTrips, fetchInvitations])
   );
 
   // Client-side search only, over the already-fetched trips - no new
@@ -226,6 +278,92 @@ export default function TripsIndex() {
             </Pressable>
           </View>
 
+          {/* Checkpoint 5C.3C: a visually distinct "Invitations" section,
+              shown only when there's something to show - loading, at
+              least one pending invitation, or an invitation-specific
+              load error. Deliberately renders nothing per card beyond
+              what TripInvitation itself already carries (no per-card
+              getTripInvitationPreview fan-out, per the frozen docs/audits/
+              TRIP_INVITATION_CLIENT_UX_PREFLIGHT_2026-10-18.md §8/§10/§11)
+              - the full safe Trip preview loads only once the user taps
+              through to the review screen. */}
+          {invitationsLoading || invitations.length > 0 || invitationsError ? (
+            <View style={styles.invitationsSection}>
+              <Text style={[styles.sectionTitle, { color: theme.colors.onBackground }]}>
+                Invitations
+              </Text>
+              {invitationsLoading ? (
+                <View style={styles.invitationsLoadingRow}>
+                  <ActivityIndicator color={theme.colors.primary} size="small" />
+                  <Text style={[styles.loadingText, { color: theme.colors.onSurfaceVariant }]}>
+                    Loading invitations…
+                  </Text>
+                </View>
+              ) : invitationsError ? (
+                <Text style={[styles.invitationsErrorText, { color: colors.coral }]}>
+                  {invitationsError}
+                </Text>
+              ) : (
+                <View style={{ gap: spacing.sm }}>
+                  {invitations.map((invitation) => (
+                    <Pressable
+                      key={invitation.id}
+                      onPress={() =>
+                        router.push({
+                          pathname: "/(tabs)/trips/invitations/[invitationId]",
+                          params: { invitationId: invitation.id },
+                        })
+                      }
+                      accessibilityRole="button"
+                      accessibilityLabel="Review trip invitation"
+                      style={({ pressed }) => [
+                        styles.invitationCard,
+                        { backgroundColor: theme.colors.surface, borderColor: colors.border },
+                        pressed && { opacity: 0.9 },
+                      ]}
+                    >
+                      <View
+                        style={[
+                          styles.invitationIconWrap,
+                          { backgroundColor: colors.surfaceTertiary },
+                        ]}
+                      >
+                        <MaterialCommunityIcons
+                          name="email-outline"
+                          size={20}
+                          color={theme.colors.primary}
+                        />
+                      </View>
+                      <View style={styles.invitationBody}>
+                        <Text
+                          style={[styles.invitationTitle, { color: theme.colors.onSurface }]}
+                        >
+                          Trip invitation
+                        </Text>
+                        <Text
+                          style={[
+                            styles.invitationSubtitle,
+                            { color: theme.colors.onSurfaceVariant },
+                          ]}
+                        >
+                          Review invitation and trip terms
+                        </Text>
+                        <Text style={[styles.invitationExpiry, { color: colors.textMuted }]}>
+                          {formatInvitationExpiry(invitation)}
+                        </Text>
+                      </View>
+                      <MaterialCommunityIcons
+                        name="chevron-right"
+                        size={20}
+                        color={theme.colors.onSurfaceVariant}
+                      />
+                    </Pressable>
+                  ))}
+                </View>
+              )}
+            </View>
+          ) : null}
+
           {loading ? (
             <View style={styles.loadingWrap}>
               <ActivityIndicator color={theme.colors.primary} />
@@ -351,6 +489,33 @@ const styles = StyleSheet.create({
   },
 
   sectionTitle: { ...typography.sectionTitle, marginBottom: spacing.sm },
+
+  // Checkpoint 5C.3C: the pending-invitations section - visually
+  // distinct from both the Active hero/Other Stashes cards above it and
+  // the compact Archived rows below, matching this file's own existing
+  // convention of a titled section + its own vertical rhythm.
+  invitationsSection: { marginBottom: spacing.lg },
+  invitationsLoadingRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
+  invitationsErrorText: { fontWeight: "600", fontSize: 13 },
+  invitationCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    borderWidth: 1,
+    borderRadius: radii.lg,
+    padding: spacing.sm,
+  },
+  invitationIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: radii.pill,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  invitationBody: { flex: 1 },
+  invitationTitle: { ...typography.cardTitle },
+  invitationSubtitle: { ...typography.meta, marginTop: 1 },
+  invitationExpiry: { fontSize: 11, fontWeight: "600", marginTop: 2 },
 
   // Checkpoint 4B.5B: deliberately compact/subdued - title + chevron
   // only, no thumbnail/progress - this is a status list distinguishing

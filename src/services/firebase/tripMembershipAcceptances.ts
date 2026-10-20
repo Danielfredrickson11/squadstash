@@ -1,43 +1,31 @@
-// Checkpoint 5A: direct client reads/writes for the TripMembershipAcceptance
-// architecture, gated entirely by firestore.rules (self-only create,
-// requires an existing tripInvitations record plus a real tripTerms
-// document to reference; unconditional update/delete: if false). No
-// trusted callable is needed - see firestore.rules' own comment on this
-// collection.
+// Checkpoint 5C.2/5C.3C: this module is READ-ONLY. Direct client
+// creation of a tripMembershipAcceptances record was closed permanently
+// by Checkpoint 5C.2 (firestore.rules: `allow create, update, delete:
+// if false;`) - acceptance evidence is now created EXCLUSIVELY by the
+// trusted acceptTripInvitationCore transaction (functions/src/callables/
+// acceptTripInvitation.ts, Admin SDK, bypasses these Rules entirely),
+// atomically alongside flipping the invitation to "accepted" and adding
+// the accepting uid to trips.memberIds. There is no client write path
+// left in this file, and none should ever be added back - see
+// firestore.rules' own comment on this collection for why the old
+// direct-create path became a genuine bypass once acceptance started
+// granting real Trip membership (Checkpoint 5C).
 //
-// FROZEN INVARIANT (preflight §5, amendment 5.0A): creating one of these
-// records proves terms acceptance only - it has zero effect on
-// `trips.memberIds` or any trusted financial callable's authorization
-// decision. Nothing in this file writes to, or reads for the purpose of
-// granting, Trip financial authorization.
+// FROZEN INVARIANT (unchanged since the 5A/5.0A preflight, restated for
+// 5C): an acceptance record is proof of *how* a member joined, never a
+// second authorization source. `trips.memberIds` remains the sole
+// runtime financial-authorization authority every trusted financial
+// callable already consults - reading this collection (below) never
+// implies, grants, or substitutes for membership.
 import {
   collection,
-  doc,
   getDocs,
   query,
-  serverTimestamp,
-  setDoc,
   where,
   type DocumentData,
 } from "firebase/firestore";
 import { db } from "../../../firebase";
-import { assertNoTripCompositeIdDelimiter } from "../../domain/tripCompositeId";
 import type { PersistedTimestamp, TripMembershipAcceptance } from "../../types/domain";
-
-// Mirrors firestore.rules' own `acceptanceId ==` check exactly - the
-// entire uniqueness mechanism for "at most one acceptance record per
-// (tripId, uid, termsDocId) tuple." See src/domain/tripCompositeId.ts
-// for why this concatenation is safe.
-export function tripMembershipAcceptanceId(
-  tripId: string,
-  uid: string,
-  termsDocId: string
-): string {
-  assertNoTripCompositeIdDelimiter(tripId, "tripId");
-  assertNoTripCompositeIdDelimiter(uid, "uid");
-  assertNoTripCompositeIdDelimiter(termsDocId, "termsDocId");
-  return `${tripId}_${uid}_${termsDocId}`;
-}
 
 function mapTripMembershipAcceptanceDocument(
   id: string,
@@ -51,22 +39,6 @@ function mapTripMembershipAcceptanceDocument(
     acceptedTermsVersion: data.acceptedTermsVersion as number,
     acceptedAt: data.acceptedAt as PersistedTimestamp,
   };
-}
-
-export async function acceptTripTerms(
-  tripId: string,
-  uid: string,
-  termsDocId: string,
-  acceptedTermsVersion: number
-): Promise<void> {
-  const id = tripMembershipAcceptanceId(tripId, uid, termsDocId);
-  await setDoc(doc(db, "tripMembershipAcceptances", id), {
-    tripId,
-    uid,
-    termsDocId,
-    acceptedTermsVersion,
-    acceptedAt: serverTimestamp(),
-  });
 }
 
 export async function fetchTripMembershipAcceptances(

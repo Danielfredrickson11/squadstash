@@ -38,3 +38,21 @@ export type TripInvitation = {
   expiresAt: PersistedTimestamp;
   respondedAt: PersistedTimestamp | null;
 };
+
+// Checkpoint 5C.3C: the parsed client-side shape of the trusted
+// getTripInvitationPreview callable's response (functions/src/callables/
+// getTripInvitationPreview.ts) - EXACTLY the six safe, non-financial
+// fields that callable returns, and nothing else. Deliberately does NOT
+// include target/saved/currency/ledger*/ownerId/memberIds/
+// ownershipModel*/creationRequest/inviterUid/inviteeUid/inviteeEmail, or
+// any other root Trip/invitation field - a pending invitee must never
+// see Trip financial or membership state before joining (frozen
+// docs/audits/TRIP_INVITATION_CLIENT_UX_PREFLIGHT_2026-10-18.md §5).
+export type TripInvitationPreview = {
+  tripId: string;
+  title: string;
+  location: string | null;
+  imageUrl: string;
+  tripStartDate: string | null;
+  tripEndDate: string | null;
+};
