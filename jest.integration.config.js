@@ -54,7 +54,19 @@ const babelJestEntry = jestExpoPreset.transform['\\.[jt]sx?$'];
 module.exports = {
   ...jestExpoPreset,
   rootDir: __dirname,
-  testMatch: ['<rootDir>/tests/integration/**/*.test.ts', '<rootDir>/tests/integration/**/*.test.tsx'],
+  // Milestone 5C.4+5C.5 correction: narrowed from a directory-wide glob
+  // to the exact invitation-suite files this config already owned
+  // before that milestone - the broad glob began unintentionally
+  // absorbing the new, separately-configured financial integration
+  // suite's own test files (which also live under tests/integration/).
+  // The invitation suite's own sequencer (sequencer.js) already orders
+  // exactly these four conceptual files and needs no change.
+  testMatch: [
+    '<rootDir>/tests/integration/integrationGuard.test.ts',
+    '<rootDir>/tests/integration/tripInvitationFlow.emulator.test.ts',
+    '<rootDir>/tests/integration/tripInvitationScreen.emulator.test.tsx',
+    '<rootDir>/tests/integration/zzz_summary.emulator.test.ts',
+  ],
   transform: {
     ...jestExpoPreset.transform,
     '\\.mjs$': babelJestEntry,
