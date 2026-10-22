@@ -756,6 +756,41 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // ---------------------------------------
+    // TRIP OWNERSHIP RECONCILIATION ATTEMPTS (Checkpoint 5C.6, per the
+    // frozen docs/audits/
+    // MULTI_MEMBER_REVERSAL_RECONCILIATION_PREFLIGHT_2026-10-20.md §8/§17)
+    // - the trusted reconciliation tool's own permanent, append-only
+    // multi-attempt audit history for one Trip's reversal/reconciliation
+    // repair episodes. Fully client-closed, mirroring
+    // tripOwnershipMigrationState's own posture exactly - no current or
+    // planned client/app feature ever needs to read this collection; it
+    // exists solely for the local, non-exported Admin SDK reconciliation
+    // tool (functions/src/admin/reconcileTripOwnership.ts) to read/write
+    // directly, bypassing these Rules entirely like every other
+    // trusted-write-only collection in this file.
+    // ---------------------------------------
+    match /tripOwnershipReconciliationAttempts/{attemptId} {
+      allow get, list: if false;
+
+      allow create, update, delete: if false;
+    }
+
+    // ---------------------------------------
+    // TRIP OWNERSHIP RECONCILIATION CONTROL (Checkpoint 5C.6, same
+    // preflight §8/§9/§17) - the trusted reconciliation tool's own
+    // mutable, fixed-id-per-Trip coordination document, giving every
+    // concurrent `apply` start a single deterministic contention point.
+    // NEVER the audit history itself (see
+    // tripOwnershipReconciliationAttempts above for that) - fully
+    // client-closed for the identical reason.
+    // ---------------------------------------
+    match /tripOwnershipReconciliationControl/{tripId} {
+      allow get, list: if false;
+
+      allow create, update, delete: if false;
+    }
+
     // TRIP MEMBERSHIP ACCEPTANCE: immutable, append-only proof that `uid`
     // accepted the EXACT tripTerms document `termsDocId` at `acceptedAt`.
     // Deterministic id `{tripId}_{uid}_{termsDocId}` - a member may hold

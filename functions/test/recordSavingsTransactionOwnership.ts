@@ -230,6 +230,7 @@ describe("initialized contribution", () => {
     await seedOwnership(TRIP_ID, MEMBER_UID, 400, {
       lastUpdatedAt: oldSentinel,
     });
+    await seedOwnership(TRIP_ID, FRIEND_UID, 600);
 
     await recordSavingsTransactionCore(
       db,
@@ -278,6 +279,7 @@ describe("initialized contribution", () => {
   it("zero -> positive contribution works when the row exists at zero", async () => {
     await seedTrip(initializedOverrides(1000));
     await seedOwnership(TRIP_ID, MEMBER_UID, 0);
+    await seedOwnership(TRIP_ID, FRIEND_UID, 1000);
 
     const result = await recordSavingsTransactionCore(
       db,
@@ -539,6 +541,7 @@ describe("initialized contribution", () => {
   it("idempotent replay does not double-credit ownership", async () => {
     await seedTrip(initializedOverrides(1000));
     await seedOwnership(TRIP_ID, MEMBER_UID, 400);
+    await seedOwnership(TRIP_ID, FRIEND_UID, 600);
     const request = baseRequest({amountMinor: 100});
 
     const first = await recordSavingsTransactionCore(db, MEMBER_UID, request);
@@ -698,6 +701,7 @@ describe("initialized personal withdrawal", () => {
     await seedOwnership(TRIP_ID, MEMBER_UID, 100, {
       lastUpdatedAt: oldSentinel,
     });
+    await seedOwnership(TRIP_ID, FRIEND_UID, 900);
 
     await recordSavingsTransactionCore(
       db,
@@ -717,6 +721,7 @@ describe("initialized personal withdrawal", () => {
     await seedTrip(initializedOverrides(1000));
     const sentinel = Timestamp.fromMillis(1000);
     await seedOwnership(TRIP_ID, MEMBER_UID, 100, {lastUpdatedAt: sentinel});
+    await seedOwnership(TRIP_ID, FRIEND_UID, 900);
 
     await assertRejectsWithCode(
       recordSavingsTransactionCore(
@@ -891,6 +896,7 @@ describe("initialized personal withdrawal", () => {
   it("idempotent replay does not double-debit", async () => {
     await seedTrip(initializedOverrides(1000));
     await seedOwnership(TRIP_ID, MEMBER_UID, 100);
+    await seedOwnership(TRIP_ID, FRIEND_UID, 900);
     const request = baseRequest({type: "withdrawal", amountMinor: 40});
 
     const first = await recordSavingsTransactionCore(db, MEMBER_UID, request);
@@ -978,6 +984,7 @@ describe("migrating - every new mutation rejects", () => {
   it("an exact replay of an already-committed withdrawal survives the Trip later entering migrating (Checkpoint 5B.3A, item 2)", async () => {
     await seedTrip(initializedOverrides(1000));
     await seedOwnership(TRIP_ID, MEMBER_UID, 500);
+    await seedOwnership(TRIP_ID, FRIEND_UID, 500);
     const request = baseRequest({type: "withdrawal", amountMinor: 200});
     const first = await recordSavingsTransactionCore(db, MEMBER_UID, request);
     assert.equal(first.balanceMinor, 800);
@@ -1036,6 +1043,7 @@ describe("needs_reconciliation - every new mutation rejects, identically to migr
   it("an exact replay of an already-committed withdrawal survives the Trip later needing reconciliation", async () => {
     await seedTrip(initializedOverrides(1000));
     await seedOwnership(TRIP_ID, MEMBER_UID, 500);
+    await seedOwnership(TRIP_ID, FRIEND_UID, 500);
     const request = baseRequest({type: "withdrawal", amountMinor: 200});
     const first = await recordSavingsTransactionCore(db, MEMBER_UID, request);
     assert.equal(first.balanceMinor, 800);
@@ -1155,4 +1163,187 @@ describe("corrupt / unsupported ownership model state - fails closed", () => {
       assert.equal(rowSnap.exists, false);
     });
   }
+});
+
+// ---------------------------------------------------------------------
+// Checkpoint 5C.6 - per the frozen docs/audits/
+// MULTI_MEMBER_REVERSAL_RECONCILIATION_PREFLIGHT_2026-10-20.md: closing
+// the three full-set-reconciliation hardening gaps (existing-row
+// contribution, existing-row withdrawal, missing-row contribution).
+// Each case proves: failed-precondition; "initialized" ->
+// "needs_reconciliation" persisted (exact same version); aggregate
+// unchanged; complete ownership set unchanged; no savingsTransactions
+// document created.
+// ---------------------------------------------------------------------
+
+async function getTripOwnershipState(): Promise<{
+  state: unknown;
+  version: unknown;
+}> {
+  const snap = await db.collection("trips").doc(TRIP_ID).get();
+  const data = snap.data() ?? {};
+  return {
+    state: data.ownershipModelState,
+    version: data.ownershipModelVersion,
+  };
+}
+
+describe("5C.6 - existing-row contribution drift", () => {
+  it("rejects with failed-precondition, transitions to needs_reconciliation, and mutates nothing", async () => {
+    await seedTrip(initializedOverrides(1000));
+    // MEMBER_UID has an existing row, but the complete set (50) does not
+    // sum to the aggregate (1000) - a genuine drift this hardening pass
+    // must now detect for an EXISTING row, not only a missing one.
+    await seedOwnership(TRIP_ID, MEMBER_UID, 50);
+
+    const request = baseRequest({amountMinor: 100});
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(db, MEMBER_UID, request),
+      "failed-precondition"
+    );
+
+    const {state, version} = await getTripOwnershipState();
+    assert.equal(state, "needs_reconciliation");
+    assert.equal(version, CURRENT_TRIP_OWNERSHIP_MODEL_VERSION);
+    assert.equal(await getOwnership(MEMBER_UID), 50);
+    const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.equal(tripSnap.data()?.ledgerBalanceMinor, 1000);
+    const txnSnap = await db
+      .collection("savingsTransactions")
+      .doc(request.clientRequestId as string)
+      .get();
+    assert.equal(txnSnap.exists, false);
+  });
+
+  it("a healthy (non-drifted) existing-row contribution still succeeds", async () => {
+    await seedTrip(initializedOverrides(1000));
+    await seedOwnership(TRIP_ID, MEMBER_UID, 400);
+    await seedOwnership(TRIP_ID, FRIEND_UID, 600);
+
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({amountMinor: 100})
+    );
+    assert.equal(result.balanceMinor, 1100);
+    assert.equal(await getOwnership(MEMBER_UID), 500);
+    const {state} = await getTripOwnershipState();
+    assert.equal(state, "initialized");
+  });
+
+  it("an exact replay of an already-committed existing-row contribution succeeds even after the Trip later becomes needs_reconciliation via this same drift gate", async () => {
+    await seedTrip(initializedOverrides(1000));
+    await seedOwnership(TRIP_ID, MEMBER_UID, 400);
+    await seedOwnership(TRIP_ID, FRIEND_UID, 600);
+    const request = baseRequest({amountMinor: 100});
+    const first = await recordSavingsTransactionCore(db, MEMBER_UID, request);
+
+    // Independently drift the Trip into needs_reconciliation (simulating
+    // a later, unrelated out-of-band corruption).
+    await db.collection("trips").doc(TRIP_ID).update({
+      ownershipModelState: "needs_reconciliation",
+    });
+
+    const replay = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      request
+    );
+    assert.deepEqual(replay, first);
+  });
+});
+
+describe("5C.6 - existing-row withdrawal drift", () => {
+  it("rejects with failed-precondition, transitions to needs_reconciliation, and mutates nothing", async () => {
+    await seedTrip(initializedOverrides(1000));
+    await seedOwnership(TRIP_ID, MEMBER_UID, 500);
+    // Complete set sums to 500, not the aggregate's 1000 - drift.
+
+    const request = baseRequest({
+      type: "withdrawal",
+      amountMinor: 100,
+    });
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(db, MEMBER_UID, request),
+      "failed-precondition"
+    );
+
+    const {state, version} = await getTripOwnershipState();
+    assert.equal(state, "needs_reconciliation");
+    assert.equal(version, CURRENT_TRIP_OWNERSHIP_MODEL_VERSION);
+    assert.equal(await getOwnership(MEMBER_UID), 500);
+    const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.equal(tripSnap.data()?.ledgerBalanceMinor, 1000);
+    const txnSnap = await db
+      .collection("savingsTransactions")
+      .doc(request.clientRequestId as string)
+      .get();
+    assert.equal(txnSnap.exists, false);
+  });
+
+  it("a healthy (non-drifted) existing-row withdrawal still succeeds", async () => {
+    await seedTrip(initializedOverrides(1000));
+    await seedOwnership(TRIP_ID, MEMBER_UID, 400);
+    await seedOwnership(TRIP_ID, FRIEND_UID, 600);
+
+    const result = await recordSavingsTransactionCore(
+      db,
+      MEMBER_UID,
+      baseRequest({type: "withdrawal", amountMinor: 100})
+    );
+    assert.equal(result.balanceMinor, 900);
+    assert.equal(await getOwnership(MEMBER_UID), 300);
+  });
+});
+
+describe("5C.6 - missing-row contribution drift transitions to needs_reconciliation", () => {
+  it("rejects with failed-precondition and now ALSO transitions to needs_reconciliation (closing the frozen deferral)", async () => {
+    await seedTrip(initializedOverrides(1000));
+    await seedOwnership(TRIP_ID, FRIEND_UID, 50);
+    // No row for MEMBER_UID - existing set sums to 50, not 1000.
+
+    const request = baseRequest({amountMinor: 100});
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(db, MEMBER_UID, request),
+      "failed-precondition"
+    );
+
+    const {state, version} = await getTripOwnershipState();
+    assert.equal(state, "needs_reconciliation");
+    assert.equal(version, CURRENT_TRIP_OWNERSHIP_MODEL_VERSION);
+    assert.equal(await getOwnership(MEMBER_UID), undefined);
+    assert.equal(await getOwnership(FRIEND_UID), 50);
+    const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
+    assert.equal(tripSnap.data()?.ledgerBalanceMinor, 1000);
+    const txnSnap = await db
+      .collection("savingsTransactions")
+      .doc(request.clientRequestId as string)
+      .get();
+    assert.equal(txnSnap.exists, false);
+  });
+});
+
+describe("5C.6 - missing-row withdrawal remains unchanged (no new reconciliation scan)", () => {
+  it("rejects immediately on a missing row, without scanning the full ownership set or transitioning the Trip, even while OTHER rows are drifted", async () => {
+    await seedTrip(initializedOverrides(1000));
+    // The complete set (FRIEND_UID=50) does not sum to the aggregate
+    // (1000) - a real drift exists, but a missing-row withdrawal must
+    // reject on its own frozen ceiling alone, never running the
+    // full-set scan that would otherwise detect and flag this drift.
+    await seedOwnership(TRIP_ID, FRIEND_UID, 50);
+
+    await assertRejectsWithCode(
+      recordSavingsTransactionCore(
+        db,
+        MEMBER_UID,
+        baseRequest({type: "withdrawal", amountMinor: 1})
+      ),
+      "failed-precondition"
+    );
+
+    const {state} = await getTripOwnershipState();
+    assert.equal(state, "initialized");
+    assert.equal(await getOwnership(MEMBER_UID), undefined);
+    assert.equal(await getOwnership(FRIEND_UID), 50);
+  });
 });

@@ -307,3 +307,167 @@ export async function setTripLedgerBalanceDrift(
     await ctx.firestore().collection("trips").doc(tripId).update({ledgerBalanceMinor});
   });
 }
+
+/**
+ * Milestone 5C.6 - trusted, Rules-bypassing read of a single
+ * `tripOwnershipReconciliationAttempts` document, used to verify the
+ * frozen phase/evidence contract the real `reconcileTripOwnership.ts`
+ * admin tool produces (never written by this test helper itself).
+ * @param {string} tripId The Trip id.
+ * @param {string} attemptId The attempt's own id.
+ * @return {Promise<Record<string, unknown> | undefined>} The raw data,
+ *   or undefined if the document does not exist.
+ */
+export async function inspectReconciliationAttempt(
+  tripId: string,
+  attemptId: string
+): Promise<Record<string, unknown> | undefined> {
+  const env = await getTrustedInspectionEnv();
+  let data: Record<string, unknown> | undefined;
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const snap = await ctx
+      .firestore()
+      .collection("tripOwnershipReconciliationAttempts")
+      .doc(`${tripId}_${attemptId}`)
+      .get();
+    data = snap.data();
+  });
+  return data;
+}
+
+/**
+ * Milestone 5C.6 - trusted, Rules-bypassing read of every
+ * `tripOwnershipReconciliationAttempts` document for a Trip - used to
+ * verify the complete attempt history (e.g. that a failed attempt is
+ * retained, never overwritten).
+ * @param {string} tripId The Trip id.
+ * @return {Promise<Record<string, unknown>[]>} Every matching
+ *   document's raw data.
+ */
+export async function inspectAllReconciliationAttempts(
+  tripId: string
+): Promise<Record<string, unknown>[]> {
+  const env = await getTrustedInspectionEnv();
+  let rows: Record<string, unknown>[] = [];
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const snap = await ctx
+      .firestore()
+      .collection("tripOwnershipReconciliationAttempts")
+      .where("tripId", "==", tripId)
+      .get();
+    rows = snap.docs.map((d) => d.data());
+  });
+  return rows;
+}
+
+/**
+ * Milestone 5C.6 - trusted, Rules-bypassing read of the single
+ * `tripOwnershipReconciliationControl` document for a Trip.
+ * @param {string} tripId The Trip id.
+ * @return {Promise<Record<string, unknown> | undefined>} The raw data,
+ *   or undefined if the document does not exist.
+ */
+export async function inspectReconciliationControl(
+  tripId: string
+): Promise<Record<string, unknown> | undefined> {
+  const env = await getTrustedInspectionEnv();
+  let data: Record<string, unknown> | undefined;
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const snap = await ctx
+      .firestore()
+      .collection("tripOwnershipReconciliationControl")
+      .doc(tripId)
+      .get();
+    data = snap.data();
+  });
+  return data;
+}
+
+/**
+ * TRUSTED PRECONDITION SETUP (Milestone 5C.6, frozen scope - see the
+ * file header): directly deletes a member's `tripMemberOwnership` row
+ * out-of-band - no public client path can ever delete this row (every
+ * real callable only ever creates or updates it). Used solely to
+ * construct the "existing financial history, but the row vanished"
+ * drift precondition the frozen preflight's existing-row hardening
+ * gates must detect, and to construct a legitimate zero-row-retention
+ * fixture for the reconciliation admin tool's own tests.
+ * @param {string} tripId The Trip id.
+ * @param {string} uid The member uid whose row is deleted.
+ * @return {Promise<void>}
+ */
+export async function deleteOwnershipRow(
+  tripId: string,
+  uid: string
+): Promise<void> {
+  const env = await getTrustedInspectionEnv();
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    await ctx
+      .firestore()
+      .collection("tripMemberOwnership")
+      .doc(`${tripId}_${uid}`)
+      .delete();
+  });
+}
+
+/**
+ * TRUSTED PRECONDITION SETUP (Milestone 5C.6, frozen scope - see the
+ * file header): directly creates a `tripMemberOwnership` row for a uid
+ * with no supporting financial history whatsoever - no public client
+ * path can ever create a row this way (every real callable only ever
+ * materializes a row in direct response to that same uid's own
+ * contribution). Used solely to construct the "rogue row" precondition
+ * the reconciliation admin tool's own rogue-row-deletion behavior must
+ * detect and repair.
+ * @param {string} tripId The Trip id.
+ * @param {string} uid The uid to give a rogue row.
+ * @param {number} ownershipMinor The rogue row's own (unsupported)
+ *   balance.
+ * @return {Promise<void>}
+ */
+export async function createRogueOwnershipRow(
+  tripId: string,
+  uid: string,
+  ownershipMinor: number
+): Promise<void> {
+  const env = await getTrustedInspectionEnv();
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    await ctx
+      .firestore()
+      .collection("tripMemberOwnership")
+      .doc(`${tripId}_${uid}`)
+      .set({
+        tripId,
+        uid,
+        ownershipMinor,
+        lastUpdatedAt: firebaseCompat.firestore.FieldValue.serverTimestamp(),
+      });
+  });
+}
+
+/**
+ * TRUSTED PRECONDITION SETUP (Milestone 5C.6, frozen scope - see the
+ * file header): directly corrupts a persisted `tripOwnershipAllocations`
+ * record's `amountMinor` - no public client path can ever mutate this
+ * immutable collection. Used solely to construct the "authoritative
+ * historical evidence is corrupted" precondition the reconciliation
+ * admin tool's own allocation-validation step must reject with
+ * `requires_manual_review`, never an automatic repair.
+ * @param {string} allocationId The allocation record's own id.
+ * @param {number} amountMinor The corrupted (deliberately inconsistent)
+ *   amount to write.
+ * @return {Promise<void>}
+ */
+export async function corruptOwnershipAllocationAmount(
+  allocationId: string,
+  amountMinor: number
+): Promise<void> {
+  const env = await getTrustedInspectionEnv();
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    await ctx
+      .firestore()
+      .collection("tripOwnershipAllocations")
+      .doc(allocationId)
+      .update({amountMinor});
+  });
+}
