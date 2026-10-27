@@ -101,6 +101,7 @@ import { RecordSettlementDialog } from "../../../../components/balances/RecordSe
 import { SettlementRow, type SettlementRowFromMember } from "../../../../components/balances/SettlementRow";
 import { ReverseSettlementDialog } from "../../../../components/balances/ReverseSettlementDialog";
 import { TripMembersSection } from "../../../../components/trips/TripMembersSection";
+import { TripTermsSection } from "../../../../components/trips/TripTermsSection";
 
 const FALLBACK_IMAGE =
   "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=60";
@@ -2231,6 +2232,12 @@ export default function TripDetails() {
                 remove/leave action yet (see components/trips/
                 TripMembersSection.tsx for the full scope boundary). */}
             <TripMembersSection ownerId={trip.ownerId} memberIds={trip.memberIds} />
+
+            {/* Checkpoint 6.3: compact summary card only - the full
+                five-field view/edit/review flow lives on its own
+                dedicated route (see components/trips/TripTermsSection.tsx
+                and app/(tabs)/trips/[tripId]/terms.tsx). */}
+            <TripTermsSection tripId={tripId} isOwner={isOwner} />
 
             {/* Checkpoint 3F.3B.3: compact owner-only date-edit form -
                 a real Cancel/Save flow, not a fake local-only control.
