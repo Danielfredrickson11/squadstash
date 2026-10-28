@@ -21,6 +21,7 @@ import {
   TripTermsEditor,
 } from "../../../../components/trips/TripTermsEditor";
 import { useAuth } from "../../../../src/contexts/AuthContext";
+import { isTripOwner } from "../../../../src/domain/tripPermissions";
 import { fetchTripById } from "../../../../src/services/firebase/trips";
 import { fetchCurrentTripTerms } from "../../../../src/services/firebase/tripTerms";
 import { radii, spacing, typography } from "../../../../src/theme/tokens";
@@ -79,7 +80,7 @@ export default function TripTermsScreen() {
     number | null
   >(null);
 
-  const isOwner = !!user?.uid && !!trip?.ownerId && user.uid === trip.ownerId;
+  const isOwner = isTripOwner(trip?.ownerId, user?.uid);
 
   const loadAll = useCallback(async () => {
     if (!tripId) {
@@ -114,7 +115,7 @@ export default function TripTermsScreen() {
       // Trip itself proves the caller is the current owner - never
       // trusted from the param alone (§ "client visibility is not
       // security authority").
-      const ownerMatch = !!user?.uid && fetchedTrip.ownerId === user.uid;
+      const ownerMatch = isTripOwner(fetchedTrip.ownerId, user?.uid);
       if (modeHint === "edit" && ownerMatch) {
         setViewMode("edit");
       }

@@ -51,6 +51,7 @@ import {
   type TripSavingsGuidance,
 } from "../../../../src/domain/tripSavingsGuidance";
 import { isMatchingTripPersonalBucket, tripPersonalBucketId } from "../../../../src/domain/tripPersonalFund";
+import { isTripOwner } from "../../../../src/domain/tripPermissions";
 import {
   normalizeTransactionNote,
   resolveAmountMinor,
@@ -333,7 +334,7 @@ export default function TripDetails() {
     fetchTrip();
   }, [fetchTrip]);
 
-  const isOwner = !!user?.uid && !!trip?.ownerId && user.uid === trip.ownerId;
+  const isOwner = isTripOwner(trip?.ownerId, user?.uid);
   // Checkpoint 4B.5B: archivedAt's own presence IS the archive status -
   // no separate status field exists (see src/types/domain/trip.ts). A
   // legacy Trip with no archivedAt key maps to undefined here, which is
