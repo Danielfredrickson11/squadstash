@@ -2231,7 +2231,13 @@ export default function TripDetails() {
                 invitation UI, no pending-invitation visibility, no
                 remove/leave action yet (see components/trips/
                 TripMembersSection.tsx for the full scope boundary). */}
-            <TripMembersSection ownerId={trip.ownerId} memberIds={trip.memberIds} />
+            <TripMembersSection
+              tripId={tripId}
+              ownerId={trip.ownerId}
+              memberIds={trip.memberIds}
+              isOwner={isOwner}
+              isArchived={isArchived}
+            />
 
             {/* Checkpoint 6.3: compact summary card only - the full
                 five-field view/edit/review flow lives on its own

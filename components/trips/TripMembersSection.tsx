@@ -1,9 +1,10 @@
-// Trip Members card (Checkpoint 6.1) - current-membership DISPLAY only.
-// No invitation UI, no pending-invitation visibility, no remove/leave
+// Trip Members card (Checkpoint 6.1, extended by 6.2) - current-
+// membership display, plus (6.2) an owner-only Invite Member entry
+// point. Still no pending-invitation visibility, no remove/leave
 // action, no membership or financial write of any kind - those remain
-// explicitly deferred to a later checkpoint (6.2+). Matches the existing
-// Trip Detail card conventions exactly (same card/border/shadow/
-// icon-bubble/title-subtitle treatment as the Balances card in
+// explicitly deferred to later checkpoints (6.4/6.5). Matches the
+// existing Trip Detail card conventions exactly (same card/border/
+// shadow/icon-bubble/title-subtitle treatment as the Balances card in
 // app/(tabs)/trips/[tripId]/index.tsx) rather than introducing a new
 // visual language.
 //
@@ -14,12 +15,22 @@
 // this presentational list. Never reads the private `users/{uid}`
 // collection, never reads tripMembershipAcceptances, never queries any
 // financial/ownership collection merely to render membership.
+//
+// Checkpoint 6.2: this component owns only the Invite Member button's
+// visibility and the dialog's open/closed state plus the post-send
+// success confirmation copy - InviteTripMemberDialog.tsx owns every
+// other piece (email field, Terms-prerequisite gate, submit lifecycle,
+// error mapping, the actual createTripInvitation call). Sending an
+// invitation never changes `members` above - membership (and this
+// card's own member count) changes only after the invitee independently
+// accepts through the existing, separate acceptance flow.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { StyleSheet, View } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 import { Text, useTheme } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 
 import { AvatarCircle, initialsFromName } from "../buckets/AvatarCircle";
+import { InviteTripMemberDialog } from "./InviteTripMemberDialog";
 import { cardShadowFor, radii, spacing, typography } from "../../src/theme/tokens";
 import { useSemanticColors } from "../../src/theme/useSemanticColors";
 import { deriveCurrentMemberUids } from "../../src/domain/expenseSubmission";
@@ -35,14 +46,37 @@ type ProfileState =
 const EMPTY_PROFILES: Map<string, PublicProfile> = new Map();
 
 export function TripMembersSection({
+  tripId,
   ownerId,
   memberIds,
+  isOwner,
+  isArchived,
 }: {
+  tripId: string;
   ownerId: string | null | undefined;
   memberIds: (string | null | undefined)[] | null | undefined;
+  isOwner: boolean;
+  isArchived: boolean;
 }) {
   const theme = useTheme();
   const colors = useSemanticColors();
+
+  const [inviteDialogOpen, setInviteDialogOpen] = useState(false);
+  const [invitedEmailNotice, setInvitedEmailNotice] = useState<string | null>(null);
+
+  const onInvitePress = useCallback(() => {
+    setInvitedEmailNotice(null);
+    setInviteDialogOpen(true);
+  }, []);
+
+  const onCloseInviteDialog = useCallback(() => {
+    setInviteDialogOpen(false);
+  }, []);
+
+  const onInvitationSent = useCallback((normalizedEmail: string) => {
+    setInviteDialogOpen(false);
+    setInvitedEmailNotice(normalizedEmail);
+  }, []);
 
   const currentMemberUids = useMemo(
     () => deriveCurrentMemberUids(ownerId, memberIds),
@@ -146,6 +180,38 @@ export function TripMembersSection({
           Some member names couldn’t load. Tap to retry.
         </Text>
       ) : null}
+
+      {invitedEmailNotice ? (
+        <Text style={[styles.inviteNotice, { color: colors.textSecondary }]}>
+          Invitation sent to {invitedEmailNotice}
+        </Text>
+      ) : null}
+
+      {/* Checkpoint 6.2 §6/§16: owner-only, and never rendered at all on
+          an archived Trip - client hiding is convenience only, the
+          trusted createTripInvitation callable remains the real,
+          backend-enforced owner/archived gate regardless. */}
+      {isOwner && !isArchived ? (
+        <Pressable
+          onPress={onInvitePress}
+          accessibilityRole="button"
+          accessibilityLabel="Invite Member"
+          style={({ pressed }) => [
+            styles.inviteBtn,
+            { borderColor: colors.border },
+            pressed && { opacity: 0.9 },
+          ]}
+        >
+          <Text style={[styles.inviteBtnText, { color: colors.textPrimary }]}>Invite Member</Text>
+        </Pressable>
+      ) : null}
+
+      <InviteTripMemberDialog
+        visible={inviteDialogOpen}
+        tripId={tripId}
+        onClose={onCloseInviteDialog}
+        onSent={onInvitationSent}
+      />
     </View>
   );
 }
@@ -178,4 +244,14 @@ const styles = StyleSheet.create({
   },
   ownerBadgeText: { fontSize: 11, fontWeight: "800" },
   errorNote: { fontSize: 12, fontWeight: "600", marginTop: spacing.sm },
+  inviteNotice: { fontSize: 12, fontWeight: "600", marginTop: spacing.sm },
+  inviteBtn: {
+    alignSelf: "flex-start",
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    marginTop: spacing.sm,
+  },
+  inviteBtnText: { fontSize: 13, fontWeight: "700" },
 });
