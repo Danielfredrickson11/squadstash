@@ -11,8 +11,10 @@
 // default preset does not transform.
 import {
   doc as mockDoc,
+  getDocs as mockGetDocs,
   serverTimestamp as mockServerTimestamp,
   updateDoc as mockUpdateDoc,
+  where as mockWhere,
 } from "firebase/firestore";
 import { httpsCallable as mockHttpsCallable } from "firebase/functions";
 import {
@@ -20,6 +22,7 @@ import {
   cancelTripInvitation,
   createTripInvitation,
   declineTripInvitation,
+  fetchInvitationsForTrip,
   getTripInvitationPreview,
 } from "../tripInvitations";
 
@@ -47,6 +50,8 @@ const mockDocFn = mockDoc as unknown as jest.Mock;
 const mockUpdateDocFn = mockUpdateDoc as unknown as jest.Mock;
 const mockServerTimestampFn = mockServerTimestamp as unknown as jest.Mock;
 const mockHttpsCallableFn = mockHttpsCallable as unknown as jest.Mock;
+const mockGetDocsFn = mockGetDocs as unknown as jest.Mock;
+const mockWhereFn = mockWhere as unknown as jest.Mock;
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -367,6 +372,94 @@ describe("cancelTripInvitation (unchanged direct write)", () => {
       expect.anything(),
       expect.objectContaining({ status: "cancelled" })
     );
+  });
+});
+
+// Checkpoint 6.4: closes the pre-existing test gap for this
+// owner-facing query - fetchInvitationsForTrip itself was added back in
+// 5C.3C but never had its own dedicated test until now.
+describe("fetchInvitationsForTrip", () => {
+  function fakeDoc(id: string, data: Record<string, unknown>) {
+    return { id, data: () => data };
+  }
+
+  it("queries tripInvitations filtered by tripId", async () => {
+    mockGetDocsFn.mockResolvedValue({ docs: [] });
+    await fetchInvitationsForTrip("trip-1");
+    expect(mockWhereFn).toHaveBeenCalledWith("tripId", "==", "trip-1");
+  });
+
+  it("returns the parsed invitations from the snapshot", async () => {
+    mockGetDocsFn.mockResolvedValue({
+      docs: [
+        fakeDoc("trip-1_invitee-a", {
+          tripId: "trip-1",
+          inviterUid: "owner-1",
+          inviteeEmail: "a@example.com",
+          inviteeUid: "invitee-a",
+          status: "pending",
+          createdAt: "createdAt-a",
+          expiresAt: "expiresAt-a",
+          respondedAt: null,
+        }),
+      ],
+    });
+    const result = await fetchInvitationsForTrip("trip-1");
+    expect(result).toEqual([
+      {
+        id: "trip-1_invitee-a",
+        tripId: "trip-1",
+        inviterUid: "owner-1",
+        inviteeEmail: "a@example.com",
+        inviteeUid: "invitee-a",
+        status: "pending",
+        createdAt: "createdAt-a",
+        expiresAt: "expiresAt-a",
+        respondedAt: null,
+      },
+    ]);
+  });
+
+  it("returns multiple invitations, preserving the snapshot's own order", async () => {
+    mockGetDocsFn.mockResolvedValue({
+      docs: [
+        fakeDoc("trip-1_invitee-a", {
+          tripId: "trip-1",
+          inviterUid: "owner-1",
+          inviteeEmail: "a@example.com",
+          inviteeUid: "invitee-a",
+          status: "pending",
+          createdAt: "createdAt-a",
+          expiresAt: "expiresAt-a",
+          respondedAt: null,
+        }),
+        fakeDoc("trip-1_invitee-b", {
+          tripId: "trip-1",
+          inviterUid: "owner-1",
+          inviteeEmail: "b@example.com",
+          inviteeUid: "invitee-b",
+          status: "declined",
+          createdAt: "createdAt-b",
+          expiresAt: "expiresAt-b",
+          respondedAt: "respondedAt-b",
+        }),
+      ],
+    });
+    const result = await fetchInvitationsForTrip("trip-1");
+    expect(result).toHaveLength(2);
+    expect(result.map((r) => r.id)).toEqual(["trip-1_invitee-a", "trip-1_invitee-b"]);
+    expect(result[1].status).toBe("declined");
+  });
+
+  it("returns an empty array when the Trip has no invitations", async () => {
+    mockGetDocsFn.mockResolvedValue({ docs: [] });
+    const result = await fetchInvitationsForTrip("trip-1");
+    expect(result).toEqual([]);
+  });
+
+  it("propagates a read/query error rather than swallowing it", async () => {
+    mockGetDocsFn.mockRejectedValue(new Error("permission-denied"));
+    await expect(fetchInvitationsForTrip("trip-1")).rejects.toThrow("permission-denied");
   });
 });
 

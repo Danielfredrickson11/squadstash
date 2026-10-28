@@ -1,6 +1,7 @@
 import {
   canCancelTripInvitation,
   canRespondToTripInvitation,
+  effectiveTripInvitationStatus,
   isPendingTripInvitation,
   isTripInvitationExpired,
   isTripInvitationTermsChangedError,
@@ -180,5 +181,70 @@ describe("isTripInvitationTermsChangedError", () => {
     const snapshot = JSON.parse(JSON.stringify(original));
     isTripInvitationTermsChangedError(original);
     expect(original).toEqual(snapshot);
+  });
+});
+
+describe("effectiveTripInvitationStatus", () => {
+  it("is pending before expiry", () => {
+    expect(
+      effectiveTripInvitationStatus(baseInvitation(), new Date("2027-01-10T00:00:00Z"))
+    ).toBe("pending");
+  });
+
+  it("is expired exactly at the expiry boundary", () => {
+    expect(
+      effectiveTripInvitationStatus(baseInvitation(), new Date("2027-01-15T00:00:00Z"))
+    ).toBe("expired");
+  });
+
+  it("is expired after the expiry boundary", () => {
+    expect(
+      effectiveTripInvitationStatus(baseInvitation(), new Date("2027-01-20T00:00:00Z"))
+    ).toBe("expired");
+  });
+
+  it("accepted overrides expiry, even long past expiresAt", () => {
+    expect(
+      effectiveTripInvitationStatus(
+        baseInvitation({ status: "accepted" }),
+        new Date("2027-06-01T00:00:00Z")
+      )
+    ).toBe("accepted");
+  });
+
+  it("declined overrides expiry, even long past expiresAt", () => {
+    expect(
+      effectiveTripInvitationStatus(
+        baseInvitation({ status: "declined" }),
+        new Date("2027-06-01T00:00:00Z")
+      )
+    ).toBe("declined");
+  });
+
+  it("cancelled overrides expiry, even long past expiresAt", () => {
+    expect(
+      effectiveTripInvitationStatus(
+        baseInvitation({ status: "cancelled" }),
+        new Date("2027-06-01T00:00:00Z")
+      )
+    ).toBe("cancelled");
+  });
+
+  it("accepted is not affected by a `now` before expiresAt either", () => {
+    expect(
+      effectiveTripInvitationStatus(
+        baseInvitation({ status: "accepted" }),
+        new Date("2027-01-02T00:00:00Z")
+      )
+    ).toBe("accepted");
+  });
+
+  it("uses only the explicitly injected `now` - never the real clock", () => {
+    // A `now` far in the past relative to createdAt/expiresAt still
+    // deterministically produces "pending" - proving this function
+    // never reads Date.now()/new Date() internally.
+    expect(
+      effectiveTripInvitationStatus(baseInvitation(), new Date("2020-01-01T00:00:00Z"))
+    ).toBe("pending");
   });
 });

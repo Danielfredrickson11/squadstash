@@ -77,3 +77,39 @@ export function canCancelTripInvitation(
 ): boolean {
   return tripOwnerId === requestingUid && isPendingTripInvitation(invitation);
 }
+
+// Checkpoint 6.4: the five-way status an owner-facing invitation-history
+// UI actually needs to render. "expired" is deliberately NOT one of the
+// four persisted TripInvitationStatus values (see that type's own
+// comment) - it is derived here, the same way isTripInvitationExpired
+// has always derived it, never a second persisted concept that could
+// desync from expiresAt.
+export type TripInvitationEffectiveStatus =
+  | "pending"
+  | "accepted"
+  | "declined"
+  | "cancelled"
+  | "expired";
+
+/**
+ * The effective status an owner-facing invitation-history UI should
+ * display. A persisted non-"pending" status (accepted/declined/
+ * cancelled) is terminal and always overrides time - expiry is only
+ * ever relevant while an invitation is still genuinely pending. Reuses
+ * isTripInvitationExpired verbatim rather than re-deriving the same
+ * expiresAt comparison a second time.
+ * @param {TripInvitation} invitation The invitation to classify.
+ * @param {Date} now The current time, always explicitly injected -
+ *   never read from Date.now()/new Date() inside this pure function, so
+ *   callers (and their tests) fully control it.
+ * @return {TripInvitationEffectiveStatus} The effective status.
+ */
+export function effectiveTripInvitationStatus(
+  invitation: TripInvitation,
+  now: Date
+): TripInvitationEffectiveStatus {
+  if (invitation.status !== "pending") {
+    return invitation.status;
+  }
+  return isTripInvitationExpired(invitation, now) ? "expired" : "pending";
+}
