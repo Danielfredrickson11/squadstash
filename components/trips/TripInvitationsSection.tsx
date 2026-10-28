@@ -21,20 +21,33 @@
 // - Empty state (owner, zero invitations ever sent): renders nothing -
 //   TripMembersSection's own Invite Member button is already the entry
 //   point; an empty card here would be pure visual noise.
-// - Read-only: no Cancel/Invite-Again/Accept/Decline action of any
-//   kind - every row is pure display. Cancellation (6.5) will reuse the
-//   already-existing cancelTripInvitation service function, but this
-//   component never calls it.
+// - Read-only except for Cancel (6.5): no Invite-Again/Accept/Decline
+//   action of any kind - a terminal row (accepted/declined/expired/
+//   cancelled) remains pure display. Only an effective-pending row ever
+//   shows a Cancel trigger, gated by canCancelTripInvitation (which
+//   itself reuses effectiveTripInvitationStatus - never a second,
+//   independent expiry check).
+//
+// Checkpoint 6.5: this component owns WHICH invitation is selected for
+// cancellation and the confirmation dialog's open/closed state only -
+// CancelTripInvitationDialog owns the actual cancelTripInvitation call,
+// its own in-flight/error state. On success or on a detected race
+// (permission-denied), this component re-fetches via its own existing
+// load() - it never synthesizes a fake local "cancelled" row; the
+// server-refetched list remains the sole source of truth.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 import { Text, useTheme } from "react-native-paper";
 import { useFocusEffect } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 
+import { CancelTripInvitationDialog } from "./CancelTripInvitationDialog";
 import { cardShadowFor, radii, spacing, typography } from "../../src/theme/tokens";
 import { useSemanticColors } from "../../src/theme/useSemanticColors";
+import { useAuth } from "../../src/contexts/AuthContext";
 import { fetchInvitationsForTrip } from "../../src/services/firebase/tripInvitations";
 import {
+  canCancelTripInvitation,
   effectiveTripInvitationStatus,
   type TripInvitationEffectiveStatus,
 } from "../../src/domain/tripInvitation";
@@ -106,15 +119,20 @@ function buildSortedRows(invitations: TripInvitation[], now: Date): Row[] {
 
 export function TripInvitationsSection({
   tripId,
+  ownerId,
   isOwner,
 }: {
   tripId: string;
+  ownerId: string | null | undefined;
   isOwner: boolean;
 }) {
   const theme = useTheme();
   const colors = useSemanticColors();
+  const { user } = useAuth();
 
   const [state, setState] = useState<LoadState>({ status: "loading" });
+  const [selectedForCancel, setSelectedForCancel] = useState<TripInvitation | null>(null);
+  const [stateChangedNotice, setStateChangedNotice] = useState<string | null>(null);
 
   // Request-generation guard (same pattern established during the 6.2
   // InviteTripMemberDialog review fix): every load() call bumps this
@@ -164,6 +182,29 @@ export function TripInvitationsSection({
     load();
   }, [load]);
 
+  const onCancelPress = useCallback((invitation: TripInvitation) => {
+    setStateChangedNotice(null);
+    setSelectedForCancel(invitation);
+  }, []);
+
+  const onCloseCancelDialog = useCallback(() => {
+    setSelectedForCancel(null);
+  }, []);
+
+  const onCancelled = useCallback(() => {
+    setSelectedForCancel(null);
+    load();
+  }, [load]);
+
+  const onCancelStateChanged = useCallback(
+    (message: string) => {
+      setSelectedForCancel(null);
+      setStateChangedNotice(message);
+      load();
+    },
+    [load]
+  );
+
   if (!isOwner) {
     return null;
   }
@@ -171,7 +212,9 @@ export function TripInvitationsSection({
     return null;
   }
 
-  const rows = state.status === "ready" ? buildSortedRows(state.invitations, new Date()) : [];
+  const now = new Date();
+  const rows = state.status === "ready" ? buildSortedRows(state.invitations, now) : [];
+  const requestingUid = user?.uid ?? "";
 
   return (
     <View
@@ -187,6 +230,12 @@ export function TripInvitationsSection({
         </View>
         <Text style={[styles.cardTitle, { color: colors.textPrimary }]}>Invitations</Text>
       </View>
+
+      {stateChangedNotice ? (
+        <Text style={[styles.stateChangedNotice, { color: colors.textMuted }]}>
+          {stateChangedNotice}
+        </Text>
+      ) : null}
 
       {state.status === "loading" ? (
         <Text style={[styles.bodyText, { color: colors.textMuted }]}>
@@ -206,6 +255,12 @@ export function TripInvitationsSection({
         <View style={styles.list}>
           {rows.map(({ invitation, effectiveStatus }) => {
             const isPendingRow = effectiveStatus === "pending";
+            const cancellable = canCancelTripInvitation(
+              invitation,
+              ownerId ?? "",
+              requestingUid,
+              now
+            );
             return (
               <View key={invitation.id} style={styles.row}>
                 <Text
@@ -225,11 +280,32 @@ export function TripInvitationsSection({
                 >
                   {statusLabel(invitation, effectiveStatus)}
                 </Text>
+                {cancellable ? (
+                  <Pressable
+                    onPress={() => onCancelPress(invitation)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Cancel invitation to ${invitation.inviteeEmail}`}
+                    style={styles.cancelTrigger}
+                  >
+                    <Text style={[styles.cancelTriggerText, { color: colors.coral }]}>
+                      Cancel Invitation
+                    </Text>
+                  </Pressable>
+                ) : null}
               </View>
             );
           })}
         </View>
       )}
+
+      <CancelTripInvitationDialog
+        visible={selectedForCancel !== null}
+        tripId={tripId}
+        invitation={selectedForCancel}
+        onClose={onCloseCancelDialog}
+        onCancelled={onCancelled}
+        onStateChanged={onCancelStateChanged}
+      />
     </View>
   );
 }
@@ -256,4 +332,7 @@ const styles = StyleSheet.create({
   row: { gap: 2 },
   email: { fontSize: 14, fontWeight: "600" },
   statusText: { fontSize: 12, fontWeight: "600" },
+  stateChangedNotice: { fontSize: 12, fontWeight: "600", marginBottom: spacing.xs },
+  cancelTrigger: { alignSelf: "flex-start", marginTop: 2 },
+  cancelTriggerText: { fontSize: 12, fontWeight: "700" },
 });

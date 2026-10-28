@@ -9,7 +9,10 @@ import React from "react";
 import { act, create } from "react-test-renderer";
 
 import { TripInvitationsSection } from "../TripInvitationsSection";
-import { fetchInvitationsForTrip } from "../../../src/services/firebase/tripInvitations";
+import {
+  cancelTripInvitation,
+  fetchInvitationsForTrip,
+} from "../../../src/services/firebase/tripInvitations";
 import type { TripInvitation } from "../../../src/types/domain";
 
 let mockFocusEffectCallback: (() => void) | undefined;
@@ -27,11 +30,22 @@ jest.mock("expo-router", () => {
 
 jest.mock("../../../src/services/firebase/tripInvitations", () => ({
   fetchInvitationsForTrip: jest.fn(),
+  cancelTripInvitation: jest.fn(),
+}));
+
+// Checkpoint 6.5: TripInvitationsSection now needs the signed-in uid
+// (to compute canCancelTripInvitation's owner comparison) - "owner-1"
+// matches this file's own default `ownerId` prop, so the default render
+// is always the owner viewing their own outgoing invitations.
+const mockAuthUser: { uid: string } | null = { uid: "owner-1" };
+jest.mock("../../../src/contexts/AuthContext", () => ({
+  useAuth: () => ({ user: mockAuthUser }),
 }));
 
 const mockedFetch = fetchInvitationsForTrip as jest.MockedFunction<
   typeof fetchInvitationsForTrip
 >;
+const mockedCancel = cancelTripInvitation as jest.MockedFunction<typeof cancelTripInvitation>;
 
 type JsonNode = {
   props: Record<string, unknown>;
@@ -78,6 +92,7 @@ function makeInvitation(overrides: Partial<TripInvitation> = {}): TripInvitation
 function renderSection(props: Partial<React.ComponentProps<typeof TripInvitationsSection>> = {}) {
   const defaults: React.ComponentProps<typeof TripInvitationsSection> = {
     tripId: "trip-1",
+    ownerId: "owner-1",
     isOwner: true,
   };
   let tree!: ReturnType<typeof create>;
@@ -89,6 +104,7 @@ function renderSection(props: Partial<React.ComponentProps<typeof TripInvitation
 
 beforeEach(() => {
   mockedFetch.mockReset();
+  mockedCancel.mockReset();
   mockFocusEffectCallback = undefined;
 });
 
@@ -120,7 +136,7 @@ describe("TripInvitationsSection - loading/empty/error states", () => {
     mockedFetch.mockResolvedValue([]);
     let tree!: ReturnType<typeof create>;
     await act(async () => {
-      tree = create(<TripInvitationsSection tripId="trip-1" isOwner={true} />);
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
     });
     expect(tree.toJSON()).toBeNull();
   });
@@ -129,7 +145,7 @@ describe("TripInvitationsSection - loading/empty/error states", () => {
     mockedFetch.mockRejectedValue(new Error("permission-denied: internal detail"));
     let tree!: ReturnType<typeof create>;
     await act(async () => {
-      tree = create(<TripInvitationsSection tripId="trip-1" isOwner={true} />);
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
     });
     const text = collectText(tree.toJSON() as JsonNode);
     expect(text).not.toContain("permission-denied: internal detail");
@@ -140,7 +156,7 @@ describe("TripInvitationsSection - loading/empty/error states", () => {
     mockedFetch.mockRejectedValueOnce(new Error("blip"));
     let tree!: ReturnType<typeof create>;
     await act(async () => {
-      tree = create(<TripInvitationsSection tripId="trip-1" isOwner={true} />);
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
     });
 
     mockedFetch.mockResolvedValueOnce([makeInvitation()]);
@@ -161,7 +177,7 @@ describe("TripInvitationsSection - per-status presentation", () => {
     mockedFetch.mockResolvedValue([invitation]);
     let tree!: ReturnType<typeof create>;
     await act(async () => {
-      tree = create(<TripInvitationsSection tripId="trip-1" isOwner={true} />);
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
     });
     return tree;
   }
@@ -272,7 +288,7 @@ describe("TripInvitationsSection - sort order", () => {
     ]);
     let tree!: ReturnType<typeof create>;
     await act(async () => {
-      tree = create(<TripInvitationsSection tripId="trip-1" isOwner={true} />);
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
     });
     const text = collectText(tree.toJSON() as JsonNode);
     expect(text.indexOf("pending@example.com")).toBeLessThan(text.indexOf("declined@example.com"));
@@ -295,7 +311,7 @@ describe("TripInvitationsSection - sort order", () => {
     ]);
     let tree!: ReturnType<typeof create>;
     await act(async () => {
-      tree = create(<TripInvitationsSection tripId="trip-1" isOwner={true} />);
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
     });
     const text = collectText(tree.toJSON() as JsonNode);
     expect(text.indexOf("newer@example.com")).toBeLessThan(text.indexOf("older@example.com"));
@@ -307,7 +323,7 @@ describe("TripInvitationsSection - focus refresh and async safety (review-fix pa
     mockedFetch.mockResolvedValueOnce([makeInvitation({ status: "pending" })]);
     let tree!: ReturnType<typeof create>;
     await act(async () => {
-      tree = create(<TripInvitationsSection tripId="trip-1" isOwner={true} />);
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
     });
     expect(collectText(tree.toJSON() as JsonNode)).toContain("Pending");
 
@@ -330,7 +346,7 @@ describe("TripInvitationsSection - focus refresh and async safety (review-fix pa
     );
     let tree!: ReturnType<typeof create>;
     await act(async () => {
-      tree = create(<TripInvitationsSection tripId="trip-1" isOwner={true} />);
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
     });
 
     mockedFetch.mockResolvedValueOnce([
@@ -360,7 +376,7 @@ describe("TripInvitationsSection - focus refresh and async safety (review-fix pa
 
     let tree!: ReturnType<typeof create>;
     await act(async () => {
-      tree = create(<TripInvitationsSection tripId="trip-1" isOwner={true} />);
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
     });
 
     act(() => {
@@ -374,5 +390,176 @@ describe("TripInvitationsSection - focus refresh and async safety (review-fix pa
 
     expect(consoleErrorSpy).not.toHaveBeenCalled();
     consoleErrorSpy.mockRestore();
+  });
+});
+
+describe("TripInvitationsSection - Cancel action (Checkpoint 6.5)", () => {
+  async function renderWithInvitation(invitation: TripInvitation) {
+    mockedFetch.mockResolvedValue([invitation]);
+    let tree!: ReturnType<typeof create>;
+    await act(async () => {
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
+    });
+    return tree;
+  }
+
+  it("an active pending row shows a Cancel trigger", async () => {
+    const tree = await renderWithInvitation(makeInvitation({ status: "pending" }));
+    expect(() => findByLabel(tree, "Cancel invitation to invitee@example.com")).not.toThrow();
+  });
+
+  it("an accepted row shows no Cancel trigger", async () => {
+    const tree = await renderWithInvitation(
+      makeInvitation({
+        status: "accepted",
+        respondedAt: fakeTimestamp(new Date("2026-10-30T12:00:00Z")),
+      })
+    );
+    expect(() => findByLabel(tree, "Cancel invitation to invitee@example.com")).toThrow();
+  });
+
+  it("a declined row shows no Cancel trigger", async () => {
+    const tree = await renderWithInvitation(
+      makeInvitation({
+        status: "declined",
+        respondedAt: fakeTimestamp(new Date("2026-10-30T12:00:00Z")),
+      })
+    );
+    expect(() => findByLabel(tree, "Cancel invitation to invitee@example.com")).toThrow();
+  });
+
+  // The exact-instant expiry boundary (<=) is already exhaustively
+  // unit-tested at the domain layer (canCancelTripInvitation/
+  // effectiveTripInvitationStatus in src/domain/__tests__/
+  // tripInvitation.test.ts, with an injected `now`). This component
+  // computes `now` internally at render time (matching TripTermsSection/
+  // TripMembersSection's own convention of never accepting an injectable
+  // clock prop), so this test proves the practically-reachable case - a
+  // persisted-pending invitation already past its real expiresAt - never
+  // shows a Cancel trigger, which is the same boundary semantics applied
+  // a moment after the instant itself.
+  it("a persisted-pending invitation that is effectively expired shows no Cancel trigger", async () => {
+    const tree = await renderWithInvitation(
+      makeInvitation({
+        status: "pending",
+        expiresAt: fakeTimestamp(new Date("2020-01-01T12:00:00Z")),
+      })
+    );
+    expect(() => findByLabel(tree, "Cancel invitation to invitee@example.com")).toThrow();
+  });
+
+  it("a cancelled row shows no Cancel trigger", async () => {
+    const tree = await renderWithInvitation(
+      makeInvitation({
+        status: "cancelled",
+        respondedAt: fakeTimestamp(new Date("2026-10-30T12:00:00Z")),
+      })
+    );
+    expect(() => findByLabel(tree, "Cancel invitation to invitee@example.com")).toThrow();
+  });
+
+  it("a non-owner still renders nothing and issues no query, even with a pending invitation present", async () => {
+    mockedFetch.mockResolvedValue([makeInvitation({ status: "pending" })]);
+    let tree!: ReturnType<typeof create>;
+    await act(async () => {
+      tree = create(
+        <TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={false} />
+      );
+    });
+    expect(tree.toJSON()).toBeNull();
+    expect(mockedFetch).not.toHaveBeenCalled();
+  });
+
+  it("pressing a row's Cancel trigger opens the confirmation dialog naming that invitation", async () => {
+    const tree = await renderWithInvitation(
+      makeInvitation({ status: "pending", inviteeEmail: "x@example.com" })
+    );
+    act(() => {
+      (
+        findByLabel(tree, "Cancel invitation to x@example.com").props.onPress as () => void
+      )();
+    });
+    const text = collectText(tree.toJSON() as JsonNode);
+    expect(text).toContain("Cancel the invitation to x@example.com?");
+  });
+
+  it("dismissing the confirmation (Keep Invitation) performs no write and no refetch", async () => {
+    const tree = await renderWithInvitation(makeInvitation({ status: "pending" }));
+    expect(mockedFetch).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      (
+        findByLabel(tree, "Cancel invitation to invitee@example.com").props
+          .onPress as () => void
+      )();
+    });
+    act(() => {
+      (findByLabel(tree, "Keep Invitation").props.onPress as () => void)();
+    });
+
+    expect(mockedFetch).toHaveBeenCalledTimes(1);
+    expect(mockedCancel).not.toHaveBeenCalled();
+  });
+
+  it("a successful cancellation triggers a refetch, and the row becomes Cancelled from the server response", async () => {
+    mockedFetch.mockResolvedValueOnce([makeInvitation({ status: "pending" })]);
+    let tree!: ReturnType<typeof create>;
+    await act(async () => {
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
+    });
+    mockedCancel.mockResolvedValue(undefined);
+
+    act(() => {
+      (
+        findByLabel(tree, "Cancel invitation to invitee@example.com").props
+          .onPress as () => void
+      )();
+    });
+
+    mockedFetch.mockResolvedValueOnce([
+      makeInvitation({
+        status: "cancelled",
+        respondedAt: fakeTimestamp(new Date("2026-10-30T12:00:00Z")),
+      }),
+    ]);
+    await act(async () => {
+      await (findByLabel(tree, "Cancel Invitation").props.onPress as () => Promise<void>)();
+    });
+
+    expect(mockedFetch).toHaveBeenCalledTimes(2);
+    const text = collectText(tree.toJSON() as JsonNode);
+    expect(text).toContain("Cancelled");
+    expect(text).toContain("Oct 30");
+  });
+
+  it("a permission-denied race triggers a refetch and shows the safe state-changed notice", async () => {
+    mockedFetch.mockResolvedValueOnce([makeInvitation({ status: "pending" })]);
+    let tree!: ReturnType<typeof create>;
+    await act(async () => {
+      tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
+    });
+    mockedCancel.mockRejectedValue({ code: "permission-denied" });
+
+    act(() => {
+      (
+        findByLabel(tree, "Cancel invitation to invitee@example.com").props
+          .onPress as () => void
+      )();
+    });
+
+    mockedFetch.mockResolvedValueOnce([
+      makeInvitation({
+        status: "accepted",
+        respondedAt: fakeTimestamp(new Date("2026-10-30T12:00:00Z")),
+      }),
+    ]);
+    await act(async () => {
+      await (findByLabel(tree, "Cancel Invitation").props.onPress as () => Promise<void>)();
+    });
+
+    expect(mockedFetch).toHaveBeenCalledTimes(2);
+    const text = collectText(tree.toJSON() as JsonNode);
+    expect(text).toContain("This invitation has already changed");
+    expect(text).toContain("Accepted");
   });
 });

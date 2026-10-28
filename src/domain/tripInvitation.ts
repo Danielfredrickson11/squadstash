@@ -69,13 +69,28 @@ export function isTripInvitationTermsChangedError(error: unknown): boolean {
   return (details as { reason?: unknown }).reason === "terms_changed";
 }
 
-/** Owner-only: a Trip owner may cancel their own still-pending invitation. */
+/**
+ * Owner-only: a Trip owner may cancel their own still-ACTIVELY-pending
+ * invitation. Checkpoint 6.5: reuses effectiveTripInvitationStatus
+ * (below) rather than the raw persisted status, so an invitation that is
+ * still persisted "pending" but already past its expiresAt is correctly
+ * treated as not cancellable - Firestore Rules still permit narrowing an
+ * expired pending invitation to "cancelled" (harmless, matching decline's
+ * own documented choice), but this UI-facing eligibility helper
+ * deliberately does not expose that action - see this checkpoint's own
+ * preflight §7/§14 for why that is a UX restriction, never a new
+ * security boundary.
+ */
 export function canCancelTripInvitation(
   invitation: TripInvitation,
   tripOwnerId: string,
-  requestingUid: string
+  requestingUid: string,
+  now: Date
 ): boolean {
-  return tripOwnerId === requestingUid && isPendingTripInvitation(invitation);
+  return (
+    tripOwnerId === requestingUid &&
+    effectiveTripInvitationStatus(invitation, now) === "pending"
+  );
 }
 
 // Checkpoint 6.4: the five-way status an owner-facing invitation-history

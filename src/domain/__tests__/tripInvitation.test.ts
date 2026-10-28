@@ -106,26 +106,85 @@ describe("canRespondToTripInvitation", () => {
 });
 
 describe("canCancelTripInvitation", () => {
-  it("allows the Trip owner to cancel a pending invitation", () => {
-    expect(canCancelTripInvitation(baseInvitation(), "owner-uid", "owner-uid")).toBe(
-      true
-    );
+  // baseInvitation()'s own createdAt/expiresAt: 2027-01-01 / 2027-01-15.
+  const activeNow = new Date("2027-01-10T00:00:00Z");
+
+  it("allows the Trip owner to cancel an active (unexpired) pending invitation", () => {
+    expect(
+      canCancelTripInvitation(baseInvitation(), "owner-uid", "owner-uid", activeNow)
+    ).toBe(true);
   });
 
-  it("denies a non-owner (including the invitee) from cancelling", () => {
-    expect(canCancelTripInvitation(baseInvitation(), "owner-uid", "invitee-uid")).toBe(
-      false
-    );
+  it("denies a non-owner (including the invitee) from cancelling an active pending invitation", () => {
+    expect(
+      canCancelTripInvitation(baseInvitation(), "owner-uid", "invitee-uid", activeNow)
+    ).toBe(false);
   });
 
-  it("denies cancelling an invitation that is no longer pending", () => {
+  it("denies cancelling an accepted invitation, even by the owner", () => {
+    expect(
+      canCancelTripInvitation(
+        baseInvitation({ status: "accepted" }),
+        "owner-uid",
+        "owner-uid",
+        activeNow
+      )
+    ).toBe(false);
+  });
+
+  it("denies cancelling a declined invitation, even by the owner", () => {
     expect(
       canCancelTripInvitation(
         baseInvitation({ status: "declined" }),
         "owner-uid",
-        "owner-uid"
+        "owner-uid",
+        activeNow
       )
     ).toBe(false);
+  });
+
+  it("denies cancelling an already-cancelled invitation, even by the owner", () => {
+    expect(
+      canCancelTripInvitation(
+        baseInvitation({ status: "cancelled" }),
+        "owner-uid",
+        "owner-uid",
+        activeNow
+      )
+    ).toBe(false);
+  });
+
+  it("denies cancelling a persisted-pending invitation that is effectively expired", () => {
+    expect(
+      canCancelTripInvitation(
+        baseInvitation(),
+        "owner-uid",
+        "owner-uid",
+        new Date("2027-02-01T00:00:00Z")
+      )
+    ).toBe(false);
+  });
+
+  it("denies cancelling exactly at the expiry boundary", () => {
+    expect(
+      canCancelTripInvitation(
+        baseInvitation(),
+        "owner-uid",
+        "owner-uid",
+        new Date("2027-01-15T00:00:00Z")
+      )
+    ).toBe(false);
+  });
+
+  it("allows cancelling just before the expiry boundary", () => {
+    expect(
+      canCancelTripInvitation(
+        baseInvitation(),
+        "owner-uid",
+        "owner-uid",
+        new Date("2027-01-14T23:59:59.999Z")
+      )
+    ).toBe(true);
   });
 });
 

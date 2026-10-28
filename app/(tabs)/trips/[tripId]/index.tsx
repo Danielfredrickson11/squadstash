@@ -2240,12 +2240,13 @@ export default function TripDetails() {
               isArchived={isArchived}
             />
 
-            {/* Checkpoint 6.4: owner-only, read-only outgoing-invitation
-                status history - renders nothing for a non-owner or when
-                the owner has never sent an invitation (see
-                components/trips/TripInvitationsSection.tsx). No Cancel/
-                Invite-Again action here - that remains 6.5. */}
-            <TripInvitationsSection tripId={tripId} isOwner={isOwner} />
+            {/* Checkpoint 6.4/6.5: owner-only, outgoing-invitation status
+                history, with a Cancel action on effective-pending rows
+                only - renders nothing for a non-owner or when the owner
+                has never sent an invitation (see components/trips/
+                TripInvitationsSection.tsx). No Invite-Again action - the
+                existing re-invite limitation remains unchanged. */}
+            <TripInvitationsSection tripId={tripId} ownerId={trip.ownerId} isOwner={isOwner} />
 
             {/* Checkpoint 6.3: compact summary card only - the full
                 five-field view/edit/review flow lives on its own
