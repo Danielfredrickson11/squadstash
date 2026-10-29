@@ -1,12 +1,13 @@
 # Trip Permissions — Architecture Reference
 
-Status: current, frozen (Checkpoint 6.6).
+Status: current, frozen (Checkpoint 6.6; extended by Checkpoint 6.7A for
+the social expense-balance aggregate below).
 
 This document is the source of truth for SquadStash's Trip organizational
 role model and the permission matrix it governs. It reflects verified
 behavior read directly from `firestore.rules` and the trusted Cloud
-Functions in `functions/src/callables/` as of Checkpoint 6.6 — it is not
-a design proposal.
+Functions in `functions/src/callables/` as of Checkpoint 6.6 (plus the
+6.7A addition below) — it is not a design proposal.
 
 ## Membership authority
 
@@ -87,6 +88,55 @@ authority — it does not. The Owner's only financial-adjacent privilege is
 the creator-or-owner expense-reversal rule, which is a narrow, explicit
 exception documented in `reverseTripExpense.ts`/
 `reverseSharedStashExpense.ts`, not a general pattern.
+
+## Social expense/settlement balances (Checkpoint 6.7A)
+
+A Trip's **social** expense/settlement net position (who currently owes
+whom, from ordinary member-to-member expenses and settlements) is a
+wholly separate system from the Shared-Stash ownership cache described
+above:
+
+```text
+tripMemberOwnership   — custodial Shared-Stash ownership (who owns what
+                         share of the Trip's pooled Shared Stash fund)
+tripExpenseBalances   — social net position (who owes whom from ordinary
+                         member expenses/settlements) — Checkpoint 6.7A
+```
+
+`tripExpenseBalances` is a backend-authoritative aggregate, maintained
+transactionally by `recordTripExpense`, `reverseTripExpense`,
+`recordTripSettlement`, and `reverseTripSettlement` as each financial
+event commits. It exists specifically to give a future member-departure
+feature a bounded, race-safe source of truth for "does this member have
+an outstanding social balance" — it is not itself a UI-facing balance
+display. The existing client-side balance computation
+(`src/hooks/useTripBalances.ts` / `computeTripBalances`) remains the
+UI's own display/informational mechanism, derived live from Expense/
+Split/Settlement history, and is unaffected by this aggregate's
+existence.
+
+Like the Shared-Stash ownership model, this aggregate has its own
+independent two-field lifecycle marker — `Trip.expenseBalanceModelState`
+/ `expenseBalanceModelVersion` (absent, or one of `"legacy"` /
+`"migrating"` / `"initialized"` / `"needs_reconciliation"`) — never
+merged with `ownershipModelState`/`ownershipModelVersion`, which track
+the unrelated Shared-Stash system. A Trip created from Checkpoint 6.7A
+onward starts already `"initialized"`; a pre-existing Trip remains
+`"legacy"` (no aggregate maintained for it) until a future, explicitly
+authorized migration runs.
+
+**No member-departure feature exists yet.** Checkpoint 6.7A ships only
+this aggregate's foundation and lifecycle so a later checkpoint can
+build on it — it does not add any way to leave or remove a Trip member.
+One forward-looking safety rule ships now, ahead of that feature, and is
+currently behavior-neutral in production (today's monotonic membership
+means it can never actually reject anything yet): `reverseTripExpense`
+and `reverseTripSettlement` both refuse to reverse a historical record
+once any named party to it (payer, split participant, settlement
+`fromUid`/`toUid`) is no longer a current Trip member. Once a departure
+feature ships, this means a departed member's historical expenses and
+settlements become permanently unreversible rather than reopening that
+member's balance after they have left.
 
 ## Archive semantics
 

@@ -777,6 +777,29 @@ service cloud.firestore {
     }
 
     // ---------------------------------------
+    // TRIP EXPENSE BALANCES (Checkpoint 6.7A) - the backend-authoritative
+    // SOCIAL expense/settlement net-position aggregate, ONE independent
+    // system from tripMemberOwnership above (that collection is the
+    // custodial Shared-Stash ownership cache; this one is who-owes-whom
+    // on ordinary member-to-member expenses/settlements). Deterministic
+    // id is `{tripId}_{uid}` (tripExpenseBalanceId). Fully client-closed,
+    // mirroring tripOwnershipAllocations/tripOwnershipMigrationState's
+    // own posture exactly - no current or planned client/app feature
+    // ever needs to read this collection directly; the existing
+    // client-side computeTripBalances already derives the same
+    // information, informationally, from live Expense/Split/Settlement
+    // history for display. Only the trusted financial callables
+    // (recordTripExpense, reverseTripExpense, recordTripSettlement,
+    // reverseTripSettlement) and the local, non-exported Admin SDK
+    // migration tool (functions/src/admin/migrateTripExpenseBalances.ts)
+    // ever read/write this collection, bypassing these Rules entirely
+    // like every other trusted-write-only collection in this file.
+    // ---------------------------------------
+    match /tripExpenseBalances/{balanceId} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------
     // TRIP OWNERSHIP RECONCILIATION CONTROL (Checkpoint 5C.6, same
     // preflight §8/§9/§17) - the trusted reconciliation tool's own
     // mutable, fixed-id-per-Trip coordination document, giving every

@@ -2,6 +2,13 @@ import {FieldValue, Timestamp, getFirestore} from "firebase-admin/firestore";
 import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError, onCall} from "firebase-functions/v2/https";
 import type {CallableRequest} from "firebase-functions/v2/https";
+import {
+  classifyExpenseBalanceMutationGate,
+} from "../domain/tripExpenseBalanceModel";
+import {computeSettlementBalanceDeltas} from "../domain/tripExpenseBalance";
+import {
+  applyTripExpenseBalanceDeltas,
+} from "../domain/tripExpenseBalanceStore";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -310,6 +317,47 @@ export async function recordTripSettlementCore(
     // E. No archive check - deliberately omitted (preflight §9/§10).
     // Resolving a pre-existing debt must remain possible on an archived
     // Trip.
+
+    // E2. Checkpoint 6.7A: maintain the tripExpenseBalances social-ledger
+    // aggregate - fromUid (who paid in real life) is credited, toUid (the
+    // recipient) is debited. Gated on the Trip's own expense-balance-
+    // model lifecycle state, mirroring recordTripExpense.ts's own gate
+    // usage exactly. No authorization change - this is bookkeeping only.
+    const expenseBalanceGate = classifyExpenseBalanceMutationGate(
+      tripData.expenseBalanceModelState,
+      tripData.expenseBalanceModelVersion
+    );
+    if (expenseBalanceGate.kind === "blocked") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip's expense-balance model is currently being migrated " +
+          "or reconciled; new settlement activity is temporarily " +
+          "unavailable."
+      );
+    }
+    if (expenseBalanceGate.kind === "fail_closed") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip has an unsupported or corrupt expense-balance model " +
+          "state."
+      );
+    }
+    if (expenseBalanceGate.kind === "initialized") {
+      const deltaResult = computeSettlementBalanceDeltas(
+        input.fromUid,
+        input.toUid,
+        input.amountMinor
+      );
+      if (!deltaResult.ok) {
+        throw new HttpsError("failed-precondition", deltaResult.reason);
+      }
+      await applyTripExpenseBalanceDeltas(
+        tx,
+        db,
+        input.tripId,
+        deltaResult.deltas
+      );
+    }
 
     // F. Persist the new Settlement.
     const settlementData: Record<string, unknown> = {

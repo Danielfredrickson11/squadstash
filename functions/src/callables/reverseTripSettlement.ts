@@ -2,6 +2,16 @@ import {FieldValue, getFirestore} from "firebase-admin/firestore";
 import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError, onCall} from "firebase-functions/v2/https";
 import type {CallableRequest} from "firebase-functions/v2/https";
+import {
+  classifyExpenseBalanceMutationGate,
+} from "../domain/tripExpenseBalanceModel";
+import {
+  computeSettlementBalanceDeltas,
+  invertBalanceDeltas,
+} from "../domain/tripExpenseBalance";
+import {
+  applyTripExpenseBalanceDeltas,
+} from "../domain/tripExpenseBalanceStore";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -88,8 +98,16 @@ function isValidFirestoreDocumentId(id: string): boolean {
  *   gets no reversal authority. An unrelated member gets none either.
  * - Reversal is NOT gated on Trip archive state - correcting historical
  *   activity is deliberately allowed on an archived Trip.
- * - This callable never reads or writes any other collection - no
- *   compensating record, no replaces/replacedBy linkage, no delete.
+ * - This callable never reads or writes any other collection beyond the
+ *   Settlement/Trip pair and (Checkpoint 6.7A) the tripExpenseBalances
+ *   aggregate - no compensating record, no replaces/replacedBy linkage,
+ *   no delete.
+ * - Checkpoint 6.7A: before reversal, BOTH named parties (fromUid AND
+ *   toUid) must still be CURRENT Trip members - if either has since
+ *   left the Trip, the reversal is rejected outright (the original
+ *   record is never altered; it simply becomes permanently
+ *   unreversible). This is a membership check, independent of the
+ *   Trip's own expense-balance-model lifecycle state.
  */
 export const reverseTripSettlement = onCall(async (request) => {
   const authUid = requireAuthenticatedUid(request.auth);
@@ -253,6 +271,87 @@ export async function reverseTripSettlementCore(
       throw new HttpsError(
         "failed-precondition",
         "This settlement has already been reversed."
+      );
+    }
+
+    // G2. Checkpoint 6.7A: the frozen future-departure reversal-safety
+    // foundation. BOTH named parties - fromUid and toUid - must still be
+    // CURRENT Trip members. Today this can never actually reject
+    // anything (no member-departure path exists yet, so Trip membership
+    // is still strictly monotonic) - this gate exists now so a future
+    // departure feature never needs to retrofit it onto every historical
+    // Settlement.
+    if (
+      typeof settlementData.fromUid !== "string" ||
+      settlementData.fromUid.length === 0 ||
+      typeof settlementData.toUid !== "string" ||
+      settlementData.toUid.length === 0
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        "This settlement has malformed party data and cannot be reversed."
+      );
+    }
+    if (
+      !isCurrentTripMember(tripData, settlementData.fromUid) ||
+      !isCurrentTripMember(tripData, settlementData.toUid)
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        "This settlement can no longer be reversed because a " +
+          "participant has left the trip."
+      );
+    }
+
+    // G3. Checkpoint 6.7A: maintain the tripExpenseBalances aggregate by
+    // applying the EXACT inverse of this Settlement's original forward
+    // delta, recomputed from the immutable persisted Settlement evidence
+    // above (never reimplemented). Gated on the Trip's own expense-
+    // balance-model lifecycle state, mirroring recordTripSettlement.ts's
+    // own gate usage.
+    const expenseBalanceGate = classifyExpenseBalanceMutationGate(
+      tripData.expenseBalanceModelState,
+      tripData.expenseBalanceModelVersion
+    );
+    if (expenseBalanceGate.kind === "blocked") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip's expense-balance model is currently being migrated " +
+          "or reconciled; reversals are temporarily unavailable."
+      );
+    }
+    if (expenseBalanceGate.kind === "fail_closed") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip has an unsupported or corrupt expense-balance model " +
+          "state."
+      );
+    }
+    if (expenseBalanceGate.kind === "initialized") {
+      if (
+        typeof settlementData.amountMinor !== "number" ||
+        !Number.isSafeInteger(settlementData.amountMinor) ||
+        settlementData.amountMinor <= 0
+      ) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This settlement has a malformed amountMinor and cannot be " +
+            "reversed."
+        );
+      }
+      const forwardDeltaResult = computeSettlementBalanceDeltas(
+        settlementData.fromUid,
+        settlementData.toUid,
+        settlementData.amountMinor
+      );
+      if (!forwardDeltaResult.ok) {
+        throw new HttpsError("failed-precondition", forwardDeltaResult.reason);
+      }
+      await applyTripExpenseBalanceDeltas(
+        tx,
+        db,
+        tripId,
+        invertBalanceDeltas(forwardDeltaResult.deltas)
       );
     }
 

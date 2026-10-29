@@ -5,6 +5,9 @@ import type {CallableRequest} from "firebase-functions/v2/https";
 import {
   CURRENT_TRIP_OWNERSHIP_MODEL_VERSION,
 } from "../domain/tripOwnershipModel";
+import {
+  CURRENT_TRIP_EXPENSE_BALANCE_MODEL_VERSION,
+} from "../domain/tripExpenseBalanceModel";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -33,9 +36,10 @@ const CANONICAL_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 // invalid-argument, including every trusted field a native Trip must
 // never accept as client input (ownerId, memberIds, saved,
 // ledgerOpeningBalanceMinor, ledgerBalanceMinor, currency,
-// ownershipModelState, ownershipModelVersion, creationRequest, createdAt,
-// lastUpdatedAt, lastUpdatedBy, archivedAt, archivedBy, or anything else
-// unrecognized). Deliberately NOT a blocklist - see validateInput below.
+// ownershipModelState, ownershipModelVersion, expenseBalanceModelState,
+// expenseBalanceModelVersion, creationRequest, createdAt, lastUpdatedAt,
+// lastUpdatedBy, archivedAt, archivedBy, or anything else unrecognized).
+// Deliberately NOT a blocklist - see validateInput below.
 const ALLOWED_INPUT_KEYS: ReadonlySet<string> = new Set([
   "clientRequestId",
   "title",
@@ -178,6 +182,15 @@ export async function createTripCore(
       currency: "USD",
       ownershipModelState: "initialized",
       ownershipModelVersion: CURRENT_TRIP_OWNERSHIP_MODEL_VERSION,
+      // Checkpoint 6.7A: a brand-new Trip has no historical expense/
+      // settlement activity to migrate, so it is born already-
+      // initialized for the SEPARATE social expense-balance aggregate
+      // too - mirrors ownershipModelState/Version immediately above
+      // exactly, but is an independent field pair (never overloaded
+      // onto ownershipModelState/Version - see docs/architecture/
+      // TRIP_PERMISSIONS.md). Never accepted as client input.
+      expenseBalanceModelState: "initialized",
+      expenseBalanceModelVersion: CURRENT_TRIP_EXPENSE_BALANCE_MODEL_VERSION,
       // Immutable trusted creation metadata - the sole source of truth
       // idempotent replay compares against (matchesCreationRequest
       // below), never a client-write input, mirroring createBucket.ts's

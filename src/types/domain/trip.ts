@@ -19,6 +19,21 @@ export type TripOwnershipModelState =
   | "initialized"
   | "needs_reconciliation";
 
+// Checkpoint 6.7A: the SOCIAL expense/settlement-balance aggregate's own
+// independent lifecycle marker - identical shape to
+// TripOwnershipModelState above (same four states, same absent-means-
+// legacy semantics), but a deliberately separate type name, mirroring
+// functions/src/domain/tripExpenseBalanceModel.ts's own
+// TripExpenseBalanceModelState exactly. Never merged with
+// TripOwnershipModelState - these two track two independent backend
+// systems (see the field comment below, and
+// docs/architecture/TRIP_PERMISSIONS.md).
+export type TripExpenseBalanceModelState =
+  | "legacy"
+  | "migrating"
+  | "initialized"
+  | "needs_reconciliation";
+
 // Persisted trips/{tripId} document. Every field but id stays optional,
 // matching the current read mapping (mapTripDocument, used by
 // fetchMemberTripsOrdered/fetchMemberTrips/fetchTripById in
@@ -116,6 +131,23 @@ export type Trip = {
   // no migration has run yet (5B.1 is schema-only).
   ownershipModelState?: TripOwnershipModelState;
   ownershipModelVersion?: number;
+
+  // Checkpoint 6.7A: the SOCIAL expense/settlement-balance aggregate's
+  // own independent two-field lifecycle marker - mirrors
+  // TripOwnershipModelState's shape/semantics exactly, but is a wholly
+  // separate system (see docs/architecture/TRIP_PERMISSIONS.md):
+  // ownershipModelState/Version above track the custodial Shared-Stash
+  // ownership cache; these two track the backend-authoritative
+  // tripExpenseBalances aggregate (who-owes-whom on ordinary
+  // member-to-member expenses/settlements). Both fields are
+  // backend-only (never a client-write input). A brand-new Trip
+  // (createTrip) is created already "initialized"; an existing legacy
+  // Trip has neither key at all until a future migration runs - not
+  // yet mapped by mapTripDocument (src/services/firebase/trips.ts),
+  // since no current client feature reads it; added here only so a
+  // future departure/readiness UI has a typed field to read.
+  expenseBalanceModelState?: TripExpenseBalanceModelState;
+  expenseBalanceModelVersion?: number;
 };
 
 // Checkpoint 5B.5B: the exact, frozen request shape the trusted

@@ -2,6 +2,16 @@ import {FieldValue, getFirestore} from "firebase-admin/firestore";
 import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError, onCall} from "firebase-functions/v2/https";
 import type {CallableRequest} from "firebase-functions/v2/https";
+import {
+  classifyExpenseBalanceMutationGate,
+} from "../domain/tripExpenseBalanceModel";
+import {
+  computeExpenseBalanceDeltas,
+  invertBalanceDeltas,
+} from "../domain/tripExpenseBalance";
+import {
+  applyTripExpenseBalanceDeltas,
+} from "../domain/tripExpenseBalanceStore";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -94,7 +104,18 @@ function isValidFirestoreDocumentId(id: string): boolean {
  *   participant status grant no reversal authority (§5).
  * - Reversal is NOT gated on Trip archive state - correcting historical
  *   activity is deliberately allowed on an archived Trip (§6).
- * - This callable never reads or writes tripExpenseSplits (§12/§14).
+ * - This callable never WRITES tripExpenseSplits (§12/§14) - Checkpoint
+ *   6.7A added a single READ of the Expense's own immutable, already-
+ *   persisted split evidence, needed to compute the exact inverse
+ *   social-balance delta and to run the departed-member reversal-safety
+ *   freeze gate below.
+ * - Checkpoint 6.7A: before reversal, every uid whose inverse delta
+ *   would be touched (the original payerUid, and every persisted split
+ *   participant) must still be a CURRENT Trip member - if any named
+ *   party has since left the Trip, the reversal is rejected outright
+ *   (the original record is never altered; it simply becomes
+ *   permanently unreversible). This is a membership check, independent
+ *   of the Trip's own expense-balance-model lifecycle state.
  * - Checkpoint 4F.2A: this callable only reverses
  *   paymentSource === "member_out_of_pocket" Expenses. A "shared_stash"
  *   Expense is rejected (failed-precondition) and must be reversed
@@ -288,6 +309,126 @@ export async function reverseTripExpenseCore(
         "failed-precondition",
         "This expense is Shared-Stash-funded and must be reversed " +
           "through the Shared Stash reversal operation."
+      );
+    }
+
+    // G3. Checkpoint 6.7A: read this Expense's own persisted, immutable
+    // ExpenseSplit evidence - the first and only point in this callable
+    // that ever reads tripExpenseSplits. Needed both for the departed-
+    // member freeze gate (G4) and to compute the exact inverse social-
+    // balance delta (G5) - never recomputed from current input, since a
+    // reversal carries none. Finding ZERO split documents is NOT itself
+    // an error here - a pre-6.7A Expense (or a hand-seeded fixture that
+    // predates split-tracking) legitimately has none, and this callable
+    // historically never required any; G5 below separately fails closed
+    // if an "initialized" Trip (which always requires split evidence to
+    // compute its aggregate) is somehow missing it. An EXISTING split
+    // document with a malformed shape, however, is always a genuine
+    // data-integrity problem, regardless of Trip state. Checkpoint
+    // 6.7A Final Financial Parity Review: a split's own amountMinor may
+    // legitimately be exactly 0 (an intentional $0 share) - only a
+    // NEGATIVE or non-safe-integer value is malformed.
+    const splitsSnap = await tx.get(
+      db
+        .collection("tripExpenseSplits")
+        .where("expenseId", "==", input.expenseId)
+    );
+    const splits: {uid: string; amountMinor: number}[] = [];
+    for (const doc of splitsSnap.docs) {
+      const splitData = doc.data();
+      if (
+        typeof splitData.userId !== "string" ||
+        splitData.userId.length === 0 ||
+        typeof splitData.amountMinor !== "number" ||
+        !Number.isSafeInteger(splitData.amountMinor) ||
+        splitData.amountMinor < 0
+      ) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This expense has malformed split data and cannot be reversed."
+        );
+      }
+      splits.push({uid: splitData.userId, amountMinor: splitData.amountMinor});
+    }
+    if (
+      typeof expenseData.payerUid !== "string" ||
+      expenseData.payerUid.length === 0
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        "This expense has a malformed payerUid and cannot be reversed."
+      );
+    }
+
+    // G4. Checkpoint 6.7A: the frozen future-departure reversal-safety
+    // foundation. Every uid whose inverse delta would be touched - the
+    // original payerUid, and every persisted split participant - must
+    // still be a CURRENT Trip member. Today this can never actually
+    // reject anything (no member-departure path exists yet, so Trip
+    // membership is still strictly monotonic) - this gate exists now so
+    // a future departure feature never needs to retrofit it onto every
+    // historical Expense. Deliberately skipped when memberIds is itself
+    // malformed (non-array): this is a forward-looking correctness gate
+    // against a feature that does not exist yet, not an authorization
+    // boundary (step E above already is one) - it must never newly
+    // block an otherwise-authorized reversal (e.g. the Trip owner's)
+    // merely because of unrelated memberIds corruption, matching this
+    // callable's own established "owner authority survives malformed
+    // memberIds" precedent (Checkpoint 4C.3C §7).
+    if (Array.isArray(tripData.memberIds)) {
+      const namedParties = new Set<string>([
+        expenseData.payerUid,
+        ...splits.map((s) => s.uid),
+      ]);
+      for (const uid of namedParties) {
+        if (!isCurrentTripMember(tripData, uid)) {
+          throw new HttpsError(
+            "failed-precondition",
+            "This expense can no longer be reversed because a " +
+              "participant has left the trip."
+          );
+        }
+      }
+    }
+
+    // G5. Checkpoint 6.7A: maintain the tripExpenseBalances aggregate by
+    // applying the EXACT inverse of this Expense's original forward
+    // delta, recomputed from the immutable persisted Expense/Split
+    // evidence above (never reimplemented, never recomputed from
+    // current input). Gated on the Trip's own expense-balance-model
+    // lifecycle state, mirroring recordTripExpense.ts's own gate usage.
+    const expenseBalanceGate = classifyExpenseBalanceMutationGate(
+      tripData.expenseBalanceModelState,
+      tripData.expenseBalanceModelVersion
+    );
+    if (expenseBalanceGate.kind === "blocked") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip's expense-balance model is currently being migrated " +
+          "or reconciled; reversals are temporarily unavailable."
+      );
+    }
+    if (expenseBalanceGate.kind === "fail_closed") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip has an unsupported or corrupt expense-balance model " +
+          "state."
+      );
+    }
+    if (expenseBalanceGate.kind === "initialized") {
+      const forwardDeltaResult = computeExpenseBalanceDeltas(
+        expenseData.payerUid,
+        expenseData.amountMinor,
+        splits
+      );
+      if (!forwardDeltaResult.ok) {
+        throw new HttpsError("failed-precondition", forwardDeltaResult.reason);
+      }
+      await applyTripExpenseBalanceDeltas(
+        tx,
+        db,
+        tripId,
+        invertBalanceDeltas(forwardDeltaResult.deltas)
       );
     }
 

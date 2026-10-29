@@ -8,6 +8,13 @@ import {
   splitDocumentId,
   type SplitStrategyInput,
 } from "../domain/tripExpenseSplits";
+import {
+  classifyExpenseBalanceMutationGate,
+} from "../domain/tripExpenseBalanceModel";
+import {computeExpenseBalanceDeltas} from "../domain/tripExpenseBalance";
+import {
+  applyTripExpenseBalanceDeltas,
+} from "../domain/tripExpenseBalanceStore";
 
 type CallableAuth = CallableRequest["auth"];
 type SplitStrategy = "equal" | "percentage" | "custom";
@@ -524,6 +531,55 @@ export async function recordTripExpenseCore(
       throw new HttpsError(
         "invalid-argument",
         e instanceof Error ? e.message : "Invalid split input."
+      );
+    }
+
+    // G2. Checkpoint 6.7A: maintain the SEPARATE social tripExpenseBalances
+    // aggregate (never the Shared-Stash tripMemberOwnership aggregate -
+    // these are two independent systems, see docs/architecture/
+    // TRIP_PERMISSIONS.md). "legacy" preserves today's exact behavior
+    // unchanged (no aggregate write, no rejection) - this is what makes
+    // this checkpoint's deploy backward-compatible for every pre-existing
+    // Trip. "migrating"/"needs_reconciliation" reject the mutation
+    // outright. A corrupt/unsupported state fails closed. Only
+    // "initialized" computes and applies the normalized deltas, using the
+    // SAME trusted `allocations` this transaction already computed in
+    // step G - never a second, independent split computation. All of
+    // applyTripExpenseBalanceDeltas's own reads happen here, strictly
+    // before the writes in step H below (Firestore's own
+    // reads-before-writes transaction requirement).
+    const expenseBalanceGate = classifyExpenseBalanceMutationGate(
+      tripData.expenseBalanceModelState,
+      tripData.expenseBalanceModelVersion
+    );
+    if (expenseBalanceGate.kind === "blocked") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip's expense-balance model is currently being migrated " +
+          "or reconciled; new expense activity is temporarily unavailable."
+      );
+    }
+    if (expenseBalanceGate.kind === "fail_closed") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This trip has an unsupported or corrupt expense-balance model " +
+          "state."
+      );
+    }
+    if (expenseBalanceGate.kind === "initialized") {
+      const deltaResult = computeExpenseBalanceDeltas(
+        input.payerUid,
+        input.amountMinor,
+        allocations
+      );
+      if (!deltaResult.ok) {
+        throw new HttpsError("failed-precondition", deltaResult.reason);
+      }
+      await applyTripExpenseBalanceDeltas(
+        tx,
+        db,
+        input.tripId,
+        deltaResult.deltas
       );
     }
 
