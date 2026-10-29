@@ -16,3 +16,5 @@ export {recordSharedStashExpense} from "./callables/recordSharedStashExpense";
 export {reverseSharedStashExpense} from "./callables/reverseSharedStashExpense";
 export {recordTripSettlement} from "./callables/recordTripSettlement";
 export {reverseTripSettlement} from "./callables/reverseTripSettlement";
+export {leaveTrip} from "./callables/leaveTrip";
+export {removeTripMember} from "./callables/removeTripMember";

@@ -800,6 +800,30 @@ service cloud.firestore {
     }
 
     // ---------------------------------------
+    // TRIP MEMBERSHIP DEPARTURES (Checkpoint 6.7B1) - the immutable,
+    // backend-authoritative audit evidence that `uid` left or was
+    // removed from a Trip. Deterministic id `{tripId}_{uid}` - at most
+    // one departure event ever exists per (tripId, uid) pair (the
+    // current invitation architecture is terminal, so rejoin is not yet
+    // possible). This document is audit evidence and future former-
+    // member residual-withdrawal authorization evidence (6.7B2) - it is
+    // NEVER current membership authority, which remains exclusively
+    // Trip.ownerId/Trip.memberIds.
+    //
+    // Fully client-closed for B1, mirroring tripExpenseBalances/
+    // tripOwnershipAllocations' own identical posture exactly - the
+    // trusted leaveTrip/removeTripMember callables are the sole writers.
+    // 6.7B2 will add a narrow, former-member-specific read/trusted-
+    // write path through its own dedicated callable(s); this checkpoint
+    // deliberately does not widen any Rules capability in anticipation
+    // of that - a departed former member gets no broader Trip-read
+    // authority merely because this collection now exists.
+    // ---------------------------------------
+    match /tripMembershipDepartures/{departureId} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------
     // TRIP OWNERSHIP RECONCILIATION CONTROL (Checkpoint 5C.6, same
     // preflight §8/§9/§17) - the trusted reconciliation tool's own
     // mutable, fixed-id-per-Trip coordination document, giving every
