@@ -145,11 +145,14 @@ member's balance after they have left.
 
 **Production-readiness caveat:** this section describes trusted backend
 logic that exists in source as of 6.7B1. It is deliberately **not**
-exposed through any client service or UI yet, and former-member residual
-Shared-Stash recovery (6.7B2) has not been built. Do not treat this
-section as describing a feature a user can access today — Checkpoints
-6.7B2 and 6.7C must land first before departure is considered
-production-ready end to end.
+exposed through any client service or UI yet. Do not treat this section
+as describing a feature a user can access today — Checkpoint 6.7C (client
+service/UI wiring) must land first before departure is considered
+production-ready end to end. Checkpoint 6.7B2 — originally planned as a
+former-member residual Shared-Stash recovery feature — was evaluated and
+closed as unnecessary; see "Former-member residual recovery (6.7B2) was
+closed as unnecessary" below for why no further backend work is needed
+before 6.7C.
 
 ### Who can leave/remove, and the Owner's own status
 
@@ -216,14 +219,51 @@ Trip activity.
 `tripMembershipDepartures/{tripId}_{uid}` records that a specific uid
 left or was removed, by whom, and when. It is created in the same
 transaction that removes the uid from `Trip.memberIds` — these two facts
-can never diverge. It is audit evidence and the future authorization
-basis for former-member residual recovery (6.7B2); it is **never**
-itself consulted to answer "is this uid currently a member" (that
-remains exclusively `Trip.ownerId`/`Trip.memberIds`, per "Membership
-authority" above). It is fully Firestore-Rules-closed in 6.7B1 — no
-client role, including the departed member themselves, may read, create,
-update, or delete it; only the trusted `leaveTrip`/`removeTripMember`
-callables ever touch it.
+can never diverge. It is audit evidence only; it is **never** itself
+consulted to answer "is this uid currently a member" (that remains
+exclusively `Trip.ownerId`/`Trip.memberIds`, per "Membership authority"
+above), and — per the 6.7B2 closeout below — it does not authorize any
+former-member recovery flow either, because no such flow is needed. It
+is fully Firestore-Rules-closed — no client role, including the departed
+member themselves, may read, create, update, or delete it; only the
+trusted `leaveTrip`/`removeTripMember` callables ever touch it. Former
+members receive no new Firestore-Rules-based Trip access of any kind as
+a consequence of this collection existing.
+
+### Former-member residual recovery (6.7B2) was closed as unnecessary
+
+Checkpoint 6.7B2 was originally planned (during the 6.7 architecture
+preflight rounds, before 6.7B1 was implemented) as a former-member
+residual Shared-Stash recovery feature — a `withdrawFormerMemberResidual`
+callable plus a narrow Rules exception, for a member who left while still
+holding Shared-Stash ownership.
+
+That need does not exist under the architecture 6.7B1 actually shipped.
+"Both financial positions must be exactly zero before departure" (above)
+is a *precondition* for departure to succeed, not a post-departure
+cleanup step: a departure that would leave the target with a nonzero
+Shared-Stash ownership or a nonzero social expense/settlement position is
+rejected outright, for both `leaveTrip` and `removeTripMember`. Combined
+with `recordTripExpense`/`recordTripSettlement` already requiring every
+named party to be a *current* member, and 6.7A's reversal-freeze gate
+(`reverseTripExpense`/`reverseTripSettlement` refuse to reverse a record
+naming a departed party), a successfully departed member's position in
+both systems is zero at the moment of departure and provably stays zero
+forever after — there is no mechanism, race, or legacy path by which it
+could become nonzero post-departure. There is therefore nothing left to
+recover, and 6.7B2 was closed without implementation. No
+`withdrawFormerMemberResidual`-style callable, no `tripMembershipDepartures`
+read path for former members, and no Rules widening of any kind were
+built or are planned.
+
+`trip_personal` Buckets ("My Stash for this trip") are unaffected by any
+of this and were never part of the departure-residual problem in the
+first place: a `trip_personal` Bucket's access is governed entirely by
+its own `ownerId`/`memberIds`, set at Bucket creation and never
+re-synced with the parent Trip's membership (see
+`functions/src/callables/createBucket.ts`). A member's `trip_personal`
+savings are not affected by leaving or being removed from the Trip they
+are linked to.
 
 ### Invitation/acceptance history is never rewritten by departure
 

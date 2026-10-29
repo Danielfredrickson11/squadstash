@@ -14,9 +14,15 @@
 // orchestrates it.
 //
 // Scope (6.7B1 only): leaveTrip / removeTripMember backend only. NO
-// former-member residual withdrawal, NO residual funds listing, NO
 // client wiring, NO ownership transfer, NO owner leave, NO rejoin -
-// all explicitly deferred.
+// all explicitly deferred to a later checkpoint. Former-member residual
+// Shared-Stash withdrawal/funds-listing (originally planned as a
+// separate "6.7B2" checkpoint) is NOT deferred - it was evaluated and
+// closed as unnecessary, since the gates below already require both
+// financial positions to be exactly zero before departure succeeds, and
+// existing post-departure financial authorization prevents them from
+// reopening. See docs/architecture/TRIP_PERMISSIONS.md's own "Former-
+// member residual recovery (6.7B2) was closed as unnecessary" section.
 import {FieldValue} from "firebase-admin/firestore";
 import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError} from "firebase-functions/v2/https";

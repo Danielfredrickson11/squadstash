@@ -10,10 +10,17 @@
 // every Firestore read/write and maps a validation failure here onto
 // its own exact HttpsError code/message.
 //
-// A departure event is audit evidence and future former-member residual
-// authorization evidence (6.7B2) - it is NEVER current membership
-// authority (that remains Trip.ownerId/Trip.memberIds exclusively).
-// There is at most one departure event per (tripId, uid) pair - the
+// A departure event is audit evidence only - it is NEVER current
+// membership authority (that remains Trip.ownerId/Trip.memberIds
+// exclusively). Checkpoint 6.7B2 (a planned former-member residual
+// Shared-Stash recovery feature) was evaluated and closed as
+// unnecessary: both financial positions are already required to be
+// exactly zero before departure succeeds, and existing post-departure
+// financial authorization prevents them from reopening, so there is no
+// residual left for a departure event to ever authorize recovery of -
+// see docs/architecture/TRIP_PERMISSIONS.md's own "Former-member
+// residual recovery (6.7B2) was closed as unnecessary" section. There
+// is at most one departure event per (tripId, uid) pair - the
 // current invitation architecture is terminal, so rejoin is not
 // possible yet; this is a known, disclosed limitation (6.7C UI), not a
 // defect to work around here.

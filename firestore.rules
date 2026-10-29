@@ -801,23 +801,33 @@ service cloud.firestore {
 
     // ---------------------------------------
     // TRIP MEMBERSHIP DEPARTURES (Checkpoint 6.7B1) - the immutable,
-    // backend-authoritative audit evidence that `uid` left or was
-    // removed from a Trip. Deterministic id `{tripId}_{uid}` - at most
-    // one departure event ever exists per (tripId, uid) pair (the
+    // backend-authoritative audit/departure evidence that `uid` left or
+    // was removed from a Trip. Deterministic id `{tripId}_{uid}` - at
+    // most one departure event ever exists per (tripId, uid) pair (the
     // current invitation architecture is terminal, so rejoin is not yet
-    // possible). This document is audit evidence and future former-
-    // member residual-withdrawal authorization evidence (6.7B2) - it is
-    // NEVER current membership authority, which remains exclusively
+    // possible). This document is audit evidence only - it is NEVER
+    // current-membership authority, which remains exclusively
     // Trip.ownerId/Trip.memberIds.
     //
-    // Fully client-closed for B1, mirroring tripExpenseBalances/
+    // Checkpoint 6.7B2 was originally planned as a former-member
+    // residual Shared-Stash recovery feature (a dedicated withdrawal
+    // callable plus a narrow Rules exception for this collection). It
+    // was evaluated and closed as unnecessary: 6.7B1 already requires a
+    // departing member's Shared-Stash ownership AND social expense
+    // balance to both be exactly zero before departure succeeds, and
+    // existing financial authorization prevents either position from
+    // reopening afterward - so there is no residual left to ever
+    // authorize recovery of. See docs/architecture/TRIP_PERMISSIONS.md's
+    // own "Former-member residual recovery (6.7B2) was closed as
+    // unnecessary" section.
+    //
+    // Fully client-closed, mirroring tripExpenseBalances/
     // tripOwnershipAllocations' own identical posture exactly - the
-    // trusted leaveTrip/removeTripMember callables are the sole writers.
-    // 6.7B2 will add a narrow, former-member-specific read/trusted-
-    // write path through its own dedicated callable(s); this checkpoint
-    // deliberately does not widen any Rules capability in anticipation
-    // of that - a departed former member gets no broader Trip-read
-    // authority merely because this collection now exists.
+    // trusted leaveTrip/removeTripMember callables are the sole
+    // writers. Former members gain no direct Rules-based access of any
+    // kind from this collection - a departed former member gets no
+    // broader Trip-read authority merely because this collection
+    // exists.
     // ---------------------------------------
     match /tripMembershipDepartures/{departureId} {
       allow read, write: if false;
