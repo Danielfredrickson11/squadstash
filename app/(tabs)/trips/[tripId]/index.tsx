@@ -104,6 +104,7 @@ import { ReverseSettlementDialog } from "../../../../components/balances/Reverse
 import { TripMembersSection } from "../../../../components/trips/TripMembersSection";
 import { TripInvitationsSection } from "../../../../components/trips/TripInvitationsSection";
 import { TripTermsSection } from "../../../../components/trips/TripTermsSection";
+import { LeaveTripDialog } from "../../../../components/trips/LeaveTripDialog";
 
 const FALLBACK_IMAGE =
   "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=60";
@@ -396,6 +397,49 @@ export default function TripDetails() {
       setArchiving(false);
     }
   }, [tripId, trip, user, router, notify]);
+
+  // Checkpoint 6.7C: Leave Trip entry point for a non-owner current
+  // member only - the owner can never leave (no ownership transfer
+  // exists yet, see functions/src/callables/tripMembershipDepartureCore.ts).
+  // Not gated on isArchived - departure remains a financially-eligible
+  // wind-down operation on an archived Trip, matching the backend's own
+  // semantics exactly (unlike Archive itself, which the owner can no
+  // longer trigger once already archived).
+  const [leaveDialogVisible, setLeaveDialogVisible] = useState(false);
+
+  const onLeaveTrip = useCallback(() => {
+    if (!tripId || !trip || !user) return;
+    setLeaveDialogVisible(true);
+  }, [tripId, trip, user]);
+
+  const closeLeaveDialog = useCallback(() => {
+    setLeaveDialogVisible(false);
+  }, []);
+
+  // Mirrors confirmArchiveTrip's own post-success navigation exactly -
+  // prompt navigation lets this screen's own live, Rules-gated
+  // listeners (expenses/settlements/balances/stash activity) unmount via
+  // their existing cleanup rather than surfacing a stale
+  // permission-denied error once memberIds no longer contains this uid.
+  const onLeftTrip = useCallback(() => {
+    setLeaveDialogVisible(false);
+    router.replace("/(tabs)/trips");
+  }, [router]);
+
+  // Checkpoint 6.7C: TripMembersSection receives memberIds as a prop (it
+  // owns no Trip state itself), so a successful owner-initiated removal
+  // is reflected here via the same optimistic local patch saveDates
+  // already uses above - never a direct Firestore write, and never a
+  // fetchTrip() refetch (which would flip the page-level `loading` flag
+  // and briefly unmount the whole screen, exactly the concern
+  // confirmArchiveTrip's own comment above already raises for Archive).
+  const onMemberRemoved = useCallback((targetUid: string) => {
+    setTrip((prev) =>
+      prev
+        ? { ...prev, memberIds: (prev.memberIds ?? []).filter((uid) => uid !== targetUid) }
+        : prev
+    );
+  }, []);
 
   const startEditDates = useCallback(() => {
     if (!isOwner || !trip) return;
@@ -2170,6 +2214,21 @@ export default function TripDetails() {
                     <MaterialCommunityIcons name="archive-outline" size={16} color="#FFFFFF" />
                   </Pressable>
                 ) : null}
+
+                {/* Checkpoint 6.7C: non-owner current member only - never
+                    shown to the owner, and (unlike Archive above)
+                    deliberately NOT gated on isArchived. */}
+                {!isOwner ? (
+                  <Pressable
+                    onPress={onLeaveTrip}
+                    accessibilityRole="button"
+                    accessibilityLabel="Leave trip"
+                    style={({ pressed }) => [styles.iconOnlyPill, pressed && { opacity: 0.85 }]}
+                    hitSlop={10}
+                  >
+                    <MaterialCommunityIcons name="exit-to-app" size={16} color="#FFFFFF" />
+                  </Pressable>
+                ) : null}
               </View>
 
               <View style={styles.heroText}>
@@ -2239,6 +2298,7 @@ export default function TripDetails() {
               memberIds={trip.memberIds}
               isOwner={isOwner}
               isArchived={isArchived}
+              onRemoved={onMemberRemoved}
             />
 
             {/* Checkpoint 6.4/6.5: owner-only, outgoing-invitation status
@@ -3331,6 +3391,12 @@ export default function TripDetails() {
       onCancel={closeArchiveDialog}
       onConfirm={confirmArchiveTrip}
       colors={colors}
+    />
+    <LeaveTripDialog
+      visible={leaveDialogVisible}
+      tripId={tripId}
+      onClose={closeLeaveDialog}
+      onLeft={onLeftTrip}
     />
     <RecordSettlementDialog
       visible={settlementVisible}

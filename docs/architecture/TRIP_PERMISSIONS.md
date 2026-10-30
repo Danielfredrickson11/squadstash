@@ -141,18 +141,24 @@ the first time — a departed member's historical expenses and
 settlements become permanently unreversible rather than reopening that
 member's balance after they have left.
 
-## Member departure (Checkpoint 6.7B1 — backend only, not yet a shipped user-facing feature)
+## Member departure (Checkpoint 6.7B1 backend + 6.7C client UI)
 
-**Production-readiness caveat:** this section describes trusted backend
-logic that exists in source as of 6.7B1. It is deliberately **not**
-exposed through any client service or UI yet. Do not treat this section
-as describing a feature a user can access today — Checkpoint 6.7C (client
-service/UI wiring) must land first before departure is considered
-production-ready end to end. Checkpoint 6.7B2 — originally planned as a
-former-member residual Shared-Stash recovery feature — was evaluated and
-closed as unnecessary; see "Former-member residual recovery (6.7B2) was
-closed as unnecessary" below for why no further backend work is needed
-before 6.7C.
+**Production-readiness note:** the trusted backend logic described in
+this section (6.7B1) is now exposed end to end through a client UI
+(Checkpoint 6.7C) — a "Leave trip" action for a non-owner current
+member, and a per-row "Remove" action on `TripMembersSection` for the
+owner. Both go exclusively through the trusted `leaveTrip`/
+`removeTripMember` callables via `src/services/firebase/trips.ts`'s own
+thin wrappers; neither the client service layer nor either confirmation
+dialog (`components/trips/LeaveTripDialog.tsx`,
+`components/trips/RemoveTripMemberDialog.tsx`) mutates `memberIds`
+directly, reads/writes `tripMembershipDepartures`, or treats any
+client-side financial value as authorization — the backend remains the
+sole authority for whether a departure succeeds. Checkpoint 6.7B2 —
+originally planned as a former-member residual Shared-Stash recovery
+feature — was evaluated and closed as unnecessary; see "Former-member
+residual recovery (6.7B2) was closed as unnecessary" below for why no
+further backend work was needed before 6.7C.
 
 ### Who can leave/remove, and the Owner's own status
 

@@ -31,6 +31,7 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 
 import { AvatarCircle, initialsFromName } from "../buckets/AvatarCircle";
 import { InviteTripMemberDialog } from "./InviteTripMemberDialog";
+import { RemoveTripMemberDialog } from "./RemoveTripMemberDialog";
 import { cardShadowFor, radii, spacing, typography } from "../../src/theme/tokens";
 import { useSemanticColors } from "../../src/theme/useSemanticColors";
 import { deriveCurrentMemberUids } from "../../src/domain/expenseSubmission";
@@ -51,12 +52,21 @@ export function TripMembersSection({
   memberIds,
   isOwner,
   isArchived,
+  onRemoved,
 }: {
   tripId: string;
   ownerId: string | null | undefined;
   memberIds: (string | null | undefined)[] | null | undefined;
   isOwner: boolean;
   isArchived: boolean;
+  // Checkpoint 6.7C: called with the removed member's uid once the
+  // trusted removeTripMember call succeeds (or exact-replays as
+  // success) - this component never mutates memberIds/the parent's Trip
+  // state itself, since it only receives memberIds as a prop. The
+  // parent decides how to reflect the removal (see
+  // app/(tabs)/trips/[tripId]/index.tsx's own optimistic-patch
+  // convention, matching saveDates).
+  onRemoved?: (targetUid: string) => void;
 }) {
   const theme = useTheme();
   const colors = useSemanticColors();
@@ -77,6 +87,28 @@ export function TripMembersSection({
     setInviteDialogOpen(false);
     setInvitedEmailNotice(normalizedEmail);
   }, []);
+
+  // Checkpoint 6.7C: per-row target state + a single shared dialog
+  // instance at the bottom of this card - mirrors
+  // TripInvitationsSection's own selectedForCancel/CancelTripInvitationDialog
+  // wiring exactly.
+  const [removeTarget, setRemoveTarget] = useState<TripMemberViewModel | null>(null);
+
+  const onRemovePress = useCallback((member: TripMemberViewModel) => {
+    setRemoveTarget(member);
+  }, []);
+
+  const onCloseRemoveDialog = useCallback(() => {
+    setRemoveTarget(null);
+  }, []);
+
+  const onMemberRemoved = useCallback(
+    (targetUid: string) => {
+      setRemoveTarget(null);
+      onRemoved?.(targetUid);
+    },
+    [onRemoved]
+  );
 
   const currentMemberUids = useMemo(
     () => deriveCurrentMemberUids(ownerId, memberIds),
@@ -170,6 +202,20 @@ export function TripMembersSection({
                   <Text style={[styles.ownerBadgeText, { color: colors.blue }]}>Owner</Text>
                 </View>
               ) : null}
+              {/* Checkpoint 6.7C: owner-only, never on the owner's own
+                  row - client hiding is convenience only, the trusted
+                  removeTripMember callable remains the real,
+                  backend-enforced owner/target gate regardless. */}
+              {isOwner && !member.isOwner ? (
+                <Pressable
+                  onPress={() => onRemovePress(member)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Remove ${member.nameLabel} from trip`}
+                  style={styles.removeTrigger}
+                >
+                  <Text style={[styles.removeTriggerText, { color: colors.coral }]}>Remove</Text>
+                </Pressable>
+              ) : null}
             </View>
           ))}
         </View>
@@ -212,6 +258,15 @@ export function TripMembersSection({
         onClose={onCloseInviteDialog}
         onSent={onInvitationSent}
       />
+
+      <RemoveTripMemberDialog
+        visible={removeTarget !== null}
+        tripId={tripId}
+        targetUid={removeTarget?.uid ?? null}
+        targetNameLabel={removeTarget?.nameLabel ?? ""}
+        onClose={onCloseRemoveDialog}
+        onRemoved={onMemberRemoved}
+      />
     </View>
   );
 }
@@ -243,6 +298,8 @@ const styles = StyleSheet.create({
     borderRadius: radii.pill,
   },
   ownerBadgeText: { fontSize: 11, fontWeight: "800" },
+  removeTrigger: { paddingHorizontal: spacing.xs, paddingVertical: 2 },
+  removeTriggerText: { fontSize: 12, fontWeight: "700" },
   errorNote: { fontSize: 12, fontWeight: "600", marginTop: spacing.sm },
   inviteNotice: { fontSize: 12, fontWeight: "600", marginTop: spacing.sm },
   inviteBtn: {

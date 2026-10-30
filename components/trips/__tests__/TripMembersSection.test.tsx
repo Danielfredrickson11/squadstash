@@ -16,6 +16,7 @@ import { TripMembersSection } from "../TripMembersSection";
 import { subscribeToPublicUsersByIdsChunked } from "../../../src/services/firebase/users";
 import { fetchCurrentTripTerms } from "../../../src/services/firebase/tripTerms";
 import { createTripInvitation } from "../../../src/services/firebase/tripInvitations";
+import { removeTripMember } from "../../../src/services/firebase/trips";
 import type { PublicProfile, TripTerms } from "../../../src/types/domain";
 
 jest.mock("../../../src/services/firebase/users", () => ({
@@ -28,6 +29,10 @@ jest.mock("../../../src/services/firebase/tripTerms", () => ({
 
 jest.mock("../../../src/services/firebase/tripInvitations", () => ({
   createTripInvitation: jest.fn(),
+}));
+
+jest.mock("../../../src/services/firebase/trips", () => ({
+  removeTripMember: jest.fn(),
 }));
 
 const mockPush = jest.fn();
@@ -52,6 +57,7 @@ const mockedFetchTerms = fetchCurrentTripTerms as jest.MockedFunction<
 const mockedCreateInvitation = createTripInvitation as jest.MockedFunction<
   typeof createTripInvitation
 >;
+const mockedRemoveTripMember = removeTripMember as jest.MockedFunction<typeof removeTripMember>;
 
 type JsonNode = {
   props: Record<string, unknown>;
@@ -112,6 +118,7 @@ beforeEach(() => {
   mockedSubscribe.mockReset();
   mockedFetchTerms.mockReset();
   mockedCreateInvitation.mockReset();
+  mockedRemoveTripMember.mockReset();
   mockPush.mockReset();
 });
 
@@ -291,5 +298,115 @@ describe("TripMembersSection - Invite Member entry point (Checkpoint 6.2)", () =
     // exactly the one pre-existing owner row, no new member/count.
     expect(text).toContain("1 member on this trip");
     expect(text).toContain("Dana Owner");
+  });
+});
+
+describe("TripMembersSection - Remove Member entry point (Checkpoint 6.7C)", () => {
+  it("owner sees a Remove action for a non-owner member, never for their own row", () => {
+    mockedSubscribe.mockImplementation((_uids, onChange) => {
+      onChange([
+        { uid: "owner-1", displayName: "Dana Owner", photoURL: "" },
+        { uid: "member-2", displayName: "Sam Member", photoURL: "" },
+      ]);
+      return () => {};
+    });
+    const tree = renderSection({
+      isOwner: true,
+      ownerId: "owner-1",
+      memberIds: ["owner-1", "member-2"],
+    });
+
+    expect(() => findByLabel(tree, "Remove Sam Member from trip")).not.toThrow();
+    expect(() => findByLabel(tree, "Remove Dana Owner from trip")).toThrow();
+  });
+
+  it("a non-owner member never sees any Remove control", () => {
+    mockedSubscribe.mockImplementation((_uids, onChange) => {
+      onChange([
+        { uid: "owner-1", displayName: "Dana Owner", photoURL: "" },
+        { uid: "member-2", displayName: "Sam Member", photoURL: "" },
+      ]);
+      return () => {};
+    });
+    const tree = renderSection({
+      isOwner: false,
+      ownerId: "owner-1",
+      memberIds: ["owner-1", "member-2"],
+    });
+
+    expect(() => findByLabel(tree, "Remove Sam Member from trip")).toThrow();
+    expect(() => findByLabel(tree, "Remove Dana Owner from trip")).toThrow();
+  });
+
+  it("an archived Trip still permits the Remove action for the owner", () => {
+    mockedSubscribe.mockImplementation((_uids, onChange) => {
+      onChange([
+        { uid: "owner-1", displayName: "Dana Owner", photoURL: "" },
+        { uid: "member-2", displayName: "Sam Member", photoURL: "" },
+      ]);
+      return () => {};
+    });
+    const tree = renderSection({
+      isOwner: true,
+      isArchived: true,
+      ownerId: "owner-1",
+      memberIds: ["owner-1", "member-2"],
+    });
+
+    expect(() => findByLabel(tree, "Remove Sam Member from trip")).not.toThrow();
+  });
+
+  it("pressing Remove opens the dialog naming the correct target member", () => {
+    mockedSubscribe.mockImplementation((_uids, onChange) => {
+      onChange([
+        { uid: "owner-1", displayName: "Dana Owner", photoURL: "" },
+        { uid: "member-2", displayName: "Sam Member", photoURL: "" },
+      ]);
+      return () => {};
+    });
+    const tree = renderSection({
+      isOwner: true,
+      ownerId: "owner-1",
+      memberIds: ["owner-1", "member-2"],
+    });
+
+    act(() => {
+      (findByLabel(tree, "Remove Sam Member from trip").props.onPress as () => void)();
+    });
+
+    const text = collectText(tree.toJSON() as JsonNode);
+    expect(text).toContain("Remove Sam Member?");
+  });
+
+  it("a successful removal calls removeTripMember with the exact tripId/targetUid and notifies the parent", async () => {
+    mockedSubscribe.mockImplementation((_uids, onChange) => {
+      onChange([
+        { uid: "owner-1", displayName: "Dana Owner", photoURL: "" },
+        { uid: "member-2", displayName: "Sam Member", photoURL: "" },
+      ]);
+      return () => {};
+    });
+    mockedRemoveTripMember.mockResolvedValue({
+      tripId: "trip-1",
+      uid: "member-2",
+      departureType: "removed",
+    });
+    const onRemoved = jest.fn();
+    const tree = renderSection({
+      isOwner: true,
+      ownerId: "owner-1",
+      memberIds: ["owner-1", "member-2"],
+      onRemoved,
+    });
+
+    act(() => {
+      (findByLabel(tree, "Remove Sam Member from trip").props.onPress as () => void)();
+    });
+    await act(async () => {
+      await (findByLabel(tree, "Remove Member").props.onPress as () => Promise<void>)();
+    });
+
+    expect(mockedRemoveTripMember).toHaveBeenCalledWith("trip-1", "member-2");
+    expect(onRemoved).toHaveBeenCalledWith("member-2");
   });
 });

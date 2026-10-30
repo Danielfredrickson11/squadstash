@@ -221,3 +221,95 @@ export async function updateTripDates(
     lastUpdatedBy: input.lastUpdatedBy,
   });
 }
+
+// ---------------------------------------------------------------------
+// Member departure (Checkpoint 6.7C) - thin httpsCallable wrappers over
+// the trusted leaveTrip/removeTripMember Cloud Functions (Checkpoint
+// 6.7B1). No direct Firestore write of any kind: memberIds is never
+// mutated client-side, and tripMembershipDepartures is never read or
+// written from the client at all (it is fully Rules-closed - see
+// firestore.rules). Matches createTrip's own convention exactly: the
+// request is rebuilt field-by-field (never a spread), the response is
+// validated field-by-field rather than trusted via a whole-object cast,
+// and callable errors (HttpsError/FirebaseError) are never caught or
+// wrapped here - they propagate to the caller unchanged.
+// ---------------------------------------------------------------------
+
+export type LeaveTripResult = {
+  tripId: string;
+  uid: string;
+  departureType: "left";
+};
+
+function parseLeaveTripResponse(data: unknown): LeaveTripResult {
+  if (typeof data !== "object" || data === null) {
+    throw new Error("leaveTrip: invalid response (expected an object).");
+  }
+  const { tripId, uid, departureType } = data as Record<string, unknown>;
+  if (typeof tripId !== "string" || tripId.length === 0) {
+    throw new Error(
+      "leaveTrip: invalid response (tripId must be a non-empty string)."
+    );
+  }
+  if (typeof uid !== "string" || uid.length === 0) {
+    throw new Error(
+      "leaveTrip: invalid response (uid must be a non-empty string)."
+    );
+  }
+  if (departureType !== "left") {
+    throw new Error(
+      'leaveTrip: invalid response (departureType must be "left").'
+    );
+  }
+  return { tripId, uid, departureType };
+}
+
+export async function leaveTrip(tripId: string): Promise<LeaveTripResult> {
+  const callable = httpsCallable<{ tripId: string }, unknown>(
+    functions,
+    "leaveTrip"
+  );
+  const res = await callable({ tripId });
+  return parseLeaveTripResponse(res.data);
+}
+
+export type RemoveTripMemberResult = {
+  tripId: string;
+  uid: string;
+  departureType: "removed";
+};
+
+function parseRemoveTripMemberResponse(data: unknown): RemoveTripMemberResult {
+  if (typeof data !== "object" || data === null) {
+    throw new Error("removeTripMember: invalid response (expected an object).");
+  }
+  const { tripId, uid, departureType } = data as Record<string, unknown>;
+  if (typeof tripId !== "string" || tripId.length === 0) {
+    throw new Error(
+      "removeTripMember: invalid response (tripId must be a non-empty string)."
+    );
+  }
+  if (typeof uid !== "string" || uid.length === 0) {
+    throw new Error(
+      "removeTripMember: invalid response (uid must be a non-empty string)."
+    );
+  }
+  if (departureType !== "removed") {
+    throw new Error(
+      'removeTripMember: invalid response (departureType must be "removed").'
+    );
+  }
+  return { tripId, uid, departureType };
+}
+
+export async function removeTripMember(
+  tripId: string,
+  targetUid: string
+): Promise<RemoveTripMemberResult> {
+  const callable = httpsCallable<{ tripId: string; targetUid: string }, unknown>(
+    functions,
+    "removeTripMember"
+  );
+  const res = await callable({ tripId, targetUid });
+  return parseRemoveTripMemberResponse(res.data);
+}
