@@ -8,16 +8,22 @@
 // the invitation list itself, never touches membership/financial state,
 // and never implements any re-invite workaround.
 //
-// FROZEN INVARIANT (6.5 preflight §4/§14): cancellation remains a
-// direct Firestore write, gated entirely by firestore.rules (owner-only,
-// pending -> cancelled, locked field diff) - this dialog never attempts
-// to compensate for or second-guess a Rules rejection. A
-// "permission-denied" result means the invitation's state already
-// changed underneath the owner (most plausibly: the invitee accepted it
-// first, Checkpoint 6.5's own approved cancel-vs-accept race analysis) -
-// the only safe response is to close and let the parent re-fetch
-// authoritative state, never to retry the same write or infer what
-// actually happened from the error text.
+// Checkpoint 6.8B2: cancellation now goes through the trusted
+// cancelTripInvitation Cloud Function (src/services/firebase/
+// tripInvitations.ts), not a direct Firestore write - the legacy
+// Rules-gated write path still exists during the rollout compatibility
+// window (6.8A3), but this dialog's own call site always uses the
+// callable. A callable error reports a DISTINCT code per cause, unlike
+// the old Rules rejection (which was uniformly "permission-denied"
+// regardless of why): "functions/failed-precondition" means the
+// invitation's state already changed underneath the owner (most
+// plausibly: the invitee accepted it first, Checkpoint 6.5's own
+// approved cancel-vs-accept race analysis) - the only safe response is
+// to close and let the parent re-fetch authoritative state, never to
+// retry the same call or infer what happened from the error text.
+// "functions/permission-denied" now means something different and more
+// serious - the caller genuinely is not this Trip's current owner - and
+// must NOT be mapped to the same "state changed" message.
 import React, { useCallback, useRef, useState } from "react";
 import {
   KeyboardAvoidingView,
@@ -78,10 +84,10 @@ export function CancelTripInvitationDialog({
     } catch (e) {
       console.log("cancelTripInvitation error:", e);
       const code = (e as { code?: string } | null | undefined)?.code;
-      if (code === "permission-denied") {
+      if (code === "functions/failed-precondition") {
         // The invitation's state already changed underneath the owner -
         // never leave this confirmation open against stale state, and
-        // never retry the write ourselves. Hand the safe message to the
+        // never retry the call ourselves. Hand the safe message to the
         // parent, which closes this dialog and re-fetches.
         onStateChanged(CANCEL_STATE_CHANGED_MESSAGE);
         return;

@@ -12,7 +12,6 @@
 import {
   doc as mockDoc,
   getDocs as mockGetDocs,
-  serverTimestamp as mockServerTimestamp,
   updateDoc as mockUpdateDoc,
   where as mockWhere,
 } from "firebase/firestore";
@@ -32,7 +31,6 @@ jest.mock("firebase/firestore", () => ({
   getDoc: jest.fn(),
   getDocs: jest.fn(),
   query: jest.fn((...args: unknown[]) => ({ __type: "query", args })),
-  serverTimestamp: jest.fn(() => ({ __type: "serverTimestamp" })),
   updateDoc: jest.fn(),
   where: jest.fn((...args: unknown[]) => ({ __type: "where", args })),
 }));
@@ -48,7 +46,6 @@ jest.mock("../../../../firebase", () => ({
 
 const mockDocFn = mockDoc as unknown as jest.Mock;
 const mockUpdateDocFn = mockUpdateDoc as unknown as jest.Mock;
-const mockServerTimestampFn = mockServerTimestamp as unknown as jest.Mock;
 const mockHttpsCallableFn = mockHttpsCallable as unknown as jest.Mock;
 const mockGetDocsFn = mockGetDocs as unknown as jest.Mock;
 const mockWhereFn = mockWhere as unknown as jest.Mock;
@@ -338,39 +335,80 @@ describe("acceptTripInvitation", () => {
   });
 });
 
-describe("declineTripInvitation (unchanged direct write)", () => {
-  it("calls updateDoc", async () => {
+// Checkpoint 6.8B2: declineTripInvitation now invokes the trusted
+// declineTripInvitation Cloud Function - no direct Firestore write.
+describe("declineTripInvitation (Checkpoint 6.8B2: trusted callable)", () => {
+  it('invokes the callable named "declineTripInvitation"', async () => {
+    const callable = jest.fn().mockResolvedValue({ data: {} });
+    mockHttpsCallableFn.mockReturnValue(callable);
     await declineTripInvitation("trip-1", "invitee-uid");
-    expect(mockUpdateDocFn).toHaveBeenCalledTimes(1);
-  });
-
-  it('writes status: "declined"', async () => {
-    mockServerTimestampFn.mockReturnValue({ __type: "serverTimestamp" });
-    await declineTripInvitation("trip-1", "invitee-uid");
-    expect(mockUpdateDocFn).toHaveBeenCalledWith(
+    expect(mockHttpsCallableFn).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ status: "declined" })
+      "declineTripInvitation"
     );
   });
 
-  it("never invokes the acceptTripInvitation callable", async () => {
+  it("sends exactly { invitationId }, derived via the canonical tripInvitationId formula", async () => {
+    const callable = jest.fn().mockResolvedValue({ data: {} });
+    mockHttpsCallableFn.mockReturnValue(callable);
     await declineTripInvitation("trip-1", "invitee-uid");
-    expect(mockHttpsCallableFn).not.toHaveBeenCalled();
+    expect(callable).toHaveBeenCalledWith({ invitationId: "trip-1_invitee-uid" });
+  });
+
+  it("never calls updateDoc (no direct Firestore write fallback)", async () => {
+    const callable = jest.fn().mockResolvedValue({ data: {} });
+    mockHttpsCallableFn.mockReturnValue(callable);
+    await declineTripInvitation("trip-1", "invitee-uid");
+    expect(mockUpdateDocFn).not.toHaveBeenCalled();
+  });
+
+  it("propagates a raw callable error unchanged (no catch-and-rewrite)", async () => {
+    const originalError = Object.assign(new Error("failed precondition"), {
+      code: "functions/failed-precondition",
+    });
+    const callable = jest.fn().mockRejectedValue(originalError);
+    mockHttpsCallableFn.mockReturnValue(callable);
+    await expect(declineTripInvitation("trip-1", "invitee-uid")).rejects.toBe(
+      originalError
+    );
   });
 });
 
-describe("cancelTripInvitation (unchanged direct write)", () => {
-  it("calls updateDoc", async () => {
+// Checkpoint 6.8B2: cancelTripInvitation now invokes the trusted
+// cancelTripInvitation Cloud Function - no direct Firestore write.
+describe("cancelTripInvitation (Checkpoint 6.8B2: trusted callable)", () => {
+  it('invokes the callable named "cancelTripInvitation"', async () => {
+    const callable = jest.fn().mockResolvedValue({ data: {} });
+    mockHttpsCallableFn.mockReturnValue(callable);
     await cancelTripInvitation("trip-1", "invitee-uid");
-    expect(mockUpdateDocFn).toHaveBeenCalledTimes(1);
+    expect(mockHttpsCallableFn).toHaveBeenCalledWith(
+      expect.anything(),
+      "cancelTripInvitation"
+    );
   });
 
-  it('writes status: "cancelled"', async () => {
-    mockServerTimestampFn.mockReturnValue({ __type: "serverTimestamp" });
+  it("sends exactly { invitationId }, derived via the canonical tripInvitationId formula", async () => {
+    const callable = jest.fn().mockResolvedValue({ data: {} });
+    mockHttpsCallableFn.mockReturnValue(callable);
     await cancelTripInvitation("trip-1", "invitee-uid");
-    expect(mockUpdateDocFn).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ status: "cancelled" })
+    expect(callable).toHaveBeenCalledWith({ invitationId: "trip-1_invitee-uid" });
+  });
+
+  it("never calls updateDoc (no direct Firestore write fallback)", async () => {
+    const callable = jest.fn().mockResolvedValue({ data: {} });
+    mockHttpsCallableFn.mockReturnValue(callable);
+    await cancelTripInvitation("trip-1", "invitee-uid");
+    expect(mockUpdateDocFn).not.toHaveBeenCalled();
+  });
+
+  it("propagates a raw callable error unchanged (no catch-and-rewrite)", async () => {
+    const originalError = Object.assign(new Error("permission denied"), {
+      code: "functions/permission-denied",
+    });
+    const callable = jest.fn().mockRejectedValue(originalError);
+    mockHttpsCallableFn.mockReturnValue(callable);
+    await expect(cancelTripInvitation("trip-1", "invitee-uid")).rejects.toBe(
+      originalError
     );
   });
 });

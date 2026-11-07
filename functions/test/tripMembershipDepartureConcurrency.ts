@@ -17,6 +17,7 @@ import {leaveTripCore} from "../src/callables/leaveTrip";
 import {recordTripExpenseCore} from "../src/callables/recordTripExpense";
 import {CURRENT_TRIP_OWNERSHIP_MODEL_VERSION} from "../src/domain/tripOwnershipModel";
 import {CURRENT_TRIP_EXPENSE_BALANCE_MODEL_VERSION} from "../src/domain/tripExpenseBalanceModel";
+import {memberLeftActivityId} from "../src/domain/tripMembershipActivity";
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
   throw new Error(
@@ -53,6 +54,7 @@ async function clearFirestore(): Promise<void> {
     "tripExpenseSplits",
     "tripExpenseBalances",
     "tripMembershipDepartures",
+    "tripMembershipActivity",
   ]) {
     const snap = await db.collection(name).get();
     await Promise.all(snap.docs.map((d) => d.ref.delete()));
@@ -166,6 +168,24 @@ describe("departure concurrency - unrelated membership addition is never lost", 
     assert.equal(memberIds!.includes(OTHER_MEMBER_UID), true);
     // No duplicates, no dropped unrelated member.
     assert.equal(memberIds!.length, 3);
+  });
+
+  it("exactly one member_left activity event exists after two concurrent identical leave attempts", async () => {
+    await seedTrip(readyTripOverrides());
+
+    await Promise.allSettled([
+      leaveTripCore(db, MEMBER_UID, {tripId: TRIP_ID}),
+      leaveTripCore(db, MEMBER_UID, {tripId: TRIP_ID}),
+    ]);
+
+    const snap = await db
+      .collection("tripMembershipActivity")
+      .doc(memberLeftActivityId(TRIP_ID, MEMBER_UID))
+      .get();
+    assert.equal(snap.exists, true);
+
+    const allActivity = await db.collection("tripMembershipActivity").get();
+    assert.equal(allActivity.size, 1);
   });
 });
 

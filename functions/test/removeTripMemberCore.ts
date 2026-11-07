@@ -24,6 +24,7 @@ import {
 } from "../src/callables/removeTripMember";
 import {CURRENT_TRIP_OWNERSHIP_MODEL_VERSION} from "../src/domain/tripOwnershipModel";
 import {CURRENT_TRIP_EXPENSE_BALANCE_MODEL_VERSION} from "../src/domain/tripExpenseBalanceModel";
+import {memberRemovedActivityId} from "../src/domain/tripMembershipActivity";
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
   throw new Error(
@@ -59,6 +60,7 @@ async function clearFirestore(): Promise<void> {
     "tripMemberOwnership",
     "tripExpenseBalances",
     "tripMembershipDepartures",
+    "tripMembershipActivity",
   ]) {
     const snap = await db.collection(name).get();
     await Promise.all(snap.docs.map((d) => d.ref.delete()));
@@ -153,6 +155,13 @@ async function assertRejectsWithCode(
     assert.equal((err as HttpsError).code, code);
     return true;
   });
+}
+
+async function getActivity(
+  id: string
+): Promise<FirebaseFirestore.DocumentData | undefined> {
+  const snap = await db.collection("tripMembershipActivity").doc(id).get();
+  return snap.data();
 }
 
 describe("removeTripMemberCore - authorization", () => {
@@ -294,6 +303,55 @@ describe("removeTripMemberCore - replay", () => {
       }),
       "failed-precondition"
     );
+  });
+});
+
+describe("removeTripMemberCore - membership activity (Checkpoint 6.8B1)", () => {
+  it("success creates the exact member_removed activity event, atomically with the departure", async () => {
+    await seedTrip(readyTripOverrides());
+    await removeTripMemberCore(db, OWNER_UID, {
+      tripId: TRIP_ID,
+      targetUid: MEMBER_UID,
+    });
+    const activity = await getActivity(
+      memberRemovedActivityId(TRIP_ID, MEMBER_UID)
+    );
+    assert.deepEqual(activity && {...activity, createdAt: undefined}, {
+      tripId: TRIP_ID,
+      type: "member_removed",
+      actorUid: OWNER_UID,
+      targetUid: MEMBER_UID,
+      schemaVersion: 1,
+      createdAt: undefined,
+    });
+    assert.ok(activity?.createdAt);
+  });
+
+  it("replaying an already-committed removal does not create a second activity event", async () => {
+    await seedTrip(readyTripOverrides());
+    await removeTripMemberCore(db, OWNER_UID, {
+      tripId: TRIP_ID,
+      targetUid: MEMBER_UID,
+    });
+    await removeTripMemberCore(db, OWNER_UID, {
+      tripId: TRIP_ID,
+      targetUid: MEMBER_UID,
+    });
+    const snap = await db.collection("tripMembershipActivity").get();
+    assert.equal(snap.size, 1);
+  });
+
+  it("a rejected removal (not a current member) creates no activity event", async () => {
+    await seedTrip(readyTripOverrides());
+    await assertRejectsWithCode(
+      removeTripMemberCore(db, OWNER_UID, {
+        tripId: TRIP_ID,
+        targetUid: OUTSIDER_UID,
+      }),
+      "failed-precondition"
+    );
+    const snap = await db.collection("tripMembershipActivity").get();
+    assert.equal(snap.size, 0);
   });
 });
 

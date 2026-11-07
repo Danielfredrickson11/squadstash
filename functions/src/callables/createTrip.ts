@@ -8,6 +8,7 @@ import {
 import {
   CURRENT_TRIP_EXPENSE_BALANCE_MODEL_VERSION,
 } from "../domain/tripExpenseBalanceModel";
+import {buildTripCreatedActivity} from "../domain/tripMembershipActivity";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -210,6 +211,17 @@ export async function createTripCore(
       lastUpdatedBy: authUid,
     };
     tx.set(tripRef, tripData);
+
+    // Checkpoint 6.8B1: atomically twin the Trip creation with its
+    // membership-activity event, in the SAME transaction, on the
+    // fresh-creation branch only - the idempotent-replay branch above
+    // (existingSnap.exists) always returns before this point, so a
+    // genuine replay never attempts a second activity tx.create.
+    const activity = buildTripCreatedActivity(input.clientRequestId, authUid);
+    tx.create(
+      db.collection("tripMembershipActivity").doc(activity.id),
+      {...activity.data, createdAt: FieldValue.serverTimestamp()}
+    );
 
     return {tripId: input.clientRequestId};
   });

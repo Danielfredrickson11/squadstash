@@ -21,6 +21,7 @@ import {HttpsError} from "firebase-functions/v2/https";
 import {leaveTripCore, requireAuthenticatedUid} from "../src/callables/leaveTrip";
 import {CURRENT_TRIP_OWNERSHIP_MODEL_VERSION} from "../src/domain/tripOwnershipModel";
 import {CURRENT_TRIP_EXPENSE_BALANCE_MODEL_VERSION} from "../src/domain/tripExpenseBalanceModel";
+import {memberLeftActivityId} from "../src/domain/tripMembershipActivity";
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
   throw new Error(
@@ -56,6 +57,7 @@ async function clearFirestore(): Promise<void> {
     "tripMemberOwnership",
     "tripExpenseBalances",
     "tripMembershipDepartures",
+    "tripMembershipActivity",
   ]) {
     const snap = await db.collection(name).get();
     await Promise.all(snap.docs.map((d) => d.ref.delete()));
@@ -178,6 +180,13 @@ async function assertRejectsWithCode(
     assert.equal((err as HttpsError).code, code);
     return true;
   });
+}
+
+async function getActivity(
+  id: string
+): Promise<FirebaseFirestore.DocumentData | undefined> {
+  const snap = await db.collection("tripMembershipActivity").doc(id).get();
+  return snap.data();
 }
 
 describe("leaveTripCore - authorization", () => {
@@ -569,6 +578,48 @@ describe("leaveTripCore - atomicity", () => {
     assert.deepEqual(await getTripMemberIds(), [OWNER_UID, OTHER_MEMBER_UID]);
     const departure = await getDeparture(MEMBER_UID);
     assert.ok(departure);
+  });
+});
+
+describe("leaveTripCore - membership activity (Checkpoint 6.8B1)", () => {
+  it("success creates the exact member_left activity event, atomically with the departure", async () => {
+    await seedTrip(readyTripOverrides());
+    await leaveTripCore(db, MEMBER_UID, {tripId: TRIP_ID});
+    const activity = await getActivity(memberLeftActivityId(TRIP_ID, MEMBER_UID));
+    assert.deepEqual(activity && {...activity, createdAt: undefined}, {
+      tripId: TRIP_ID,
+      type: "member_left",
+      actorUid: MEMBER_UID,
+      targetUid: MEMBER_UID,
+      schemaVersion: 1,
+      createdAt: undefined,
+    });
+    assert.ok(activity?.createdAt);
+  });
+
+  it("a failed financial gate creates no activity event", async () => {
+    await seedTrip(readyTripOverrides({ledgerBalanceMinor: 100}));
+    await seedOwnership(MEMBER_UID, 100);
+    await assertRejectsWithCode(
+      leaveTripCore(db, MEMBER_UID, {tripId: TRIP_ID}),
+      "failed-precondition"
+    );
+    assert.equal(await getActivity(memberLeftActivityId(TRIP_ID, MEMBER_UID)), undefined);
+  });
+
+  it("replaying an already-committed leave does not create a second activity event", async () => {
+    await seedTrip(readyTripOverrides());
+    await leaveTripCore(db, MEMBER_UID, {tripId: TRIP_ID});
+    const first = await getActivity(memberLeftActivityId(TRIP_ID, MEMBER_UID));
+
+    await leaveTripCore(db, MEMBER_UID, {tripId: TRIP_ID});
+    const afterReplay = await getActivity(memberLeftActivityId(TRIP_ID, MEMBER_UID));
+    assert.ok((first?.createdAt as FirebaseFirestore.Timestamp).isEqual(
+      afterReplay?.createdAt as FirebaseFirestore.Timestamp
+    ));
+
+    const snap = await db.collection("tripMembershipActivity").get();
+    assert.equal(snap.size, 1);
   });
 });
 

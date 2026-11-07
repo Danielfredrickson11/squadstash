@@ -834,6 +834,53 @@ service cloud.firestore {
     }
 
     // ---------------------------------------
+    // TRIP MEMBERSHIP ACTIVITY (Checkpoint 6.8B3, per the frozen 6.8A
+    // through 6.8A4 architecture) - the human-readable membership-
+    // activity history (trip_created/invitation_created/
+    // invitation_accepted/invitation_declined/invitation_cancelled/
+    // member_left/member_removed/history_tracking_started), fully
+    // separate from tripMembershipDepartures above (that collection
+    // remains untouched, immutable security/audit evidence; this one is
+    // a parallel, narrower-purpose, current-member-readable log - see
+    // 6.8A2 §6).
+    //
+    // Read policy: current Trip members only (owner or anyone currently
+    // in memberIds) - reuses canAccessTripById(tripId) VERBATIM, the
+    // exact same cross-collection "is the caller currently this Trip's
+    // owner or member" helper tripExpenses/tripExpenseSplits/
+    // tripSettlements already rely on (declared once, above, at this
+    // same outer scope). No new helper was added for this checkpoint -
+    // canAccessTripById already expresses exactly the approved semantics
+    // (owner OR currently-in-memberIds; fails closed if the Trip is
+    // missing; a malformed memberIds errors to `false` for the non-owner
+    // branch without locking out the owner - see that function's own
+    // comment). A former member (no longer in memberIds) and a pending/
+    // declined/cancelled invitee (never added to memberIds at all) are
+    // both correctly excluded by construction, since this check always
+    // re-reads the Trip's CURRENT live state - never any historical
+    // acceptance/departure evidence.
+    //
+    // Document id conveys no authority whatsoever - exactly like
+    // tripExpenses/tripExpenseSplits above, access follows ONLY the
+    // resource's own tripId field, checked fresh on every read.
+    match /tripMembershipActivity/{activityId} {
+      allow get, list: if resource.data.tripId is string
+        && canAccessTripById(resource.data.tripId);
+
+      // Fully client-write-closed, mirroring tripMembershipAcceptances/
+      // tripMembershipDepartures/tripOwnershipAllocations' own identical
+      // posture exactly. The trusted backend transactions that write
+      // each real event (createTripCore, createTripInvitationCore,
+      // acceptTripInvitationCore, declineTripInvitationCore,
+      // cancelTripInvitationCore, executeTripMembershipDeparture) all
+      // use the Admin SDK, which bypasses these Rules entirely - no
+      // client Rules allowance is needed or given for any role,
+      // including the Trip owner attempting to directly create a
+      // seemingly-valid activity event themselves.
+      allow create, update, delete: if false;
+    }
+
+    // ---------------------------------------
     // TRIP OWNERSHIP RECONCILIATION CONTROL (Checkpoint 5C.6, same
     // preflight §8/§9/§17) - the trusted reconciliation tool's own
     // mutable, fixed-id-per-Trip coordination document, giving every

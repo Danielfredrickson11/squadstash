@@ -173,26 +173,44 @@ describe("CancelTripInvitationDialog - confirm flow", () => {
 });
 
 describe("CancelTripInvitationDialog - error mapping", () => {
-  it("maps permission-denied to the safe state-changed message, via onStateChanged", async () => {
-    mockedCancel.mockRejectedValue({ code: "permission-denied" });
+  it("maps functions/failed-precondition to the safe state-changed message, via onStateChanged", async () => {
+    mockedCancel.mockRejectedValue({ code: "functions/failed-precondition" });
     const onStateChanged = jest.fn();
     const tree = renderDialog({ onStateChanged });
     await pressConfirm(tree);
     expect(onStateChanged).toHaveBeenCalledWith(CANCEL_STATE_CHANGED_MESSAGE);
   });
 
-  it("permission-denied never exposes raw Firestore error details", async () => {
+  it("functions/failed-precondition never exposes raw callable error details", async () => {
     mockedCancel.mockRejectedValue({
-      code: "permission-denied",
-      message: "FirebaseError: Missing or insufficient permissions (internal detail).",
+      code: "functions/failed-precondition",
+      message: "Invitation status \"accepted\" cannot be cancelled. (internal detail).",
     });
     const onStateChanged = jest.fn();
     const tree = renderDialog({ onStateChanged });
     await pressConfirm(tree);
     const [[message]] = onStateChanged.mock.calls;
-    expect(message).not.toContain("Missing or insufficient permissions");
+    expect(message).not.toContain("internal detail");
     const text = collectText(tree.toJSON() as JsonNode);
-    expect(text).not.toContain("Missing or insufficient permissions");
+    expect(text).not.toContain("internal detail");
+  });
+
+  // Checkpoint 6.8B2: the trusted callable reports a caller who is
+  // genuinely NOT this Trip's owner as "functions/permission-denied" -
+  // a materially different, more serious cause than a stale/terminal
+  // invitation state, and it must never be mapped to the same reassuring
+  // "state changed, refreshing" message the old uniform Rules-rejection
+  // code used to force onto both causes alike.
+  it("a genuine functions/permission-denied (unauthorized caller) does NOT map to the state-changed message", async () => {
+    mockedCancel.mockRejectedValue({ code: "functions/permission-denied" });
+    const onStateChanged = jest.fn();
+    const tree = renderDialog({ onStateChanged });
+    await pressConfirm(tree);
+    expect(onStateChanged).not.toHaveBeenCalled();
+    const text = collectText(tree.toJSON() as JsonNode);
+    expect(text).toContain(
+      "Something went wrong cancelling the invitation. Please try again."
+    );
   });
 
   it("an unknown/network error uses the generic safe message and keeps the dialog open/retryable", async () => {

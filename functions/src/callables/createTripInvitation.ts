@@ -4,6 +4,7 @@ import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError, onCall} from "firebase-functions/v2/https";
 import type {CallableRequest} from "firebase-functions/v2/https";
 import {tripInvitationId} from "../domain/tripCompositeId";
+import {buildInvitationCreatedActivity} from "../domain/tripMembershipActivity";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -181,6 +182,22 @@ export async function createTripInvitationCore(
       expiresAt,
       respondedAt: null,
     });
+
+    // Checkpoint 6.8B1: atomically twin the invitation's creation with
+    // its membership-activity event, in the SAME transaction. There is
+    // no replay branch to guard against here - a second invitation for
+    // the same pair always throws "already-exists" above, before this
+    // point is ever reached (6.8A2 §2/§7) - so this write only ever
+    // executes once per (tripId, inviteeUid) pair, ever.
+    const activity = buildInvitationCreatedActivity(
+      input.tripId,
+      authUid,
+      inviteeUid
+    );
+    tx.create(
+      db.collection("tripMembershipActivity").doc(activity.id),
+      {...activity.data, createdAt: FieldValue.serverTimestamp()}
+    );
 
     return {invitationId, inviteeUid};
   });

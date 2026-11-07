@@ -1,16 +1,21 @@
-// Checkpoint 5A/5C.3C: TripInvitation reads are direct client Firestore
-// access (gated by firestore.rules); creation is a trusted callable
-// (server-side email-to-uid resolution, mirroring lookupUserByEmail's
-// own pattern - never a public Firestore email-query surface).
-// Responding to an already-issued invitation is now a MIX, not uniform:
-// accepting is the trusted acceptTripInvitation Cloud Function (it now
-// grants real Trip membership/financial authority - Checkpoint 5C - so
-// firestore.rules permanently closed the old direct-write path, see
-// Checkpoint 5C.2); declining and owner-cancellation remain direct
-// client writes, unchanged, since each is still a one-way terminal
-// status transition with zero financial or membership consequence (see
-// firestore.rules' own comment on this collection for why neither needs
-// a trusted callable).
+// Checkpoint 5A/5C.3C/6.8B2: TripInvitation reads are direct client
+// Firestore access (gated by firestore.rules); every WRITE is now a
+// trusted callable. Creation uses server-side email-to-uid resolution
+// (mirroring lookupUserByEmail's own pattern - never a public Firestore
+// email-query surface). Accepting is the trusted acceptTripInvitation
+// Cloud Function (it grants real Trip membership/financial authority -
+// Checkpoint 5C - so firestore.rules permanently closed the old
+// direct-write path, see Checkpoint 5C.2). Declining and
+// owner-cancellation (Checkpoint 6.8B2) have NOW also moved to trusted
+// callables (declineTripInvitation/cancelTripInvitation) - per the
+// approved 6.8A2/6.8A3 membership-activity architecture, every
+// membership-activity-producing transition must go through a trusted
+// backend path so it can atomically twin a tripMembershipActivity
+// event. The legacy direct-write Firestore Rules clauses for decline/
+// cancel still exist during the rollout compatibility window (6.8A3
+// Phase A-F) - this client file simply never uses that path anymore;
+// closing those Rules clauses is a separate, later checkpoint (Phase F),
+// not this one.
 import { httpsCallable } from "firebase/functions";
 import {
   collection,
@@ -18,8 +23,6 @@ import {
   getDoc,
   getDocs,
   query,
-  serverTimestamp,
-  updateDoc,
   where,
   type DocumentData,
 } from "firebase/firestore";
@@ -301,28 +304,39 @@ export async function getTripInvitationPreview(
   return parseTripInvitationPreviewResponse(res.data);
 }
 
-// Checkpoint 5C.2/5C.3C: declining and owner-cancellation remain direct
-// client writes, unchanged - firestore.rules' own `pending -> declined`/
-// `pending -> cancelled` clauses were never closed, since neither
-// transition ever grants anything (only narrows). Only the
-// `pending -> accepted` transition above was moved to the trusted
-// callable.
+// Checkpoint 6.8B2: declining is now the trusted declineTripInvitation
+// Cloud Function (previously a direct client write - see this file's
+// own header comment for why that changed). The exported signature
+// (tripId, inviteeUid) is preserved unchanged so existing call sites
+// (CancelTripInvitationDialog's sibling decline flow, the invitation
+// review screen) need no changes - this wrapper derives the backend's
+// required `{ invitationId }` input using the SAME canonical
+// tripInvitationId formula already defined in this file, rather than
+// inventing a second one. Callable errors (HttpsError/FirebaseError) are
+// not caught or wrapped here - they propagate to the caller unchanged,
+// matching every other trusted-callable wrapper in this file.
 export async function declineTripInvitation(
   tripId: string,
   inviteeUid: string
 ): Promise<void> {
-  await updateDoc(doc(db, "tripInvitations", tripInvitationId(tripId, inviteeUid)), {
-    status: "declined",
-    respondedAt: serverTimestamp(),
-  });
+  const callable = httpsCallable<{ invitationId: string }, unknown>(
+    functions,
+    "declineTripInvitation"
+  );
+  await callable({ invitationId: tripInvitationId(tripId, inviteeUid) });
 }
 
+// Checkpoint 6.8B2: cancellation is now the trusted
+// cancelTripInvitation Cloud Function - same treatment as decline
+// above, including signature preservation and the same canonical
+// invitationId derivation.
 export async function cancelTripInvitation(
   tripId: string,
   inviteeUid: string
 ): Promise<void> {
-  await updateDoc(doc(db, "tripInvitations", tripInvitationId(tripId, inviteeUid)), {
-    status: "cancelled",
-    respondedAt: serverTimestamp(),
-  });
+  const callable = httpsCallable<{ invitationId: string }, unknown>(
+    functions,
+    "cancelTripInvitation"
+  );
+  await callable({ invitationId: tripInvitationId(tripId, inviteeUid) });
 }

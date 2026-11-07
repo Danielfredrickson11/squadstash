@@ -33,6 +33,7 @@ import {
   isWellFormedDepartureMatchCandidate,
 } from "../domain/tripMembershipDeparture";
 import type {DepartureType} from "../domain/tripMembershipDeparture";
+import {buildMemberDepartureActivity} from "../domain/tripMembershipActivity";
 import {classifyOwnershipMutationGate} from "../domain/tripOwnershipModel";
 import {classifyLedgerInitialization} from "../domain/savingsLedger";
 import {
@@ -425,6 +426,26 @@ export async function executeTripMembershipDeparture(
       departureData.currencySnapshot = tripData.currency;
     }
     tx.create(departureRef, departureData);
+
+    // Checkpoint 6.8B1: atomically twin the departure with its
+    // membership-activity event, in the SAME transaction as the
+    // memberIds update and the tripMembershipDepartures evidence record
+    // above - never a change to, or weakening of, that independent
+    // immutable security/audit record. Step A's exact-replay check
+    // (above) always returns before this point on a genuine replay, so
+    // this write only ever executes once per (tripId, targetUid) pair,
+    // ever - mirroring tripMembershipDepartures' own identical
+    // at-most-once guarantee.
+    const activity = buildMemberDepartureActivity(
+      tripId,
+      departureType,
+      authUid,
+      targetUid
+    );
+    tx.create(
+      db.collection("tripMembershipActivity").doc(activity.id),
+      {...activity.data, createdAt: FieldValue.serverTimestamp()}
+    );
 
     return {tripId, uid: targetUid, departureType};
   });

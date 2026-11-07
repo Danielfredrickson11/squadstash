@@ -19,6 +19,7 @@ import {
   tripInvitationId,
   tripMembershipAcceptanceId,
 } from "../src/domain/tripCompositeId";
+import {invitationAcceptedActivityId} from "../src/domain/tripMembershipActivity";
 import {CURRENT_TRIP_OWNERSHIP_MODEL_VERSION} from "../src/domain/tripOwnershipModel";
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
@@ -60,6 +61,7 @@ async function clearFirestore(): Promise<void> {
     "tripTerms",
     "tripTermsCurrent",
     "tripMembershipAcceptances",
+    "tripMembershipActivity",
   ]) {
     const snap = await db.collection(name).get();
     await Promise.all(snap.docs.map((d) => d.ref.delete()));
@@ -1102,6 +1104,26 @@ describe("acceptTripInvitationCore - atomic success writes", () => {
     const allocSnap = await db.collection("tripOwnershipAllocations").get();
     assert.equal(allocSnap.size, 0);
   });
+
+  it("creates the exact invitation_accepted membership-activity event (Checkpoint 6.8B1)", async () => {
+    const termsDocId = await seedReadyToAcceptScenario();
+    await acceptTripInvitationCore(db, INVITEE_UID, {
+      invitationId: INVITATION_ID,
+      acceptedTermsDocId: termsDocId,
+    });
+    const snap = await db
+      .collection("tripMembershipActivity")
+      .doc(invitationAcceptedActivityId(TRIP_ID, INVITEE_UID, termsDocId))
+      .get();
+    const data = snap.data()!;
+    assert.equal(data.tripId, TRIP_ID);
+    assert.equal(data.type, "invitation_accepted");
+    assert.equal(data.actorUid, INVITEE_UID);
+    assert.equal(data.targetUid, INVITEE_UID);
+    assert.equal(data.invitationId, INVITATION_ID);
+    assert.equal(data.schemaVersion, 1);
+    assert.ok(data.createdAt instanceof Timestamp);
+  });
 });
 
 describe("acceptTripInvitationCore - idempotent replay", () => {
@@ -1124,6 +1146,10 @@ describe("acceptTripInvitationCore - idempotent replay", () => {
       acceptedTermsDocId: termsDocId,
     });
     assert.deepEqual(second, first);
+
+    // 6.8B1: Branch A (replay) never attempts a second activity write.
+    const activitySnap = await db.collection("tripMembershipActivity").get();
+    assert.equal(activitySnap.size, 1);
 
     const invitationAfter = (
       await db.collection("tripInvitations").doc(INVITATION_ID).get()

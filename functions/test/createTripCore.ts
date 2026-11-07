@@ -19,6 +19,7 @@ import {
 } from "../src/callables/createTrip";
 import { recordSavingsTransactionCore } from "../src/callables/recordSavingsTransaction";
 import { CURRENT_TRIP_OWNERSHIP_MODEL_VERSION } from "../src/domain/tripOwnershipModel";
+import { tripCreatedActivityId } from "../src/domain/tripMembershipActivity";
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
   throw new Error(
@@ -56,6 +57,7 @@ async function clearFirestore(): Promise<void> {
     "savingsTransactions",
     "tripMemberOwnership",
     "tripOwnershipMigrationState",
+    "tripMembershipActivity",
   ]) {
     const snap = await db.collection(name).get();
     await Promise.all(snap.docs.map((d) => d.ref.delete()));
@@ -232,6 +234,41 @@ describe("createTripCore - successful creation", () => {
       await db.collection("trips").doc(clientRequestId).get()
     ).data()!;
     assert.equal(data.location, null);
+  });
+});
+
+describe("createTripCore - membership activity (Checkpoint 6.8B1)", () => {
+  it("a fresh creation atomically creates the exact trip_created activity event", async () => {
+    const clientRequestId = randomUUID();
+    await createTripCore(db, OWNER_UID, baseRequest({ clientRequestId }));
+    const snap = await db
+      .collection("tripMembershipActivity")
+      .doc(tripCreatedActivityId(clientRequestId))
+      .get();
+    const data = snap.data()!;
+    assert.equal(data.tripId, clientRequestId);
+    assert.equal(data.type, "trip_created");
+    assert.equal(data.actorUid, OWNER_UID);
+    assert.equal(data.targetUid, OWNER_UID);
+    assert.equal(data.schemaVersion, 1);
+    assert.ok(data.createdAt instanceof Timestamp);
+    assert.equal("invitationId" in data, false);
+  });
+
+  it("an idempotent replay does not create a second activity event", async () => {
+    const request = baseRequest();
+    await createTripCore(db, OWNER_UID, request);
+    await createTripCore(db, OWNER_UID, request);
+    const snap = await db.collection("tripMembershipActivity").get();
+    assert.equal(snap.size, 1);
+  });
+
+  it("a rejected creation (invalid-argument) creates no activity event", async () => {
+    await assert.rejects(
+      createTripCore(db, OWNER_UID, baseRequest({ title: undefined }))
+    );
+    const snap = await db.collection("tripMembershipActivity").get();
+    assert.equal(snap.size, 0);
   });
 });
 

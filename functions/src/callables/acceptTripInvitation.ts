@@ -11,6 +11,9 @@ import {
   tripInvitationId,
   tripMembershipAcceptanceId,
 } from "../domain/tripCompositeId";
+import {
+  buildInvitationAcceptedActivity,
+} from "../domain/tripMembershipActivity";
 
 type CallableAuth = CallableRequest["auth"];
 
@@ -383,6 +386,24 @@ export async function acceptTripInvitationCore(
       lastUpdatedAt: FieldValue.serverTimestamp(),
       lastUpdatedBy: authUid,
     });
+
+    // Checkpoint 6.8B1: atomically twin the acceptance with its
+    // membership-activity event, in the SAME transaction as the
+    // invitation status transition, the tripMembershipAcceptances
+    // record, and the memberIds update above - Branch B (new
+    // acceptance) only. Branch A (evaluateCompletedReplay, above) never
+    // reaches this point - an already-"accepted" invitation returns
+    // success from that branch without attempting any new write, so a
+    // genuine replay never attempts a second activity tx.create.
+    const activity = buildInvitationAcceptedActivity(
+      invitation.tripId as string,
+      authUid,
+      input.acceptedTermsDocId
+    );
+    tx.create(
+      db.collection("tripMembershipActivity").doc(activity.id),
+      {...activity.data, createdAt: FieldValue.serverTimestamp()}
+    );
 
     return {tripId: invitation.tripId as string};
   });

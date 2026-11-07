@@ -1,9 +1,11 @@
 # Trip Permissions — Architecture Reference
 
 Status: current, frozen (Checkpoint 6.6; extended by Checkpoint 6.7A for
-the social expense-balance aggregate, and by Checkpoint 6.7B1 for
-trusted membership departure — see that section's own explicit
-production-readiness caveat below).
+the social expense-balance aggregate, by Checkpoint 6.7B1 for trusted
+membership departure — see that section's own explicit
+production-readiness caveat below — and by Milestone 6.8 for membership
+activity history, IMPLEMENTED IN BRANCH ONLY as of 6.8D; see that
+section's own explicit not-yet-deployed caveat).
 
 This document is the source of truth for SquadStash's Trip organizational
 role model and the permission matrix it governs. It reflects verified
@@ -287,6 +289,118 @@ ids keyed by `(tripId, uid)`, a departed member cannot currently be
 re-invited to the same Trip. 6.7B1 does not attempt to work around this
 backend-side; it is a real, current limitation to be disclosed in the
 eventual departure UI (6.7C), not silently patched over.
+
+## Membership activity history (Milestone 6.8)
+
+**IMPLEMENTED IN BRANCH ONLY as of Checkpoint 6.8D — not yet deployed to
+production.** This section describes code and Firestore Rules that
+exist in this repository's working tree (backend, client, Rules,
+indexes, admin tooling, and UI, per Checkpoints 6.8A through 6.8D) but
+have not been deployed, and no production data has been written or
+migrated. The final controlled rollout follows the frozen A–G cutover
+contract (6.8A4), not yet executed — see that checkpoint's own sequence
+and "Proposed A–G production rollout checklist" in the 6.8D report for
+the exact commands this will eventually require.
+
+### `tripMembershipActivity` — a human-readable membership log, separate from `tripMembershipDepartures`
+
+A new top-level collection, `tripMembershipActivity/{activityId}`,
+records a human-readable history of Trip membership events for display
+in the SquadStash UI. It is a **parallel, narrower-purpose log**,
+entirely separate from the pre-existing `tripMembershipDepartures`
+collection described above — that collection remains completely
+untouched, unmodified, and still the sole immutable security/audit
+evidence for leave/remove events; `tripMembershipActivity` is never
+consulted for any authorization decision anywhere in this codebase, and
+`tripMembershipDepartures` is never read by, or exposed through, the
+new activity UI.
+
+Seven REAL event types, each written exclusively inside the same
+trusted-backend transaction as the authoritative mutation it twins
+(`createTripCore`, `createTripInvitationCore`,
+`acceptTripInvitationCore`, the new `declineTripInvitationCore`/
+`cancelTripInvitationCore`, and `executeTripMembershipDeparture`):
+`trip_created`, `invitation_created`, `invitation_accepted`,
+`invitation_declined`, `invitation_cancelled`, `member_left`,
+`member_removed`. Every activity document id is deterministic
+(`"{eventType}:{authoritativeId}"`, reusing each event's own existing
+authoritative composite-id formula) — never random, and the document's
+own `id` is never duplicated as a field inside its persisted data (that
+distinction is enforced by a dedicated client-side parser check, not
+merely convention).
+
+One SYSTEM/backfill event type, `history_tracking_started`, with
+`actorUid`/`targetUid` both exactly `null` — never attributed to a
+human uid. Its approved UI copy is exactly: **"Complete membership
+activity is tracked from this point forward."** It means the boundary
+after which membership activity for that Trip is guaranteed complete —
+never that no earlier activity exists; a pre-cutover Trip may have
+genuine real events recorded before this marker. It is written, at
+most once per Trip, only by the offline admin tool
+`functions/src/admin/backfillTripMembershipActivity.ts` (Phase G of the
+cutover contract) — never automatically, never for a Trip that already
+has a genuine `trip_created` event (which proves it was created under
+the new activity-aware `createTrip` and needs no marker at all).
+
+Explicitly **not** implemented, by deliberate scope decision, not
+oversight: no persisted `invitation_expired` event (expiry remains a
+derived fact from `expiresAt`, exactly as before 6.8 — see "Current
+permission matrix" above); no `member_role_changed` event (no mutable
+organizational role exists — see "Organizational roles" above; this
+event type would require a role system this document already states
+was deliberately rejected); no re-invite support (an invitation's
+deterministic `{tripId}_{inviteeUid}` id remains a lifetime-unique key
+once resolved — unchanged from the pre-6.8 model described under
+"Rejoin is currently terminal" above).
+
+### Firestore Rules: current-member-only reads, all client writes denied
+
+```
+match /tripMembershipActivity/{activityId} {
+  allow get, list: if resource.data.tripId is string
+    && canAccessTripById(resource.data.tripId);
+  allow create, update, delete: if false;
+}
+```
+
+Reuses the pre-existing `canAccessTripById(tripId)` cross-collection
+helper verbatim (already used by `tripExpenses`/`tripExpenseSplits`) —
+no new Rules helper was introduced. Read access follows exactly the
+same "current Trip member or owner" rule as every other Trip-scoped
+financial collection: a former member (removed from `memberIds`) and a
+pending/declined/cancelled invitee (never added to `memberIds`) are
+both denied, by construction, the same way they are denied everywhere
+else in this document. Writes are unconditionally denied for every
+role, including the Trip owner — the trusted backend transactions that
+write real events, and the offline backfill tool that writes the
+system marker, both use the Admin SDK, which bypasses these Rules
+entirely.
+
+### `declineTripInvitation`/`cancelTripInvitation`: moved to trusted callables, with a temporary rollout compatibility window
+
+Both transitions are now trusted Cloud Functions
+(`functions/src/callables/declineTripInvitation.ts`/
+`cancelTripInvitation.ts`), each atomically twinning its invitation
+status change with the matching `invitation_declined`/
+`invitation_cancelled` activity event. **The legacy direct-client
+Firestore Rules clauses that previously authorized these same two
+transitions remain intentionally, temporarily open** — this is a
+deliberate rollout-compatibility decision (6.8A3), not an oversight:
+during the production cutover window, old and new client builds must
+both keep working, so the old Rules path is only closed in cutover
+Phase F, after the new callables are deployed, the client has cut over
+to them, and old-client-distribution risk is confirmed resolved. As of
+this document's current state, that closure has **not** happened —
+both paths currently coexist in the Rules file.
+
+### Client UI scope
+
+The new `MemberActivitySection` (`components/trips/
+MemberActivitySection.tsx`) is **Trip-membership-specific** — it
+renders only the seven real event types plus the system marker, for one
+Trip's membership history. It is not, and does not replace, any future
+general-purpose cross-Trip Activity Feed that a later milestone may
+introduce.
 
 ## Archive semantics
 

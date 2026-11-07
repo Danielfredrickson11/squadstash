@@ -532,13 +532,16 @@ describe("TripInvitationsSection - Cancel action (Checkpoint 6.5)", () => {
     expect(text).toContain("Oct 30");
   });
 
-  it("a permission-denied race triggers a refetch and shows the safe state-changed notice", async () => {
+  it("a functions/failed-precondition race triggers a refetch and shows the safe state-changed notice", async () => {
     mockedFetch.mockResolvedValueOnce([makeInvitation({ status: "pending" })]);
     let tree!: ReturnType<typeof create>;
     await act(async () => {
       tree = create(<TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} />);
     });
-    mockedCancel.mockRejectedValue({ code: "permission-denied" });
+    // Checkpoint 6.8B2: cancelTripInvitation is now the trusted callable;
+    // a stale/terminal-state race reports "functions/failed-precondition",
+    // not the old direct-write Rules' uniform "permission-denied".
+    mockedCancel.mockRejectedValue({ code: "functions/failed-precondition" });
 
     act(() => {
       (

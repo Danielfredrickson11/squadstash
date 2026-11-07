@@ -20,6 +20,7 @@ import {
   createTripInvitationCore,
   requireAuthenticatedUid,
 } from "../src/callables/createTripInvitation";
+import {invitationCreatedActivityId} from "../src/domain/tripMembershipActivity";
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
   throw new Error(
@@ -52,7 +53,7 @@ after(async () => {
 });
 
 async function clearFirestore(): Promise<void> {
-  for (const name of ["trips", "tripInvitations"]) {
+  for (const name of ["trips", "tripInvitations", "tripMembershipActivity"]) {
     const snap = await db.collection(name).get();
     await Promise.all(snap.docs.map((d) => d.ref.delete()));
   }
@@ -446,5 +447,43 @@ describe("createTripInvitationCore - persisted document shape", () => {
     await createTripInvitationCore(db, OWNER_UID, baseRequest(), fakeResolveInviteeUid);
     const tripSnap = await db.collection("trips").doc(TRIP_ID).get();
     assert.deepEqual(tripSnap.data()!.memberIds, [OWNER_UID]);
+  });
+});
+
+describe("createTripInvitationCore - membership activity (Checkpoint 6.8B1)", () => {
+  it("a successful new invitation atomically creates the exact invitation_created activity event", async () => {
+    await seedTrip(TRIP_ID);
+    await createTripInvitationCore(db, OWNER_UID, baseRequest(), fakeResolveInviteeUid);
+    const snap = await db
+      .collection("tripMembershipActivity")
+      .doc(invitationCreatedActivityId(TRIP_ID, INVITEE_UID))
+      .get();
+    const data = snap.data()!;
+    assert.equal(data.tripId, TRIP_ID);
+    assert.equal(data.type, "invitation_created");
+    assert.equal(data.actorUid, OWNER_UID);
+    assert.equal(data.targetUid, INVITEE_UID);
+    assert.equal(data.invitationId, `${TRIP_ID}_${INVITEE_UID}`);
+    assert.equal(data.schemaVersion, 1);
+  });
+
+  it("a rejected second invitation attempt for the same pair creates no second activity event", async () => {
+    await seedTrip(TRIP_ID);
+    await createTripInvitationCore(db, OWNER_UID, baseRequest(), fakeResolveInviteeUid);
+    await assertRejectsWithCode(
+      createTripInvitationCore(db, OWNER_UID, baseRequest(), fakeResolveInviteeUid),
+      "already-exists"
+    );
+    const snap = await db.collection("tripMembershipActivity").get();
+    assert.equal(snap.size, 1);
+  });
+
+  it("a rejected request (not-found Trip) creates no activity event", async () => {
+    await assertRejectsWithCode(
+      createTripInvitationCore(db, OWNER_UID, baseRequest(), fakeResolveInviteeUid),
+      "not-found"
+    );
+    const snap = await db.collection("tripMembershipActivity").get();
+    assert.equal(snap.size, 0);
   });
 });

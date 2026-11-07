@@ -12,6 +12,7 @@ export * from "./invitation";
 export * from "./tripTerms";
 export * from "./tripInvitation";
 export * from "./tripMembershipAcceptance";
+export * from "./tripMembershipActivity";
 // Checkpoint 5B.1: the trusted per-member Shared-Stash ownership cache
 // schema - see docs/audits/TRIP_WALLET_OWNERSHIP_WITHDRAWAL_PREFLIGHT_
 // 2026-10-08.md §12. TripOwnershipModelState itself lives on ./trip

@@ -102,6 +102,7 @@ import { RecordSettlementDialog } from "../../../../components/balances/RecordSe
 import { SettlementRow, type SettlementRowFromMember } from "../../../../components/balances/SettlementRow";
 import { ReverseSettlementDialog } from "../../../../components/balances/ReverseSettlementDialog";
 import { TripMembersSection } from "../../../../components/trips/TripMembersSection";
+import { MemberActivitySection } from "../../../../components/trips/MemberActivitySection";
 import { TripInvitationsSection } from "../../../../components/trips/TripInvitationsSection";
 import { TripTermsSection } from "../../../../components/trips/TripTermsSection";
 import { LeaveTripDialog } from "../../../../components/trips/LeaveTripDialog";
@@ -2300,6 +2301,15 @@ export default function TripDetails() {
               isArchived={isArchived}
               onRemoved={onMemberRemoved}
             />
+
+            {/* Checkpoint 6.8C: read-only membership-activity history,
+                placed directly below the current-members card so the
+                member-management area reads as one coherent group:
+                current members, invitations/controls, then history.
+                Never makes its own authorization decision - Firestore
+                Rules (6.8B3) remain the sole authority (see
+                components/trips/MemberActivitySection.tsx). */}
+            <MemberActivitySection tripId={tripId} />
 
             {/* Checkpoint 6.4/6.5: owner-only, outgoing-invitation status
                 history, with a Cancel action on effective-pending rows

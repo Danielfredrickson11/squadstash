@@ -18,3 +18,5 @@ export {recordTripSettlement} from "./callables/recordTripSettlement";
 export {reverseTripSettlement} from "./callables/reverseTripSettlement";
 export {leaveTrip} from "./callables/leaveTrip";
 export {removeTripMember} from "./callables/removeTripMember";
+export {declineTripInvitation} from "./callables/declineTripInvitation";
+export {cancelTripInvitation} from "./callables/cancelTripInvitation";
