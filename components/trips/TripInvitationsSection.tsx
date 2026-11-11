@@ -121,10 +121,28 @@ export function TripInvitationsSection({
   tripId,
   ownerId,
   isOwner,
+  refreshToken,
+  onInvitationActivityChanged,
 }: {
   tripId: string;
   ownerId: string | null | undefined;
   isOwner: boolean;
+  // Checkpoint 6.8 review fix: bumped by the parent (Trip Detail)
+  // whenever a sibling same-screen mutation (currently: a successful
+  // createTripInvitation via TripMembersSection) means this card's own
+  // list is now stale. Folded into the SAME useFocusEffect-driven load()
+  // this component already uses for route-focus refresh - never a
+  // second, independent fetch path - so a bump while this screen is not
+  // focused simply takes effect the next time it IS focused, exactly
+  // like every other focus-driven reload here.
+  refreshToken?: number;
+  // Checkpoint 6.8 review fix: called once after a successful trusted
+  // cancel (never on the stale-state/failed-precondition race, which
+  // already re-fetches this component's own list for a reason unrelated
+  // to a mutation THIS caller performed). Lets the parent refresh
+  // MemberActivitySection without this component reaching into that
+  // sibling's state itself.
+  onInvitationActivityChanged?: () => void;
 }) {
   const theme = useTheme();
   const colors = useSemanticColors();
@@ -166,10 +184,16 @@ export function TripInvitationsSection({
   // screen still re-triggers this the same way TripTermsSection/
   // TripMembersSection already rely on).
   useFocusEffect(
+    // refreshToken is intentionally a dependency though unused in the
+    // body - its only purpose is to change this callback's identity so
+    // the effect re-runs (and, while focused, re-fires immediately) on
+    // a parent-signaled sibling mutation, exactly as a real refocus
+    // already does.
     useCallback(() => {
       if (!isOwner) return;
       load();
-    }, [isOwner, load])
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isOwner, load, refreshToken])
   );
 
   useEffect(() => {
@@ -194,15 +218,27 @@ export function TripInvitationsSection({
   const onCancelled = useCallback(() => {
     setSelectedForCancel(null);
     load();
-  }, [load]);
+    onInvitationActivityChanged?.();
+  }, [load, onInvitationActivityChanged]);
 
+  // Checkpoint 6.8 review fix (correction 2): a failed-precondition race
+  // means the invitation's AUTHORITATIVE state already changed server-
+  // side (most plausibly another terminal transition raced ahead of
+  // this client) - that other transition may already have written its
+  // own real activity event, so this is a read-refresh request, never a
+  // claim that THIS caller's cancellation itself succeeded. Still never
+  // fires for a generic/permission/network failure (see
+  // CancelTripInvitationDialog's own onConfirm - only this exact
+  // onStateChanged signal corresponds to a detected authoritative-state
+  // race).
   const onCancelStateChanged = useCallback(
     (message: string) => {
       setSelectedForCancel(null);
       setStateChangedNotice(message);
       load();
+      onInvitationActivityChanged?.();
     },
-    [load]
+    [load, onInvitationActivityChanged]
   );
 
   if (!isOwner) {

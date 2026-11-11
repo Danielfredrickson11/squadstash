@@ -299,6 +299,103 @@ describe("TripMembersSection - Invite Member entry point (Checkpoint 6.2)", () =
     expect(text).toContain("1 member on this trip");
     expect(text).toContain("Dana Owner");
   });
+
+  it("Checkpoint 6.8 review fix: a successful invitation calls the parent's onInvitationSent exactly once", async () => {
+    mockedSubscribe.mockImplementation(() => () => {});
+    mockedFetchTerms.mockResolvedValue(makeTerms());
+    mockedCreateInvitation.mockResolvedValue({
+      invitationId: "trip-1_invitee-uid",
+      inviteeUid: "invitee-uid",
+    });
+    const onInvitationSent = jest.fn();
+
+    const tree = renderSection({
+      isOwner: true,
+      isArchived: false,
+      memberIds: ["owner-1"],
+      onInvitationSent,
+    });
+
+    act(() => {
+      (findByLabel(tree, "Invite Member").props.onPress as () => void)();
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    act(() => {
+      (findByLabel(tree, "Email address").props.onChangeText as (t: string) => void)(
+        "sam@example.com"
+      );
+    });
+    await act(async () => {
+      await (findByLabel(tree, "Send Invitation").props.onPress as () => Promise<void>)();
+    });
+
+    expect(onInvitationSent).toHaveBeenCalledTimes(1);
+  });
+
+  it("Checkpoint 6.8 review fix: closing the Invite dialog without sending never calls onInvitationSent", async () => {
+    mockedSubscribe.mockImplementation(() => () => {});
+    mockedFetchTerms.mockResolvedValue(makeTerms());
+    const onInvitationSent = jest.fn();
+
+    const tree = renderSection({
+      isOwner: true,
+      isArchived: false,
+      memberIds: ["owner-1"],
+      onInvitationSent,
+    });
+
+    act(() => {
+      (findByLabel(tree, "Invite Member").props.onPress as () => void)();
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    act(() => {
+      (findByLabel(tree, "Cancel").props.onPress as () => void)();
+    });
+
+    expect(onInvitationSent).not.toHaveBeenCalled();
+    expect(mockedCreateInvitation).not.toHaveBeenCalled();
+  });
+
+  it("Checkpoint 6.8 review fix: a failed invitation attempt never calls onInvitationSent", async () => {
+    mockedSubscribe.mockImplementation(() => () => {});
+    mockedFetchTerms.mockResolvedValue(makeTerms());
+    mockedCreateInvitation.mockRejectedValue({ code: "functions/already-exists" });
+    const onInvitationSent = jest.fn();
+
+    const tree = renderSection({
+      isOwner: true,
+      isArchived: false,
+      memberIds: ["owner-1"],
+      onInvitationSent,
+    });
+
+    act(() => {
+      (findByLabel(tree, "Invite Member").props.onPress as () => void)();
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    act(() => {
+      (findByLabel(tree, "Email address").props.onChangeText as (t: string) => void)(
+        "sam@example.com"
+      );
+    });
+    await act(async () => {
+      await (findByLabel(tree, "Send Invitation").props.onPress as () => Promise<void>)();
+    });
+
+    expect(onInvitationSent).not.toHaveBeenCalled();
+  });
 });
 
 describe("TripMembersSection - Remove Member entry point (Checkpoint 6.7C)", () => {

@@ -53,6 +53,7 @@ export function TripMembersSection({
   isOwner,
   isArchived,
   onRemoved,
+  onInvitationSent,
 }: {
   tripId: string;
   ownerId: string | null | undefined;
@@ -67,6 +68,17 @@ export function TripMembersSection({
   // app/(tabs)/trips/[tripId]/index.tsx's own optimistic-patch
   // convention, matching saveDates).
   onRemoved?: (targetUid: string) => void;
+  // Checkpoint 6.8 review fix: called exactly once after a successful
+  // createTripInvitation call (never on a dismissed/failed dialog) -
+  // this component owns no invitation-list/activity state itself, so it
+  // cannot refresh TripInvitationsSection/MemberActivitySection on its
+  // own. The parent (Trip Detail) uses this to bump its own refresh
+  // signal(s) for those sibling, read-only sections - see this
+  // checkpoint's own bug report for why that refresh was previously
+  // missing entirely (opening this card's Invite Member modal never
+  // blurs/refocuses the route, so TripInvitationsSection's
+  // useFocusEffect-based reload never re-ran on its own).
+  onInvitationSent?: () => void;
 }) {
   const theme = useTheme();
   const colors = useSemanticColors();
@@ -83,10 +95,14 @@ export function TripMembersSection({
     setInviteDialogOpen(false);
   }, []);
 
-  const onInvitationSent = useCallback((normalizedEmail: string) => {
-    setInviteDialogOpen(false);
-    setInvitedEmailNotice(normalizedEmail);
-  }, []);
+  const handleInviteDialogSent = useCallback(
+    (normalizedEmail: string) => {
+      setInviteDialogOpen(false);
+      setInvitedEmailNotice(normalizedEmail);
+      onInvitationSent?.();
+    },
+    [onInvitationSent]
+  );
 
   // Checkpoint 6.7C: per-row target state + a single shared dialog
   // instance at the bottom of this card - mirrors
@@ -256,7 +272,7 @@ export function TripMembersSection({
         visible={inviteDialogOpen}
         tripId={tripId}
         onClose={onCloseInviteDialog}
-        onSent={onInvitationSent}
+        onSent={handleInviteDialogSent}
       />
 
       <RemoveTripMemberDialog

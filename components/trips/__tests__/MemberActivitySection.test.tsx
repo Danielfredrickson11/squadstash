@@ -496,6 +496,134 @@ describe("MemberActivitySection - lifecycle/unmount safety", () => {
     expect(text.match(/created the Trip/g)?.length).toBe(1);
   });
 
+  it("Checkpoint 6.8 review fix: a refreshToken bump re-fetches the first page and replaces it with the refreshed result", async () => {
+    mockedFetchPage.mockResolvedValueOnce(fakePage([fakeEvent({ id: "a1", type: "trip_created" })]));
+    let tree!: ReturnType<typeof create>;
+    act(() => {
+      tree = create(<MemberActivitySection tripId="trip-1" refreshToken={0} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(collectText(tree.toJSON() as JsonNode)).toContain("created the Trip");
+    expect(collectText(tree.toJSON() as JsonNode)).not.toContain("invited");
+
+    mockedFetchPage.mockResolvedValueOnce(
+      fakePage([
+        fakeEvent({ id: "a1", type: "trip_created" }),
+        fakeEvent({
+          id: "a2",
+          type: "invitation_created",
+          actorUid: "owner-1",
+          targetUid: "invitee-1",
+          invitationId: "x",
+        } as never),
+      ])
+    );
+    act(() => {
+      tree.update(<MemberActivitySection tripId="trip-1" refreshToken={1} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(mockedFetchPage).toHaveBeenCalledTimes(2);
+    const text = collectText(tree.toJSON() as JsonNode);
+    expect(text).toContain("created the Trip");
+    expect(text).toContain("invited");
+  });
+
+  it("Checkpoint 6.8 review fix: initial mount with a refreshToken prop present issues exactly one fetch", async () => {
+    mockedFetchPage.mockResolvedValueOnce(fakePage([fakeEvent()]));
+    act(() => {
+      create(<MemberActivitySection tripId="trip-1" refreshToken={0} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(mockedFetchPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("Checkpoint 6.8 review fix: a stale prior request cannot overwrite a newer refreshToken-triggered result", async () => {
+    const staleDeferred = deferred<ReturnType<typeof fakePage>>();
+    mockedFetchPage.mockReturnValueOnce(staleDeferred.promise as never);
+    let tree!: ReturnType<typeof create>;
+    act(() => {
+      tree = create(<MemberActivitySection tripId="trip-1" refreshToken={0} />);
+    });
+
+    mockedFetchPage.mockResolvedValueOnce(
+      fakePage([fakeEvent({ id: "fresh", type: "member_left", actorUid: "invitee-1", targetUid: "invitee-1" })])
+    );
+    act(() => {
+      tree.update(<MemberActivitySection tripId="trip-1" refreshToken={1} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(collectText(tree.toJSON() as JsonNode)).toContain("left the Trip");
+
+    await act(async () => {
+      staleDeferred.resolve(fakePage([fakeEvent({ id: "stale", type: "trip_created" })]));
+      await Promise.resolve();
+    });
+
+    const text = collectText(tree.toJSON() as JsonNode);
+    expect(text).toContain("left the Trip");
+    expect(text).not.toContain("created the Trip");
+  });
+
+  it("Checkpoint 6.8 review fix: pagination state (Load more) is preserved correctly after a refreshToken-triggered first-page replacement", async () => {
+    mockedFetchPage.mockResolvedValueOnce(
+      fakePage([fakeEvent({ id: "a1" })], { hasMore: true, nextCursor: { __type: "cursor-1" } })
+    );
+    let tree!: ReturnType<typeof create>;
+    act(() => {
+      tree = create(<MemberActivitySection tripId="trip-1" refreshToken={0} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(findByLabel(tree, "Load more activity")).not.toBeNull();
+
+    mockedFetchPage.mockResolvedValueOnce(fakePage([fakeEvent({ id: "a1" })], { hasMore: false }));
+    act(() => {
+      tree.update(<MemberActivitySection tripId="trip-1" refreshToken={1} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    // The refreshed first page reports hasMore: false - Load More must
+    // reflect the NEW page's own cursor/hasMore state, never a stale
+    // leftover from before the refresh.
+    expect(findByLabel(tree, "Load more activity")).toBeNull();
+
+    mockedFetchPage.mockResolvedValueOnce(
+      fakePage([fakeEvent({ id: "a2", type: "member_left", actorUid: "invitee-1", targetUid: "invitee-1" })], {
+        hasMore: true,
+        nextCursor: { __type: "cursor-2" },
+      })
+    );
+    act(() => {
+      tree.update(<MemberActivitySection tripId="trip-1" refreshToken={2} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(findByLabel(tree, "Load more activity")).not.toBeNull();
+
+    mockedFetchPage.mockResolvedValueOnce(
+      fakePage([fakeEvent({ id: "a3", type: "member_removed", actorUid: "owner-1", targetUid: "invitee-1" })], {
+        hasMore: false,
+      })
+    );
+    await act(async () => {
+      (requireByLabel(tree, "Load more activity").props.onPress as () => void)();
+      await Promise.resolve();
+    });
+    expect(mockedFetchPage).toHaveBeenNthCalledWith(4, "trip-1", { cursor: { __type: "cursor-2" } });
+  });
+
   it("a stale profile-resolution error note does not persist once tripId changes to a Trip with no resolvable uids (6.8D lifecycle fix)", async () => {
     mockedFetchPage.mockResolvedValueOnce(fakePage([fakeEvent()]));
     mockedSubscribe.mockImplementation((_uids, _onChange, onError) => {

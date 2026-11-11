@@ -440,6 +440,37 @@ export default function TripDetails() {
         ? { ...prev, memberIds: (prev.memberIds ?? []).filter((uid) => uid !== targetUid) }
         : prev
     );
+    // Checkpoint 6.8 review fix (correction 1): a successful removal is
+    // another same-screen authoritative mutation (RemoveTripMemberDialog's
+    // own Modal, never a navigation push) that writes a real
+    // member_removed activity event - reuses the SAME
+    // membershipActivityRefreshToken bump MemberActivitySection already
+    // responds to, never a new sibling coupling or a second token.
+    setMembershipActivityRefreshToken((n) => n + 1);
+  }, []);
+
+  // Checkpoint 6.8 review fix: this screen stays mounted/focused for
+  // every invite-creation and cancel action (both are same-screen Modal
+  // dialogs, never a navigation push), so TripInvitationsSection's
+  // existing useFocusEffect-based reload and MemberActivitySection's
+  // plain tripId-keyed effect never re-ran on their own after either
+  // mutation (see this checkpoint's own bug report). Two separate
+  // monotonic tokens, matching this file's own established retryNonce
+  // convention (e.g. expenseRetryNonce/settlementHistoryRetryNonce
+  // above) - kept separate, not one shared token, so a cancel's own
+  // already-correct local reload in TripInvitationsSection is never
+  // redundantly re-triggered a second time by the same signal that
+  // refreshes MemberActivitySection.
+  const [invitationsRefreshToken, setInvitationsRefreshToken] = useState(0);
+  const [membershipActivityRefreshToken, setMembershipActivityRefreshToken] = useState(0);
+
+  const onInvitationCreated = useCallback(() => {
+    setInvitationsRefreshToken((n) => n + 1);
+    setMembershipActivityRefreshToken((n) => n + 1);
+  }, []);
+
+  const onInvitationActivityChanged = useCallback(() => {
+    setMembershipActivityRefreshToken((n) => n + 1);
   }, []);
 
   const startEditDates = useCallback(() => {
@@ -2300,6 +2331,7 @@ export default function TripDetails() {
               isOwner={isOwner}
               isArchived={isArchived}
               onRemoved={onMemberRemoved}
+              onInvitationSent={onInvitationCreated}
             />
 
             {/* Checkpoint 6.8C: read-only membership-activity history,
@@ -2309,7 +2341,7 @@ export default function TripDetails() {
                 Never makes its own authorization decision - Firestore
                 Rules (6.8B3) remain the sole authority (see
                 components/trips/MemberActivitySection.tsx). */}
-            <MemberActivitySection tripId={tripId} />
+            <MemberActivitySection tripId={tripId} refreshToken={membershipActivityRefreshToken} />
 
             {/* Checkpoint 6.4/6.5: owner-only, outgoing-invitation status
                 history, with a Cancel action on effective-pending rows
@@ -2317,7 +2349,13 @@ export default function TripDetails() {
                 has never sent an invitation (see components/trips/
                 TripInvitationsSection.tsx). No Invite-Again action - the
                 existing re-invite limitation remains unchanged. */}
-            <TripInvitationsSection tripId={tripId} ownerId={trip.ownerId} isOwner={isOwner} />
+            <TripInvitationsSection
+              tripId={tripId}
+              ownerId={trip.ownerId}
+              isOwner={isOwner}
+              refreshToken={invitationsRefreshToken}
+              onInvitationActivityChanged={onInvitationActivityChanged}
+            />
 
             {/* Checkpoint 6.3: compact summary card only - the full
                 five-field view/edit/review flow lives on its own

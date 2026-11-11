@@ -56,7 +56,22 @@ type LoadMoreStatus = "idle" | "loading" | "error";
 
 const EMPTY_PROFILES: Map<string, PublicProfile> = new Map();
 
-export function MemberActivitySection({ tripId }: { tripId: string }) {
+export function MemberActivitySection({
+  tripId,
+  refreshToken,
+}: {
+  tripId: string;
+  // Checkpoint 6.8 review fix: bumped by the parent (Trip Detail)
+  // whenever a sibling same-screen mutation (a successful invitation
+  // creation or cancellation) means this feed's first page is now
+  // stale. Folded into the SAME initial-load effect/request-generation
+  // guard this component already uses for tripId changes/manual Retry -
+  // never a second, independent fetch path. A refresh always replaces
+  // the first page (matching this effect's existing semantics for a
+  // tripId change or Retry) rather than attempting to merge/patch the
+  // already-loaded feed.
+  refreshToken?: number;
+}) {
   const theme = useTheme();
   const colors = useSemanticColors();
 
@@ -108,7 +123,7 @@ export function MemberActivitySection({ tripId }: { tripId: string }) {
         console.error("MemberActivitySection: initial load failed:", err);
         setPageState({ status: "error" });
       });
-  }, [tripId, retryNonce]);
+  }, [tripId, retryNonce, refreshToken]);
 
   const retry = useCallback(() => setRetryNonce((n) => n + 1), []);
 

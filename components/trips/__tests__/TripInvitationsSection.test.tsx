@@ -21,9 +21,16 @@ jest.mock("expo-router", () => {
   return {
     useFocusEffect: (effect: () => void) => {
       mockFocusEffectCallback = effect;
+      // Checkpoint 6.8 review fix: depend on `effect` itself (mirroring
+      // real react-navigation useFocusEffect, which re-runs whenever the
+      // passed-in callback's identity changes while already focused) -
+      // not an empty array - so a refreshToken-driven identity change
+      // auto-fires exactly like a real refocus, alongside this mock's
+      // existing manual mockFocusEffectCallback escape hatch for tests
+      // that simulate an actual navigation blur/refocus explicitly.
       ReactActual.useEffect(() => {
         effect();
-      }, []);
+      }, [effect]);
     },
   };
 });
@@ -564,5 +571,200 @@ describe("TripInvitationsSection - Cancel action (Checkpoint 6.5)", () => {
     const text = collectText(tree.toJSON() as JsonNode);
     expect(text).toContain("This invitation has already changed");
     expect(text).toContain("Accepted");
+  });
+
+  it("Checkpoint 6.8 review fix: a successful cancellation notifies the parent via onInvitationActivityChanged", async () => {
+    mockedFetch.mockResolvedValueOnce([makeInvitation({ status: "pending" })]);
+    const onInvitationActivityChanged = jest.fn();
+    let tree!: ReturnType<typeof create>;
+    await act(async () => {
+      tree = create(
+        <TripInvitationsSection
+          tripId="trip-1"
+          ownerId="owner-1"
+          isOwner={true}
+          onInvitationActivityChanged={onInvitationActivityChanged}
+        />
+      );
+    });
+    mockedCancel.mockResolvedValue(undefined);
+
+    act(() => {
+      (
+        findByLabel(tree, "Cancel invitation to invitee@example.com").props
+          .onPress as () => void
+      )();
+    });
+
+    mockedFetch.mockResolvedValueOnce([
+      makeInvitation({
+        status: "cancelled",
+        respondedAt: fakeTimestamp(new Date("2026-10-30T12:00:00Z")),
+      }),
+    ]);
+    await act(async () => {
+      await (findByLabel(tree, "Cancel Invitation").props.onPress as () => Promise<void>)();
+    });
+
+    expect(onInvitationActivityChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("Checkpoint 6.8 review fix (correction 2): a failed-precondition race ALSO calls onInvitationActivityChanged, since authoritative state already changed server-side", async () => {
+    mockedFetch.mockResolvedValueOnce([makeInvitation({ status: "pending" })]);
+    const onInvitationActivityChanged = jest.fn();
+    let tree!: ReturnType<typeof create>;
+    await act(async () => {
+      tree = create(
+        <TripInvitationsSection
+          tripId="trip-1"
+          ownerId="owner-1"
+          isOwner={true}
+          onInvitationActivityChanged={onInvitationActivityChanged}
+        />
+      );
+    });
+    mockedCancel.mockRejectedValue({ code: "functions/failed-precondition" });
+
+    act(() => {
+      (
+        findByLabel(tree, "Cancel invitation to invitee@example.com").props
+          .onPress as () => void
+      )();
+    });
+
+    mockedFetch.mockResolvedValueOnce([
+      makeInvitation({
+        status: "accepted",
+        respondedAt: fakeTimestamp(new Date("2026-10-30T12:00:00Z")),
+      }),
+    ]);
+    await act(async () => {
+      await (findByLabel(tree, "Cancel Invitation").props.onPress as () => Promise<void>)();
+    });
+
+    expect(onInvitationActivityChanged).toHaveBeenCalledTimes(1);
+    // The user-facing stale-state copy itself is unchanged by this
+    // correction - still the exact frozen safe message, never implying
+    // this caller's own cancellation succeeded.
+    const text = collectText(tree.toJSON() as JsonNode);
+    expect(text).toContain("This invitation has already changed");
+  });
+
+  it("Checkpoint 6.8 review fix: a generic/non-race cancellation failure never calls onInvitationActivityChanged", async () => {
+    mockedFetch.mockResolvedValueOnce([makeInvitation({ status: "pending" })]);
+    const onInvitationActivityChanged = jest.fn();
+    let tree!: ReturnType<typeof create>;
+    await act(async () => {
+      tree = create(
+        <TripInvitationsSection
+          tripId="trip-1"
+          ownerId="owner-1"
+          isOwner={true}
+          onInvitationActivityChanged={onInvitationActivityChanged}
+        />
+      );
+    });
+    mockedCancel.mockRejectedValue({ code: "functions/internal" });
+
+    act(() => {
+      (
+        findByLabel(tree, "Cancel invitation to invitee@example.com").props
+          .onPress as () => void
+      )();
+    });
+    await act(async () => {
+      await (findByLabel(tree, "Cancel Invitation").props.onPress as () => Promise<void>)();
+    });
+
+    expect(onInvitationActivityChanged).not.toHaveBeenCalled();
+  });
+});
+
+describe("TripInvitationsSection - Checkpoint 6.8 review fix: parent-signaled refresh", () => {
+  it("initially empty can later refresh and render a newly created pending invitation, with Cancel reachable", async () => {
+    mockedFetch.mockResolvedValueOnce([]);
+    let tree!: ReturnType<typeof create>;
+    await act(async () => {
+      tree = create(
+        <TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} refreshToken={0} />
+      );
+    });
+    // Zero invitations ever sent -> renders nothing, matching the
+    // existing frozen empty-state invariant.
+    expect(tree.toJSON()).toBeNull();
+
+    mockedFetch.mockResolvedValueOnce([makeInvitation({ status: "pending" })]);
+    await act(async () => {
+      tree.update(
+        <TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} refreshToken={1} />
+      );
+    });
+
+    expect(mockedFetch).toHaveBeenCalledTimes(2);
+    const text = collectText(tree.toJSON() as JsonNode);
+    expect(text).toContain("invitee@example.com");
+    expect(text).toContain("Pending");
+    expect(() => findByLabel(tree, "Cancel invitation to invitee@example.com")).not.toThrow();
+  });
+
+  it("bumping refreshToken while already rendered re-issues exactly one fetch", async () => {
+    mockedFetch.mockResolvedValueOnce([makeInvitation({ status: "pending" })]);
+    let tree!: ReturnType<typeof create>;
+    await act(async () => {
+      tree = create(
+        <TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} refreshToken={0} />
+      );
+    });
+    expect(mockedFetch).toHaveBeenCalledTimes(1);
+
+    mockedFetch.mockResolvedValueOnce([makeInvitation({ status: "pending" })]);
+    await act(async () => {
+      tree.update(
+        <TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} refreshToken={1} />
+      );
+    });
+    expect(mockedFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("initial mount with a refreshToken prop present issues exactly one fetch (no duplicate initial request)", async () => {
+    mockedFetch.mockResolvedValueOnce([makeInvitation({ status: "pending" })]);
+    await act(async () => {
+      create(
+        <TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} refreshToken={0} />
+      );
+    });
+    expect(mockedFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("a stale earlier request cannot overwrite a newer refreshToken-triggered result", async () => {
+    let resolveStale!: (invitations: TripInvitation[]) => void;
+    mockedFetch.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveStale = resolve))
+    );
+    let tree!: ReturnType<typeof create>;
+    await act(async () => {
+      tree = create(
+        <TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} refreshToken={0} />
+      );
+    });
+
+    mockedFetch.mockResolvedValueOnce([
+      makeInvitation({ inviteeEmail: "fresh@example.com", status: "pending" }),
+    ]);
+    await act(async () => {
+      tree.update(
+        <TripInvitationsSection tripId="trip-1" ownerId="owner-1" isOwner={true} refreshToken={1} />
+      );
+    });
+    expect(collectText(tree.toJSON() as JsonNode)).toContain("fresh@example.com");
+
+    await act(async () => {
+      resolveStale([makeInvitation({ inviteeEmail: "stale@example.com" })]);
+      await Promise.resolve();
+    });
+
+    const text = collectText(tree.toJSON() as JsonNode);
+    expect(text).toContain("fresh@example.com");
+    expect(text).not.toContain("stale@example.com");
   });
 });
