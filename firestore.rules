@@ -590,11 +590,27 @@ service cloud.firestore {
     // (see the trusted acceptTripInvitation Cloud Function,
     // functions/src/callables/acceptTripInvitation.ts, which bypasses
     // these Rules entirely via the Admin SDK and is the sole accept
-    // path). Declining and owner-cancellation remain direct client
-    // writes, unchanged - each is still a one-way terminal status
-    // transition with zero financial or membership consequence, so
-    // neither needs a trusted callable (mirrors the archivedAt one-way-
-    // transition pattern already used for Trips).
+    // path).
+    //
+    // Milestone 6.8 Phase F: declining and owner-cancellation used to
+    // each keep a direct client-write compatibility exception, for any
+    // already-installed client still calling the old direct-write
+    // decline/cancel path instead of the trusted declineTripInvitation /
+    // cancelTripInvitation Cloud Functions. Both exceptions are now
+    // removed: SquadStash has only ever run locally for the owner/
+    // developer (no TestFlight, Google Play internal testing, EAS-
+    // distributed build, shared APK, or hosted external web build ever
+    // existed), the current client's declineTripInvitation /
+    // cancelTripInvitation callable paths passed Milestone 6.8 Phase
+    // E2A/E2B production verification, and no distributed legacy client
+    // population exists that could still depend on the old direct-write
+    // shape - so no compatibility exception remains necessary. ALL
+    // invitation state transitions - accepted, declined, and cancelled
+    // alike - are now trusted-callable-only (acceptTripInvitation /
+    // declineTripInvitation / cancelTripInvitation, each via the Admin
+    // SDK, bypassing these Rules entirely); direct client update of a
+    // Trip invitation is unconditionally denied, for every status
+    // transition and every role.
     match /tripInvitations/{invitationId} {
       // Only the named invitee or the Trip owner may read an invitation -
       // never an outsider, and never by guessing another trip's id (every
@@ -636,45 +652,15 @@ service cloud.firestore {
       // these Rules entirely) is the sole accept path now. No exception
       // exists for any role, including the named invitee this clause
       // used to permit directly.
+      //
+      // Milestone 6.8 Phase F: this is now the single `allow update`
+      // statement for this collection - the two compatibility exceptions
+      // that used to separately permit an invitee's direct pending ->
+      // declined write and an owner's direct pending -> cancelled write
+      // are removed (see the match-block comment above for why). No
+      // role and no status transition reaches any other `allow update`
+      // clause anymore.
       allow update: if false;
-
-      // Invitee: pending -> declined, REGARDLESS of expiry (Checkpoint
-      // 5A.1, item 2's documented choice: declining an already-expired
-      // invitation is harmless bookkeeping - it only ever narrows what
-      // the invitee is recorded as having wanted, never grants anything,
-      // so there is no reason to block it once expired).
-      allow update: if signedIn()
-        && resource.data.status == 'pending'
-        && resource.data.inviteeUid == request.auth.uid
-        && request.resource.data.tripId == resource.data.tripId
-        && request.resource.data.inviteeUid == resource.data.inviteeUid
-        && request.resource.data.inviterUid == resource.data.inviterUid
-        && request.resource.data.inviteeEmail == resource.data.inviteeEmail
-        && request.resource.data.createdAt == resource.data.createdAt
-        && request.resource.data.expiresAt == resource.data.expiresAt
-        && request.resource.data.status == 'declined'
-        && request.resource.data.respondedAt == request.time
-        && request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['status', 'respondedAt']);
-
-      // Owner: pending -> cancelled, regardless of expiry (Checkpoint
-      // 5A.1, item 2's documented choice: cancelling a (possibly already
-      // expired) pending invitation is always safe - it only ever closes
-      // off access, never grants it, so the owner may use it to clean up
-      // a stale invite). Same one-way shape as the invitee
-      // transition above, but owner-only and only to "cancelled".
-      allow update: if isTripOwnerById(resource.data.tripId)
-        && resource.data.status == 'pending'
-        && request.resource.data.tripId == resource.data.tripId
-        && request.resource.data.inviteeUid == resource.data.inviteeUid
-        && request.resource.data.inviterUid == resource.data.inviterUid
-        && request.resource.data.inviteeEmail == resource.data.inviteeEmail
-        && request.resource.data.createdAt == resource.data.createdAt
-        && request.resource.data.expiresAt == resource.data.expiresAt
-        && request.resource.data.status == 'cancelled'
-        && request.resource.data.respondedAt == request.time
-        && request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['status', 'respondedAt']);
 
       allow delete: if false;
     }

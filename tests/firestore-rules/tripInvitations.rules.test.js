@@ -133,8 +133,15 @@ describe('firestore.rules: tripInvitations - invitee responses', () => {
     );
   });
 
-  it('the invitee can decline a pending invitation', async () => {
-    await assertSucceeds(
+  // Milestone 6.8 Phase F: this test used to assert the OPPOSITE - that
+  // a pending invitee COULD directly decline. That direct-write
+  // compatibility exception is now permanently closed; the trusted
+  // declineTripInvitation Cloud Function is the sole decline path.
+  // Deliberately uses the exact previously-allowed shape (including a
+  // server-timestamped respondedAt) to prove the old compatibility
+  // bypass itself is closed, not merely that malformed data is rejected.
+  it('the invitee cannot directly decline (trusted callable only)', async () => {
+    await assertFails(
       tripInvitationDoc(asInvitee(), INVITATION_ID).update({
         status: 'declined',
         respondedAt: serverTimestamp(),
@@ -142,7 +149,7 @@ describe('firestore.rules: tripInvitations - invitee responses', () => {
     );
   });
 
-  it('the invitee cannot set status to "cancelled" (owner-only transition)', async () => {
+  it('the invitee cannot set status to "cancelled" either (no direct update of any kind)', async () => {
     await assertFails(
       tripInvitationDoc(asInvitee(), INVITATION_ID).update({
         status: 'cancelled',
@@ -265,9 +272,15 @@ describe('firestore.rules: tripInvitations - expiry enforcement', () => {
     );
   });
 
-  it('pending + expired: declining still succeeds (documented choice - harmless)', async () => {
+  // Milestone 6.8 Phase F: these two tests used to assert the OPPOSITE -
+  // that an expired pending invitation's decline/cancel direct write was
+  // a documented harmless exception. Both direct-write compatibility
+  // exceptions are now permanently closed regardless of expiry; expiry
+  // status is no longer relevant to the (now unconditionally false)
+  // direct-update Rule at all.
+  it('pending + expired: declining still fails (direct decline is now unconditionally closed)', async () => {
     await seedWithExpiry(Timestamp.fromMillis(Date.now() - 60 * 60 * 1000));
-    await assertSucceeds(
+    await assertFails(
       tripInvitationDoc(asInvitee(), INVITATION_ID).update({
         status: 'declined',
         respondedAt: serverTimestamp(),
@@ -275,9 +288,9 @@ describe('firestore.rules: tripInvitations - expiry enforcement', () => {
     );
   });
 
-  it('pending + expired: owner cancellation still succeeds (documented choice - harmless)', async () => {
+  it('pending + expired: owner cancellation still fails (direct cancel is now unconditionally closed)', async () => {
     await seedWithExpiry(Timestamp.fromMillis(Date.now() - 60 * 60 * 1000));
-    await assertSucceeds(
+    await assertFails(
       tripInvitationDoc(asOwner(), INVITATION_ID).update({
         status: 'cancelled',
         respondedAt: serverTimestamp(),
@@ -320,8 +333,16 @@ describe('firestore.rules: tripInvitations - owner cancellation', () => {
     await seedTripInvitation(testEnv, INVITATION_ID, validInvitationData());
   });
 
-  it('the owner can cancel a pending invitation', async () => {
-    await assertSucceeds(
+  // Milestone 6.8 Phase F: this test used to assert the OPPOSITE - that
+  // a pending invitation's owner COULD directly cancel. That direct-
+  // write compatibility exception is now permanently closed; the
+  // trusted cancelTripInvitation Cloud Function is the sole cancel
+  // path. Deliberately uses the exact previously-allowed shape
+  // (including a server-timestamped respondedAt) to prove the old
+  // compatibility bypass itself is closed, not merely that malformed
+  // data is rejected.
+  it('the owner cannot directly cancel (trusted callable only)', async () => {
+    await assertFails(
       tripInvitationDoc(asOwner(), INVITATION_ID).update({
         status: 'cancelled',
         respondedAt: serverTimestamp(),
